@@ -1,0 +1,16 @@
+[package]
+name = "quota-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Best-effort Codex and Claude usage adapters (session reuse, no password storage)"
+readme = false
+
+[dependencies]
+quota-core.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+webpki-roots.workspace = true

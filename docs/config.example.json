@@ -1,0 +1,11 @@
+{
+  "socket": null,
+  "history": false,
+  "history_path": null,
+  "ring_capacity": 128,
+  "refresh_min_secs": 30,
+  "refresh_max_secs": 300,
+  "http_timeout_secs": 10,
+  "enable_codex": true,
+  "enable_claude": true
+}

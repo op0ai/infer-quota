@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quota-core",
+    "crates/quota-adapters",
+    "crates/quotad",
+    "crates/quota",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.83"
+description = "Tiny Unix inference-quota daemon and CLI (Codex + Claude)"
+repository = "https://github.com/quota-rs/quota"
+
+[workspace.dependencies]
+quota-core = { path = "crates/quota-core", version = "0.1.0" }
+quota-adapters = { path = "crates/quota-adapters", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.43", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+clap = { version = "=4.5.23", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+rustls = { version = "=0.21.12", default-features = false, features = ["tls12"] }
+webpki-roots = "=0.25.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+opt-level = "s"
