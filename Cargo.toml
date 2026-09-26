@@ -5,6 +5,7 @@ members = [
     "crates/quota-adapters",
     "crates/quotad",
     "crates/quota",
+    "crates/quota-bench",
 ]
 
 [workspace.package]

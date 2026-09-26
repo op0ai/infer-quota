@@ -118,6 +118,9 @@ Documented so later contributors do not undo it:
 
 Config example: [docs/config.example.json](docs/config.example.json).
 
+Measured binary size, socket RTT, and RSS (one machine, no invented
+figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Crates
 
 | Crate | Role |

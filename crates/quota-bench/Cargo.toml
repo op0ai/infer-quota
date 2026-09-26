@@ -1,0 +1,13 @@
+[package]
+name = "quota-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "One-off Unix-socket RTT harness for quotad (not a shipped product binary)"
+publish = false
+readme = false
+
+[dependencies]
+quota-core.workspace = true
+serde_json.workspace = true
