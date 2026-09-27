@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" role="img" aria-label="infer-quota architecture: adapters into quotad, then a Unix socket to quota, quota-ctl, and other surfaces">
+  <title>infer-quota architecture</title>
+  <defs>
+    <style>
+      .bg { fill: #12110f; }
+      .card { fill: #1b1916; stroke: #2a2722; }
+      .title { font: 600 13px ui-sans-serif, system-ui, sans-serif; fill: #f4eee4; }
+      .sub { font: 500 11px ui-sans-serif, system-ui, sans-serif; fill: #8a8074; }
+      .edge { stroke: #6b5c4a; stroke-width: 1.5; fill: none; }
+      .arrow { fill: #6b5c4a; }
+      .label { font: 500 11px ui-sans-serif, system-ui, sans-serif; fill: #c9b89a; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/>
+    </marker>
+  </defs>
+  <rect width="760" height="220" rx="12" class="bg"/>
+  <rect x="1" y="1" width="758" height="218" rx="11" fill="none" stroke="#2a2722"/>
+
+  <rect x="24" y="36" width="150" height="64" rx="8" class="card"/>
+  <text x="99" y="63" text-anchor="middle" class="title">Codex</text>
+  <text x="99" y="81" text-anchor="middle" class="sub">first adapter</text>
+
+  <rect x="24" y="120" width="150" height="64" rx="8" class="card"/>
+  <text x="99" y="147" text-anchor="middle" class="title">Claude</text>
+  <text x="99" y="165" text-anchor="middle" class="sub">first adapter</text>
+
+  <path d="M174 68 H220" class="edge" marker-end="url(#arr)"/>
+  <path d="M174 152 H220" class="edge" marker-end="url(#arr)"/>
+
+  <rect x="220" y="68" width="196" height="84" rx="8" class="card"/>
+  <text x="318" y="104" text-anchor="middle" class="title">quotad</text>
+  <text x="318" y="124" text-anchor="middle" class="sub">snapshot / pool math / socket</text>
+
+  <path d="M416 110 H456" class="edge" marker-end="url(#arr)"/>
+  <text x="436" y="100" text-anchor="middle" class="label">0600</text>
+
+  <rect x="466" y="24" width="270" height="52" rx="8" class="card"/>
+  <text x="601" y="47" text-anchor="middle" class="title">quota</text>
+  <text x="601" y="65" text-anchor="middle" class="sub">read CLI / no credentials</text>
+
+  <rect x="466" y="84" width="270" height="52" rx="8" class="card"/>
+  <text x="601" y="107" text-anchor="middle" class="title">quota-ctl</text>
+  <text x="601" y="125" text-anchor="middle" class="sub">accounts / refresh / secrets</text>
+
+  <rect x="466" y="144" width="270" height="52" rx="8" class="card"/>
+  <text x="601" y="167" text-anchor="middle" class="title">other surfaces</text>
+  <text x="601" y="185" text-anchor="middle" class="sub">statusline / tmux / menu bar</text>
+
+  <path d="M456 110 V50 H466" class="edge" marker-end="url(#arr)"/>
+  <path d="M456 110 H466" class="edge" marker-end="url(#arr)"/>
+  <path d="M456 110 V170 H466" class="edge" marker-end="url(#arr)"/>
+</svg>
