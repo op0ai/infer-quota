@@ -1,0 +1,42 @@
+---
+title: fetchquota
+description: Rust-native inference quota. Provider-agnostic quota and pool math — quotad, quota, and quota-ctl.
+seo:
+  image: /og.png
+sidebar:
+  label: Overview
+---
+
+**fetchquota** is the public name for [infer-quota](https://github.com/op0ai/infer-quota): Rust-native inference quota. **quotad · quota · quota-ctl**. It is the quota and pool-math block to reach for, with collectors behind a small adapter interface so a larger workflow can stay outside the math.
+
+The crates and binaries stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. op0 publishes the repository. A custom domain can point here later; the names in Cargo do not move with the domain.
+
+```
+  quota source
+       │
+       ▼
+  adapter          shipped today: Codex, Claude
+       │
+       ▼
+    quotad         snapshot + pool math
+       │
+       │  length-prefixed JSON
+       ▼
+  Unix socket ── quota
+              ── quota-ctl
+              ── other surfaces
+```
+
+| Binary                    | Job                                                                               |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| [`quotad`](/quotad)       | Foreground daemon. Polls enabled adapters, stores the snapshot, owns the socket.  |
+| [`quota`](/quota)         | Read client. Status, pace, can-start, watch. No HTTP.                             |
+| [`quota-ctl`](/quota-ctl) | Accounts, refresh, and local secret pointers. Usage collection stays in `quotad`. |
+
+[Adapters](/adapters) are how a provider plugs in. The first shipped collectors are **Codex** and **Claude**, from early dogfood against CodexBar-shaped data and Claude usage endpoints. The snapshot, the ring, pace, and `can_start` do not special-case that pair. A failed probe is `status: unavailable` plus a reason. Token remaining shows up only when the source published a real budget. Percent-only windows stay percent-only.
+
+This block stays lean enough to compose into fuller workflows, with the math in one place. [Examples](/examples) will document real composition patterns as they ship. Those programs are coming soon and are not in the tree yet.
+
+A menu bar, a status line, or an orchestrator should speak the [socket](/protocol). [CodexBar](https://github.com/steipete/CodexBar) is a separate product (menu bar, many providers, cookies, widgets). The Codex adapter can read its on-disk snapshots as a fallback. See [Compose](/compose).
+
+Engineering notes that are not this site live in the repository `docs/` directory: protocol field notes, credential hypotheses, secrets, and measured benches. Start with [Install](/install).

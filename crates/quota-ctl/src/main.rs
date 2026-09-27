@@ -19,7 +19,7 @@ use quota_secrets::{from_env, SecretsBackend};
 #[derive(Parser, Debug)]
 #[command(
     name = "quota-ctl",
-    about = "Manage quotad accounts and trigger refresh (CodexBar-like control plane)",
+    about = "Accounts, refresh, and secret pointers for quotad",
     version
 )]
 struct Cli {

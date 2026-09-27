@@ -1,8 +1,11 @@
 # Credential locations and usage APIs
 
-v0 only talks to **Codex** and **Claude**. Everything below that is not an
-official, versioned public API is labeled **hypothesis**. When a probe fails we
-return `status: unavailable` with a reason. We never invent remaining tokens.
+The first shipped collectors are **Codex** and **Claude**, from early dogfood
+against CodexBar-shaped data and Claude usage endpoints. This note is those
+probes. A later adapter gets its own section when it lands. Everything below
+that is not an official, versioned public API is labeled **hypothesis**. When
+a probe fails we return `status: unavailable` with a reason. We never invent
+remaining tokens.
 
 We **read** existing session files. We **never write** them and never store
 passwords.

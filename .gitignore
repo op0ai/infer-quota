@@ -5,6 +5,15 @@
 *.swp
 .DS_Store
 
+# fetchquota docs (Blume). Lockfile in site/ is committed.
+node_modules/
+.blume/
+.blume-verify/
+site/node_modules/
+site/.blume/
+site/.blume-verify/
+site/dist/
+
 # Credential / session files (never commit live material)
 auth.json
 .credentials.json

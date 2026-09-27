@@ -25,11 +25,7 @@ use crate::client::{decode_result, err_msg, rpc, rpc_watch, ClientError};
 use crate::render::{print_can_start, print_pace, print_status};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "quota",
-    about = "Ask quotad for Codex/Claude inference quota",
-    version
-)]
+#[command(name = "quota", about = "Read inference quota from quotad", version)]
 struct Cli {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,

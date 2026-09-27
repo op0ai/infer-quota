@@ -4,13 +4,23 @@
 
 ## Path
 
-Resolution order:
+`--socket` is accepted by `quotad`, `quota`, and `quota-ctl`. `--config` is
+accepted by `quotad` only. Clients do not take `--config`.
 
-1. `--socket` on `quotad` / `quota`
-2. `QUOTA_SOCKET`
-3. `socket` in `~/.config/quota/config.json` (or `$XDG_CONFIG_HOME/quota/config.json`)
+`quotad` loads `--config PATH` when set, otherwise the default config file,
+then applies `--socket`:
+
+1. `--socket`
+2. `socket` in that config file
+3. `QUOTA_SOCKET` when set and non-empty
 4. `$XDG_RUNTIME_DIR/quota/quota.sock` when `XDG_RUNTIME_DIR` is set and non-empty
 5. `~/.local/share/quota/quota.sock`
+
+The default config file is `$XDG_CONFIG_HOME/quota/config.json`, or
+`~/.config/quota/config.json`. `quota` and `quota-ctl` read that default
+file only (`Config::load_default()`). A socket that exists only in a
+non-default config is not visible to them; pass `--socket` or put `socket`
+in the default file.
 
 The directory is created with mode `0700`; the socket is `0600`.
 `quotad` refuses to bind if the socket path is a symlink, if a live
@@ -55,6 +65,10 @@ legal JSON; the length prefix is the boundary).
 
 Existing `status` / `pace` / `can_start` / `ping` / `version` / `watch` are
 unchanged. New methods are additive; `protocol` stays `1`.
+
+`provider` values today are `all`, `codex`, and `claude` because `ProviderId`
+has those variants. A new collector adds a variant. The snapshot math does
+not special-case the first two adapters.
 
 ### Account metadata (no secrets)
 
@@ -144,11 +158,19 @@ def rpc(method, params=None, sock_path=None):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(str(sock_path or socket_path()))
     s.sendall(struct.pack("<I", len(payload)) + payload)
-    header = s.recv(4)
+    header = b""
+    while len(header) < 4:
+        chunk = s.recv(4 - len(header))
+        if not chunk:
+            raise EOFError("socket closed while reading frame header")
+        header += chunk
     n = struct.unpack("<I", header)[0]
     body = b""
     while len(body) < n:
-        body += s.recv(n - len(body))
+        chunk = s.recv(n - len(body))
+        if not chunk:
+            raise EOFError("socket closed while reading frame body")
+        body += chunk
     return json.loads(body)
 ```
 

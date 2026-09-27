@@ -29,7 +29,8 @@ pub struct AccountRecord {
     pub workspace_account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<SecretRef>,
-    /// Isolated Codex/Claude home for this account (path only, never tokens).
+    /// Isolated provider home for this account (path only, never tokens).
+    /// The Codex adapter uses it as `CODEX_HOME` when this account is selected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_path: Option<String>,
     pub created_at: i64,

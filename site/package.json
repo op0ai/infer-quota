@@ -1,0 +1,25 @@
+{
+  "name": "fetchquota-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "check": "blume check",
+    "lint": "oxlint .",
+    "fmt": "oxfmt --write .",
+    "fmt:check": "oxfmt --check .",
+    "doctor": "blume doctor"
+  },
+  "dependencies": {
+    "blume": "^2.0.3"
+  },
+  "devDependencies": {
+    "oxfmt": "^0.70.0",
+    "oxlint": "^1.85.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "packageManager": "bun@1.4.2"
+}

@@ -1,0 +1,56 @@
+---
+title: quota-ctl
+description: Control companion for accounts, refresh, and local secret pointers. It does not collect usage.
+---
+
+`quota-ctl` is the mutating companion. Library crate: `quota_ctl`. It edits account metadata, asks `quotad` to probe now, and talks to the local secrets chain. Provider polling stays in `quotad`.
+
+```bash
+quota-ctl ping
+quota-ctl accounts list
+quota-ctl accounts add --provider codex --email you@example.com --select
+quota-ctl accounts remove --id acct_you_example_com
+quota-ctl accounts select --id acct_you_example_com
+quota-ctl refresh
+quota-ctl refresh --provider claude --json
+quota-ctl secret backends
+quota-ctl secret get codex/work
+quota-ctl secret put codex/work --from-env QUOTA_PUT
+```
+
+`--socket` is global, same idea as `quota`.
+
+## Accounts
+
+`accounts add` sends metadata over the socket:
+
+| Flag                | Role                                                                         |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `--provider`        | Required. Shipped ids: `codex`, `claude`                                     |
+| `--email`           | Label                                                                        |
+| `--workspace-label` | Label                                                                        |
+| `--login-method`    | Label (for example `pro`)                                                    |
+| `--id`              | Stable id; the daemon generates one when omitted                             |
+| `--home-path`       | Isolated `CODEX_HOME` used on the next refresh when this account is selected |
+| `--secret-backend`  | `openbao`, `keychain`, or `file`                                             |
+| `--secret-path`     | Pointer path. The socket does not carry the secret bytes                     |
+| `--select`          | Make this account active                                                     |
+| `--json`            | Print the RPC result                                                         |
+
+`accounts select` with `--id` omitted, or an empty `--id`, clears the active account. `accounts list` prints ids, provider, email, and workspace label.
+
+`secret_ref` on the wire is `{ "backend", "path" }`. Put material with `secret put`, described in [Secrets](/secrets).
+
+## Refresh
+
+`refresh` calls the daemon method `refresh` and returns a snapshot after a probe. It does not fetch providers inside `quota-ctl`.
+
+## Secrets commands
+
+These commands use the `quota-secrets` chain in-process. They are not socket methods.
+
+- `secret backends` prints chain names. `keychain` and `file` are always listed. `openbao` is included only when both `QUOTA_OPENBAO_ADDR` and `QUOTA_OPENBAO_TOKEN` are set and non-empty. Address alone, or an empty token, is a config error: the command exits `1` and does not print a partial list. Values are not printed.
+- `secret get PATH` prints `backend=`, `path=`, and `present=true` on a hit (exit `0`). A miss prints `secret not found` and exits `2`. An OpenBao HTTP status other than 404 or 2xx is `Unavailable`: the chain continues, and if no later backend has the path the command still exits `2`. A TCP connect failure is `Io` and exits `1` before later backends run.
+- `secret put PATH --from-env VAR` reads `VAR`. Empty and unset values are refused. The stored value is not printed.
+
+Exit `1` is also a transport or RPC error on the socket commands, and a local error that the secrets chain returns (config, I/O, parse). Exit `0` is success.

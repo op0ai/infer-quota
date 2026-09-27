@@ -1,0 +1,78 @@
+---
+title: Install
+description: Build quotad, quota, and quota-ctl from the infer-quota repository on macOS or Linux.
+---
+
+v0 is built from the [infer-quota](https://github.com/op0ai/infer-quota) repository. Rust-native inference quota: **quotad · quota · quota-ctl**. Rust **1.83+** (stable). macOS or Linux: each binary requires a Unix domain socket.
+
+The quickstart below uses the first shipped adapters, Codex and Claude. How another quota source plugs in: [Adapters](/adapters).
+
+```bash
+git clone https://github.com/op0ai/infer-quota
+cd infer-quota
+cargo build --release
+```
+
+`cargo build --release` writes the binaries next to the workspace. Their names come from the crate packages (`quotad`, `quota`) and the `quota-ctl` `[[bin]]` name. A fresh checkout does not put them on `PATH`.
+
+```text
+./target/release/quotad
+./target/release/quota
+./target/release/quota-ctl
+```
+
+## Quickstart
+
+Run these from the repository root, after the release build.
+
+In one terminal:
+
+```bash
+./target/release/quotad run
+```
+
+`./target/release/quotad` with no subcommand does the same thing. In another:
+
+```bash
+./target/release/quota ping
+./target/release/quota status
+./target/release/quota status --json --provider codex
+./target/release/quota pace --provider claude
+./target/release/quota can-start --tokens 50000
+./target/release/quota watch
+./target/release/quota version
+```
+
+`quota ping` prints `pong` when the daemon is listening. If the client cannot connect, it prints the socket path and the hint `quotad run --socket …` (that text uses the bare name). On this checkout the daemon binary is `./target/release/quotad`.
+
+`cargo test --workspace` stays offline. Adapter tests use in-memory HTTP mocks and `fixtures/codexbar/`. OpenBao is optional and is not started by the test suite.
+
+## Config
+
+Missing config means defaults. Example: [`docs/config.example.json`](https://github.com/op0ai/infer-quota/blob/main/docs/config.example.json).
+
+| Key                              | Default                                                        |
+| -------------------------------- | -------------------------------------------------------------- |
+| `history`                        | `false` (optional append-only JSONL of snapshots, not secrets) |
+| `ring_capacity`                  | `128`                                                          |
+| `refresh_min_secs`               | `30`                                                           |
+| `refresh_max_secs`               | `300`                                                          |
+| `http_timeout_secs`              | `10`                                                           |
+| `enable_codex` / `enable_claude` | `true`                                                         |
+| `enable_codexbar_files`          | `true`                                                         |
+
+`quotad --config PATH` loads that file. Otherwise the path is `$XDG_CONFIG_HOME/quota/config.json`, or `~/.config/quota/config.json`.
+
+## Docs site
+
+The pages you are reading live in `site/` and build with [Blume](https://useblume.dev). From a checkout:
+
+```bash
+cd site
+bun install
+bun run dev
+```
+
+Node.js 22.12 or newer. `bun run build` writes static HTML to `site/dist/`. Deploy notes: [`site/DEPLOY.md`](https://github.com/op0ai/infer-quota/blob/main/site/DEPLOY.md). Agent entry points: [Agents](/agents).
+
+Measured binary size and socket timings for one machine are in [`docs/BENCHMARKS.md`](https://github.com/op0ai/infer-quota/blob/main/docs/BENCHMARKS.md). Those figures are not portable and are not a latency claim about OpenAI or Anthropic.

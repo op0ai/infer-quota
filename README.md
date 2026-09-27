@@ -1,35 +1,43 @@
 # quota
 
-Tiny, MIT-licensed inference-quota **daemon + CLI + control plane** for
-machines that already have Codex and/or Claude Code logged in.
+Rust-native inference quota. Tiny, MIT-licensed **quotad · quota · quota-ctl**:
+daemon, read CLI, and control plane for quota and pool math.
 
-`quotad` is the source of truth (polling + snapshots). `quota` is a thin
-read client. `quota-ctl` is the mutating companion (accounts / refresh /
-local secrets pointers) — a CodexBar-shaped foil that does **not** collect
-usage itself.
+Collectors are adapters. The first shipped ones read Codex and Claude
+sessions — early dogfood against CodexBar-shaped files and Claude usage
+endpoints, not an architectural limit. Any source that exposes quota belongs
+in another adapter. See [site/docs/adapters.mdx](site/docs/adapters.mdx).
 
-A later macOS menu bar, Herdr statusline, tmux segment, or MCP server
-should speak the same Unix socket — not scrape providers again.
+`quotad` polls enabled adapters, stores the snapshot, and owns the Unix
+socket. `quota` is a thin read client. `quota-ctl` mutates accounts, refresh,
+and local secret pointers. Usage collection stays in `quotad`.
+
+A menu bar, Herdr statusline, tmux segment, or MCP server should speak that
+socket. Provider HTTP stays in the adapters.
 
 | | URL |
 |--|-----|
 | Origin (working forge) | https://origin.cursor.com/op0/infer-quota |
 | GitHub (public mirror) | https://github.com/op0ai/infer-quota |
 
-This is **not** [CodexBar](https://github.com/steipete/CodexBar). CodexBar is a
-full menu-bar product with many providers, cookies, widgets, and UI.
-`quota` is the small rust-native core: reuse sessions, publish numbers, do the
-math.
+[CodexBar](https://github.com/steipete/CodexBar) is a separate menu-bar
+product (many providers, cookies, widgets, UI). This repository is the small
+Rust core: adapters, a snapshot, the math, a socket.
 
 ```
-  Codex ~/.codex/auth.json ──┐
-                             ├──► quotad (1 OS thread + blocking HTTP)
-  Claude ~/.claude/          │         │
-         .credentials.json ──┘         │  length-prefixed JSON
-                                       ▼
-                              Unix socket ── quota CLI
-                                           ── quota-ctl (accounts / refresh)
-                                           ── future menu bar / tmux / MCP
+  quota source
+       │
+       ▼
+  adapter          shipped today: Codex, Claude
+       │
+       ▼
+    quotad         snapshot + pool math
+       │
+       │  length-prefixed JSON
+       ▼
+  Unix socket ── quota
+              ── quota-ctl
+              ── other surfaces
 ```
 
 ## What v0 does
@@ -43,7 +51,10 @@ math.
   several are **undocumented hypotheses**). On failure: `status: unavailable`
   plus a reason — **no fake remaining tokens**.
 - Math: burn rate from a bounded snapshot ring, ETA to empty, `can_start`.
-- Providers: **Codex** and **Claude** only.
+- First collectors: **Codex** and **Claude** adapters (`Provider` in
+  `quota-adapters`). `enable_codex` / `enable_claude` default on. Another
+  provider is a code change on that trait, `ProviderId`, and the probe list
+  in `quotad`.
 - Offline CodexBar fixture parser + 1912-row history replay in tests.
 - Optional read of CodexBar's macOS snapshot/history files when the live
   API is down (never `cursor-session.json`).
@@ -55,7 +66,6 @@ math.
 - Menu bar / WidgetKit / Qt
 - MCP server
 - Cookie-DB scraping (we refuse to hold a browser cookie database in memory)
-- The rest of CodexBar's provider zoo
 - Claiming calibrated accuracy beyond what the source published
 - Converting `--tokens N` into a percent-only window
 
@@ -65,22 +75,25 @@ Requires Rust 1.83+ (stable).
 
 ```bash
 cargo build --release
-# binaries: target/release/quotad  target/release/quota  target/release/quota-ctl
+# fresh checkout, not on PATH:
+#   ./target/release/quotad
+#   ./target/release/quota
+#   ./target/release/quota-ctl
 
-quotad run                          # foreground; optional --socket PATH
-quota status
-quota status --json --provider codex
-quota pace --provider claude
-quota can-start --tokens 50000
-quota watch
-quota ping
-quota version
+./target/release/quotad run         # foreground; optional --socket PATH
+./target/release/quota status
+./target/release/quota status --json --provider codex
+./target/release/quota pace --provider claude
+./target/release/quota can-start --tokens 50000
+./target/release/quota watch
+./target/release/quota ping
+./target/release/quota version
 
-quota-ctl ping
-quota-ctl accounts add --provider codex --email you@example.com --select
-quota-ctl accounts list
-quota-ctl refresh
-quota-ctl accounts remove --id acct_you_example_com
+./target/release/quota-ctl ping
+./target/release/quota-ctl accounts add --provider codex --email you@example.com --select
+./target/release/quota-ctl accounts list
+./target/release/quota-ctl refresh
+./target/release/quota-ctl accounts remove --id acct_you_example_com
 ```
 
 `cargo test --workspace` is offline: adapters use in-memory HTTP mocks;
@@ -92,17 +105,22 @@ CodexBar tests read `fixtures/codexbar/` only. OpenBao is not required.
 docker compose -f docker-compose.dev.yml up -d
 export QUOTA_OPENBAO_ADDR=http://127.0.0.1:8200
 export QUOTA_OPENBAO_TOKEN=dev-only-not-for-prod
-quota-ctl secret backends
+./target/release/quota-ctl secret backends
 ```
+
+Both variables are required. Address without a non-empty token is a config error, not a chain that omits OpenBao.
 
 Dev-only. Not a production vault. Details: [docs/SECRETS.md](docs/SECRETS.md).
 
 ### Socket path
 
-1. `--socket` / `QUOTA_SOCKET`
-2. `~/.config/quota/config.json` → `socket`
-3. `$XDG_RUNTIME_DIR/quota/quota.sock`
-4. `~/.local/share/quota/quota.sock`
+`--socket` is on `quotad`, `quota`, and `quota-ctl`. `--config` is on `quotad` only.
+
+1. `--socket`
+2. `socket` in the config file `quotad` loaded (`--config PATH`, else the default file). Clients read only the default file: `$XDG_CONFIG_HOME/quota/config.json`, else `~/.config/quota/config.json`
+3. `QUOTA_SOCKET`
+4. `$XDG_RUNTIME_DIR/quota/quota.sock`
+5. `~/.local/share/quota/quota.sock`
 
 Protocol: **4-byte little-endian length + compact JSON**. Methods: `status`,
 `pace`, `can_start`, `ping`, `version`, `watch`, plus additive `refresh` and
@@ -121,8 +139,10 @@ Protocol: **4-byte little-endian length + compact JSON**. Methods: `status`,
 | `quota-ctl refresh` | Immediate probe |
 | `quota-ctl secret backends\|get\|put` | Local secrets chain |
 
-Exit codes: `0` ok; `1` transport/RPC error; `2` `can-start` overall `no`
-(or secret not found).
+Exit codes: `0` ok; `1` transport, RPC, or secrets-chain error (OpenBao
+connect failure, or address set without a token); `2` `can-start` overall
+`no`, or `secret get` when nothing is found. An OpenBao HTTP status other
+than 404 or 2xx is treated as a miss when no later backend has the path.
 
 `can-start` cannot honestly convert `--tokens` to a percent-only window
 (Codex `/wham/usage` and Claude `/api/oauth/usage` typically publish
@@ -171,7 +191,7 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Crate | Role |
 |-------|------|
 | `quota-core` | Types, snapshot schema, math, framing, config, paths, Unix RPC |
-| `quota-adapters` | Codex + Claude + CodexBar file parser (`Provider` trait, mocked HTTP) |
+| `quota-adapters` | `Provider` trait. First collectors: Codex and Claude, plus the CodexBar file fallback |
 | `quota-secrets` | OpenBao (feature) / OS keychain / read-only file OAuth |
 | `quotad` | Daemon |
 | `quota` | Read CLI (sync socket client; no HTTP) |
@@ -182,14 +202,32 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | | quota / quotad / quota-ctl | CodexBar |
 |--|----------------------------|----------|
-| Job | Core: session reuse, snapshot, math, socket | Product: menu bar, widgets, many providers |
+| Job | Core: adapters, snapshot, math, socket | Product: menu bar, widgets, many providers |
 | UI | None in v0 | Native macOS UI |
-| Providers (v0) | Codex, Claude | Large set + cookies + cost scanners |
+| Collectors | First adapters: Codex, Claude. Math and socket stay provider-agnostic | Large set + cookies + cost scanners |
 | Credential writes | Never (files). Optional OpenBao for *new* keys | Refresh/cookie import in some paths |
 | Accuracy | Honest `percent_only` when no token budget | Richer UI; still often percent windows |
 | Clients | Any process that can speak the socket | App-centric |
 
 A menu bar can sit on this daemon the same way `quota watch` does.
+
+## Docs
+
+Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: Rust-native inference quota, quota and pool math, quotad · quota · quota-ctl. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/). Runnable composition examples will live in [`examples/`](examples/) and on the docs Examples page; none are shipped yet.
+
+```bash
+cd site
+bun install
+bun run dev     # http://localhost:4321
+bun run build   # site/dist
+bun run check   # blume check
+```
+
+Node.js 22.12+ and Bun 1.4. From the repo root, `bun run docs:install`, `bun run dev`, `bun run build`, and `bun run check` call the same scripts. Deploy on Vercel or Cloudflare Pages: [site/DEPLOY.md](site/DEPLOY.md). A custom domain is not attached yet.
+
+Agent entry points after `bun run build`: `site/dist/llms.txt`, `site/dist/llms-full.txt`, per-page `.md` mirrors, and `site/dist/api/docs/pages.json`. The docs MCP server stays off so v1 remains static.
+
+An earlier static share stub (`docs/site`, pull request #2) is superseded by this Blume site. Publish `site/`, not a second HTML page under `docs/`.
 
 ## License
 

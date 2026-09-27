@@ -2,7 +2,8 @@
 
 `quota-secrets` is the unified lookup crate. `quota-ctl` is the human CLI.
 `quotad` never stores passwords, API keys, or JWTs, and does not depend on
-this crate.
+this crate. The CLI-file paths below are what the first shipped collectors
+(Codex and Claude) read.
 
 ## Order (first hit wins)
 
@@ -63,6 +64,10 @@ export QUOTA_PUT=sk-example-not-real
 quota-ctl secret put codex/work --from-env QUOTA_PUT
 quota-ctl secret get codex/work    # backend= path= present=true
 ```
+
+OpenBao joins the chain only when `QUOTA_OPENBAO_ADDR` and
+`QUOTA_OPENBAO_TOKEN` are both set and non-empty. Address without a token
+is a config error on `secret backends`, `secret get`, and `secret put`.
 
 ### TLS
 

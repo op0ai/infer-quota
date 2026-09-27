@@ -21,11 +21,7 @@ use quota_core::Config;
 use crate::daemon::run;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "quotad",
-    about = "Tiny inference-quota daemon (Codex + Claude session reuse)",
-    version
-)]
+#[command(name = "quotad", about = "Rust-native inference quota daemon", version)]
 struct Cli {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
