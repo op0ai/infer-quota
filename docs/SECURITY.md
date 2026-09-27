@@ -27,7 +27,7 @@ socket is the control plane for the user session, not a multi-tenant API.
 | OpenBao | Feature `openbao` (enabled by `quota-ctl`, not by `quotad`). `https://` is rustls 0.21; optional `QUOTA_OPENBAO_CA_FILE` PEM. Plain HTTP is **exact** loopback (`127.0.0.1`, `localhost`, `::1`) unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. Nested prefixes (`quota/prod`) are allowed; `..` is not. `put` values capped at 32 KiB. Response bodies capped. Token and secret bytes are redacted from `Debug`. `secret get` prints `present=true` only. `secret put` requires `--from-env` (never argv). File backend is read-only. |
 | State files | Accounts / optional history dirs we create are `0700`. Files are opened `0600` with `O_NOFOLLOW` and refused when the inode is group- or other-readable, before any bytes are written. |
 | Instance lock | `mkdir` mode `0700` on `{socket}.lock`. The pid is written and re-read before the lock is claimed. A missing pid is stolen only after it stays missing (a live starter is not unlinked mid-write). |
-| Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watch write timeout 15s. Watch idle 600s since last snapshot or client frame (`QUOTA_WATCH_IDLE_SECS`). Linux `SO_PEERCRED` same-euid. Watchers cannot exhaust `status`/`refresh`. |
+| Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watch write timeout 15s. Watch idle `max(600s, refresh_max_secs + 30s)` since last snapshot write or `ping` keepalive (`QUOTA_WATCH_IDLE_SECS` override). Linux `SO_PEERCRED` same-euid. Watchers cannot exhaust `status`/`refresh`. |
 | Window kinds | Unknown slot + no duration → `extra`/`unknown`, not invented `weekly`. |
 
 ## Residual gaps (explicit)
@@ -82,11 +82,18 @@ socket is the control plane for the user session, not a multi-tenant API.
    is not implemented. TLS is always linked when Codex/Claude HTTPS
    probes are compiled in.
 
-9. **Watch idle timeout is 600s since last snapshot or client frame**
-   (override `QUOTA_WATCH_IDLE_SECS`, minimum 1). Snapshot writes use a
-   15s timeout so a non-reading peer cannot pin a slot. A same-UID
-   watcher on a live daemon (refresh ≤ 300s) is not dropped. A wedged
-   refresh plus a silent client is.
+9. **Watch idle is `max(600s, refresh_max_secs + 30s)`** since the last
+   outbound snapshot write or a documented `ping` keepalive (override
+   `QUOTA_WATCH_IDLE_SECS`, minimum 1). Other inbound frames do not
+   reset the timer. Snapshot writes use a 15s timeout so a non-reading
+   peer cannot pin a slot. A same-UID watcher on a live daemon cannot
+   be dropped by a configured refresh interval. A wedged refresh plus
+   a silent client is.
+
+10. **Tokio blocking pool is one thread, 1ms keep-alive.** Scheduled
+    refresh and a client `refresh` RPC share that slot (`spawn_blocking`).
+    Concurrent HTTPS probes serialize. That is the measured idle
+    Threads=1 / VSZ drop; do not raise the pool without re-measuring.
 
 ## What must never be committed
 

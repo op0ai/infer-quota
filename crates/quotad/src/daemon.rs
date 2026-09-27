@@ -34,10 +34,11 @@ const MAX_WATCH_CLIENTS: usize = 48;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 /// Drop a watch writer that is not draining snapshots (slowloris).
 const WATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
-/// After subscribe, drop the slot if no snapshot and no client frame arrive.
-/// Default 600s (> `refresh_max` 300s) so a live daemon never hits this for a
-/// healthy watcher. Override with `QUOTA_WATCH_IDLE_SECS` (tests).
-const WATCH_IDLE_DEFAULT: Duration = Duration::from_secs(600);
+/// Floor so a default `refresh_max` (300s) still drops a wedged silent slot.
+const WATCH_IDLE_FLOOR_SECS: u64 = 600;
+/// Slack past `refresh_max_secs` so a live configured refresh cannot race
+/// the idle timer. Bundled `quota watch` has no heartbeat.
+const WATCH_IDLE_SLACK_SECS: u64 = 30;
 
 use crate::accounts::AccountStore;
 use crate::store::Store;
@@ -52,16 +53,29 @@ pub fn run(cfg: Config) -> Result<(), DaemonError> {
     rt.block_on(run_async(cfg))
 }
 
-fn watch_idle_timeout() -> Duration {
-    match std::env::var("QUOTA_WATCH_IDLE_SECS") {
-        Ok(s) => s
-            .parse::<u64>()
-            .ok()
-            .filter(|&n| n >= 1)
-            .map(Duration::from_secs)
-            .unwrap_or(WATCH_IDLE_DEFAULT),
-        Err(_) => WATCH_IDLE_DEFAULT,
+fn watch_idle_override_secs() -> Option<u64> {
+    std::env::var("QUOTA_WATCH_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Idle after subscribe: `max(600, refresh_max + 30)` unless
+/// `QUOTA_WATCH_IDLE_SECS` is set. A live refresh interval cannot outlast
+/// this timer. Override is for tests / operators.
+fn watch_idle_secs(refresh_max_secs: u64, override_secs: Option<u64>) -> Duration {
+    if let Some(n) = override_secs {
+        return Duration::from_secs(n);
     }
+    Duration::from_secs(
+        refresh_max_secs
+            .saturating_add(WATCH_IDLE_SLACK_SECS)
+            .max(WATCH_IDLE_FLOOR_SECS),
+    )
+}
+
+fn watch_idle_timeout(refresh_max_secs: u64) -> Duration {
+    watch_idle_secs(refresh_max_secs, watch_idle_override_secs())
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -521,7 +535,7 @@ async fn handle_client(
             };
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
-            let mut rx = {
+            let (mut rx, idle_dur) = {
                 let g = app.read().await;
                 let snap = filter_snapshot(g.store.latest(), params.provider);
                 write_frame_timed(
@@ -529,9 +543,10 @@ async fn handle_client(
                     &Response::result(req.id, StatusResult { snapshot: snap }),
                 )
                 .await?;
-                g.watch_tx.subscribe()
+                let idle_dur = watch_idle_timeout(g.cfg.refresh_max_secs());
+                (g.watch_tx.subscribe(), idle_dur)
             };
-            let idle = tokio::time::sleep(watch_idle_timeout());
+            let idle = tokio::time::sleep(idle_dur);
             tokio::pin!(idle);
             loop {
                 tokio::select! {
@@ -544,9 +559,7 @@ async fn handle_client(
                                     &Response::result(req.id, StatusResult { snapshot: snap }),
                                 )
                                 .await?;
-                                idle.as_mut().reset(
-                                    tokio::time::Instant::now() + watch_idle_timeout(),
-                                );
+                                idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
                             }
                             Err(_) => return Ok(()),
                         }
@@ -554,6 +567,8 @@ async fn handle_client(
                     incoming = read_frame_async(&mut stream) => {
                         match incoming {
                             Ok(bytes) => {
+                                // Only a documented `ping` keepalive resets idle.
+                                // Junk / other methods must not hold the slot.
                                 if let Ok(r) = serde_json::from_slice::<Request>(&bytes) {
                                     if r.method == METHOD_PING {
                                         write_frame_timed(
@@ -561,11 +576,9 @@ async fn handle_client(
                                             &Response::result(r.id, quota_core::protocol::Pong { pong: true }),
                                         )
                                         .await?;
+                                        idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
                                     }
                                 }
-                                idle.as_mut().reset(
-                                    tokio::time::Instant::now() + watch_idle_timeout(),
-                                );
                             }
                             Err(FrameError::UnexpectedEof) => return Err(ClientError::Eof),
                             Err(e) => return Err(e.into()),
@@ -968,6 +981,24 @@ mod tests {
     fn rustix_pid_alive_self() {
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn watch_idle_outlasts_configured_refresh() {
+        assert_eq!(
+            watch_idle_secs(300, None),
+            Duration::from_secs(WATCH_IDLE_FLOOR_SECS)
+        );
+        assert_eq!(
+            watch_idle_secs(600, None),
+            Duration::from_secs(600 + WATCH_IDLE_SLACK_SECS)
+        );
+        assert_eq!(
+            watch_idle_secs(3600, None),
+            Duration::from_secs(3600 + WATCH_IDLE_SLACK_SECS)
+        );
+        assert_eq!(watch_idle_secs(86400, Some(1)), Duration::from_secs(1));
+        assert!(watch_idle_secs(86400, None) > Duration::from_secs(86400));
     }
 
     #[test]

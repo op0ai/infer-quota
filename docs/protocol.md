@@ -102,7 +102,11 @@ published `reset_at`.
 
 `watch` keeps the connection open. After the first snapshot, each daemon
 refresh sends another `Response` with the same `id`. A later `ping` on that
-connection is answered; closing the socket unsubscribes.
+connection is answered and is the only inbound keepalive that resets the
+watch idle timer (junk frames do not). Closing the socket unsubscribes.
+Idle is `max(600s, refresh_max_secs + 30s)` unless `QUOTA_WATCH_IDLE_SECS`
+is set. The bundled client does not heartbeat; it relies on refresh
+snapshots.
 
 ## Response
 

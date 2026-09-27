@@ -54,7 +54,7 @@ add` + `musl-gcc` from `musl-tools`). Musl sizes are VERIFIED below.
 | `kill -0` via `Command` → `rustix::process::test_kill_process`; first probe on the accept-loop thread; Tokio blocking pool `max_blocking_threads=1`, `keep_alive=1ms`; Linux `SO_PEERCRED`; watch write 15s + idle 600s | **quotad** release size | 2 416 032 → **2 377 696** (−38 336, −1.6%) | net smaller. Peercred + watch timers did not offset the `Command` drop. |
 | same | **quotad** dist | 1 792 592 → **1 759 832** (−32 760) | same |
 | same | **quotad** musl release | 2 560 544 → **2 513 728** (−46 816) | same. Baseline musl taken on `63a66a3` this session, then rebuilt. |
-| first probe sync + 1ms keep-alive | idle **Threads** | 2 → **1** (immediately after first `quota ping`) | none. Later HTTPS refresh still uses `spawn_blocking`. |
+| first probe sync + 1ms keep-alive | idle **Threads** | 2 → **1** (immediately after first `quota ping`) | **kept:** `max_blocking_threads=1` serializes scheduled vs client `refresh` HTTPS. Do not bump the pool without re-measuring Threads/VSZ. |
 | same | idle **VmRSS** | 3308 → **3252** kB (−56). RssAnon 252 → 236. VSZ 72392 → **4752** (no parked blocking-thread stack). | none |
 | unused `serde`/`thiserror` on `quota` / `quota-ctl` | quota release | 1 061 216 → 1 061 216 (0) | lock hygiene only |
 | Linux `SO_PEERCRED` + watch timeouts | socket RTT | see §3. Three repeats: `status` mean **21.2** µs. This-host baseline 22.6 µs (one noisier run). #4 docs 21.5 µs. **Not claimed as a latency win.** | cost in the noise |
@@ -183,6 +183,10 @@ First probe ran on the runtime thread; blocking pool not created.
 `ps -o rss` agreed: **3252**. After the RTT/watch/start harness: VmRSS
 3276 kB, Threads still 1. #4 docs idle was 3428 kB / 2 threads on a
 busier RSS sample of the same tree class.
+
+`max_blocking_threads=1` is the VSZ/Threads win: scheduled refresh and a
+client `refresh` share one `spawn_blocking` slot (HTTPS serializes).
+Leave the pool at 1 unless Threads/VSZ are re-measured.
 
 ### 5. CLI spawn (VERIFIED)
 
