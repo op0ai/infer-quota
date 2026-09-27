@@ -1,7 +1,7 @@
 //! Accept loop, adaptive refresh, and request dispatch.
 
-use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -171,22 +171,53 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn claim_lock_dir(dir: &Path) -> bool {
+    let pid_path = dir.join("pid");
+    let me = std::process::id().to_string();
+    if fs::write(&pid_path, format!("{me}\n")).is_err() {
+        return false;
+    }
+    fs::read_to_string(&pid_path)
+        .ok()
+        .is_some_and(|got| got.trim() == me)
+}
+
+fn lock_held_by_live_pid(dir: &Path) -> bool {
+    match fs::read_to_string(dir.join("pid")) {
+        Ok(raw) => raw.trim().parse::<u32>().ok().is_some_and(pid_alive),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let fresh = fs::metadata(dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < Duration::from_secs(2));
+            if fresh {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(raw) = fs::read_to_string(dir.join("pid")) {
+                    return raw.trim().parse::<u32>().ok().is_some_and(pid_alive);
+                }
+            }
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 fn acquire_instance_lock(socket: &Path) -> Result<InstanceLock, DaemonError> {
     if let Some(dir) = socket.parent() {
         quota_core::ensure_private_dir(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
     }
     let dir = socket.with_extension("lock");
-    for _ in 0..4 {
-        match fs::create_dir(&dir) {
+    for _ in 0..8 {
+        match DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
-                let _ = fs::write(dir.join("pid"), std::process::id().to_string());
-                return Ok(InstanceLock { dir });
+                if claim_lock_dir(&dir) {
+                    return Ok(InstanceLock { dir });
+                }
+                let _ = fs::remove_dir_all(&dir);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let pid = fs::read_to_string(dir.join("pid"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok());
-                if pid.is_some_and(pid_alive) {
+                if lock_held_by_live_pid(&dir) {
                     return Err(DaemonError::Io(format!(
                         "already running (lock held at {})",
                         dir.display()

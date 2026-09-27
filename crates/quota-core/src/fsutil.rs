@@ -17,6 +17,14 @@ const O_NOFOLLOW: i32 = 0o400;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const O_NOFOLLOW: i32 = 0;
 
+/// Do not block when the path is a FIFO with no writer.
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0o4;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const O_NONBLOCK: i32 = 0;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CapReadError {
     #[error("file not found: {0}")]
@@ -25,6 +33,8 @@ pub enum CapReadError {
     TooLarge(usize),
     #[error("refusing symlink: {0}")]
     Symlink(String),
+    #[error("not a regular file: {0}")]
+    NotRegular(String),
     #[error("io: {0}")]
     Io(String),
 }
@@ -33,9 +43,19 @@ pub enum CapReadError {
 /// `max_bytes`. A file that grows past the cap during the read is rejected
 /// (no second unbounded `fs::read`).
 pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CapReadError> {
+    let file = open_regular_file(path)?;
+    read_capped_from(file, max_bytes)
+}
+
+/// Open a regular file. Refuses symlinks, directories, and FIFOs.
+/// `O_NONBLOCK` keeps a FIFO raced in after the type check from stalling.
+pub fn open_regular_file(path: &Path) -> Result<File, CapReadError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(CapReadError::Symlink(path.display().to_string()));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(CapReadError::NotRegular(path.display().to_string()));
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -46,8 +66,9 @@ pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CapRea
 
     let mut opts = OpenOptions::new();
     opts.read(true);
-    if O_NOFOLLOW != 0 {
-        opts.custom_flags(O_NOFOLLOW);
+    let flags = O_NOFOLLOW | O_NONBLOCK;
+    if flags != 0 {
+        opts.custom_flags(flags);
     }
     let file = match opts.open(path) {
         Ok(f) => f,
@@ -59,7 +80,11 @@ pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CapRea
         }
         Err(e) => return Err(CapReadError::Io(e.to_string())),
     };
-    read_capped_from(file, max_bytes)
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => Ok(file),
+        Ok(_) => Err(CapReadError::NotRegular(path.display().to_string())),
+        Err(e) => Err(CapReadError::Io(e.to_string())),
+    }
 }
 
 fn is_symlink_open_error(e: &io::Error) -> bool {
@@ -184,6 +209,21 @@ mod tests {
         let path = dir.join("tiny.txt");
         fs::write(&path, b"hello").unwrap();
         assert_eq!(read_file_capped(&path, 64).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capped_read_refuses_directory_and_fifo() {
+        let dir = scratch("fifo");
+        fs::create_dir_all(&dir).unwrap();
+        let err = read_file_capped(&dir, 64).unwrap_err();
+        assert!(matches!(err, CapReadError::NotRegular(_)));
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.map(|s| s.success()).unwrap_or(false) {
+            let err = read_file_capped(&fifo, 64).unwrap_err();
+            assert!(matches!(err, CapReadError::NotRegular(_)));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

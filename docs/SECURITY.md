@@ -18,15 +18,15 @@ socket is the control plane for the user session, not a multi-tenant API.
 
 | Area | Behavior |
 |------|----------|
-| Socket bind | Refuse a symlink at the socket path. If a live listener is already bound, fail with “already running” instead of unlinking. Stale sockets are removed; non-socket files are not clobbered. Parent dir `0700`, socket `0600`. |
-| Credential files | Size-capped reads (64 KiB) with `O_NOFOLLOW` / symlink refuse. No TOCTOU `metadata` then unbounded `fs::read`. |
+| Socket bind | Refuse a symlink at the socket path. If a live listener is already bound, fail with “already running” instead of unlinking. Stale sockets are removed; non-socket files are not clobbered. A directory we create is `0700`; `/tmp` itself is not. Socket `0600`. |
+| Credential files | Size-capped reads (64 KiB). Symlinks, directories, and FIFOs are refused (`O_NOFOLLOW` + `O_NONBLOCK`, then `fstat`). No TOCTOU `metadata` then unbounded `fs::read`. |
 | `$HOME` unset | Fail closed. No probes of `/.codex/auth.json`. |
 | `home_path` | Must be absolute and must not contain `..`. `accounts.add` **rejects** an invalid path (does not silently fall back to the default CLI home). Persisted books are re-sanitized on load. Applied only to the **active account’s provider** (Codex vs Claude). |
 | HTTP errors | Status code only in snapshots. Response bodies are not copied into `error.message` or history JSONL. |
-| CodexBar ingest | Fixed filenames only. Never `cursor-session.json`. Malformed/partial JSONL lines are skipped (writer race). Empty/unparseable history candidates fall through. Snapshot reads are size-capped and symlink-safe. |
+| CodexBar ingest | Fixed filenames only. Never `cursor-session.json`. History lines longer than 64 KiB are skipped. The tail ring keeps the last N **parsed** rows, so a partial line does not evict a valid one. Empty candidates fall through. Opens are regular-file only. |
 | OpenBao | Plain HTTP is **exact** loopback (`127.0.0.1`, `localhost`, `::1`) unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. Nested prefixes (`quota/prod`) are allowed; `..` is not. `put` values capped at 32 KiB. Response bodies capped. `secret get` prints `present=true` only. `secret put` requires `--from-env` (never argv). File backend is read-only. |
 | State files | Accounts / optional history dirs we create are `0700`. Files are opened `0600` with `O_NOFOLLOW` and refused when the inode is group- or other-readable, before any bytes are written. |
-| Instance lock | Atomic `mkdir` on `{socket}.lock` (pid file; stale dir removed if `kill -0` fails) before unlinking a stale socket, so two startups cannot steal each other’s bind. |
+| Instance lock | `mkdir` mode `0700` on `{socket}.lock`. The pid is written and re-read before the lock is claimed. A missing pid is stolen only after it stays missing (a live starter is not unlinked mid-write). |
 | Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watchers cannot exhaust `status`/`refresh`. |
 | Window kinds | Unknown slot + no duration → `extra`/`unknown`, not invented `weekly`. |
 

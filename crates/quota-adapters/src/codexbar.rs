@@ -6,7 +6,6 @@
 //! tests, and any later importer that already has a CodexBar JSON file.
 
 use std::collections::VecDeque;
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -324,47 +323,104 @@ pub fn parse_account_snapshots(bytes: &[u8]) -> Result<Vec<ProviderSnapshot>, Co
     Ok(out)
 }
 
+/// One CodexBar history row is a small JSON object. A longer line is skipped
+/// so a truncated or hostile file cannot force an unbounded allocation.
+const MAX_HISTORY_LINE: usize = 64 * 1024;
+
 pub fn load_history_jsonl(path: &Path) -> Result<Vec<HistoryRow>, CodexBarError> {
-    let file = fs::File::open(path).map_err(|e| CodexBarError::Io(e.to_string()))?;
-    let reader = BufReader::new(file);
     let mut rows = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|e| CodexBarError::Io(e.to_string()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Skip malformed/partial lines (CodexBar may still be appending).
-        if let Ok(row) = serde_json::from_str::<HistoryRow>(&line) {
+    for_each_history_line(path, |line| {
+        if let Ok(row) = serde_json::from_str::<HistoryRow>(line) {
             rows.push(row);
         }
-    }
+    })?;
     Ok(rows)
 }
 
-/// Stream the file once, keep only the last `cap` *lines*, then parse those.
-/// Avoids allocating a `HistoryRow` per historical sample at daemon seed.
+/// Keep the last `cap` **parsed** rows. Malformed, partial, and over-long
+/// lines do not occupy a slot.
 pub fn load_history_jsonl_tail(path: &Path, cap: usize) -> Result<Vec<HistoryRow>, CodexBarError> {
     let cap = cap.max(1);
-    let file = fs::File::open(path).map_err(|e| CodexBarError::Io(e.to_string()))?;
-    let reader = BufReader::new(file);
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(cap);
-    for line in reader.lines() {
-        let line = line.map_err(|e| CodexBarError::Io(e.to_string()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let mut ring: VecDeque<HistoryRow> = VecDeque::with_capacity(cap);
+    for_each_history_line(path, |line| {
+        let Ok(row) = serde_json::from_str::<HistoryRow>(line) else {
+            return;
+        };
         if ring.len() == cap {
             ring.pop_front();
         }
-        ring.push_back(line);
+        ring.push_back(row);
+    })?;
+    Ok(ring.into_iter().collect())
+}
+
+fn for_each_history_line(path: &Path, mut on_line: impl FnMut(&str)) -> Result<(), CodexBarError> {
+    let file = quota_core::open_regular_file(path).map_err(|e| CodexBarError::Io(e.to_string()))?;
+    let mut reader = BufReader::new(file);
+    while let Some(line) = read_bounded_line(&mut reader)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        on_line(&line);
     }
-    let mut rows = Vec::with_capacity(ring.len());
-    for line in ring {
-        if let Ok(row) = serde_json::from_str::<HistoryRow>(&line) {
-            rows.push(row);
+    Ok(())
+}
+
+/// Next line that fits in [`MAX_HISTORY_LINE`], or `None` at EOF.
+/// Over-long lines are discarded without being returned.
+fn read_bounded_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, CodexBarError> {
+    loop {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut oversized = false;
+        let saw_newline = loop {
+            let data = reader
+                .fill_buf()
+                .map_err(|e| CodexBarError::Io(e.to_string()))?;
+            if data.is_empty() {
+                break false;
+            }
+            if let Some(i) = data.iter().position(|&b| b == b'\n') {
+                if !oversized && buf.len().saturating_add(i) <= MAX_HISTORY_LINE {
+                    buf.extend_from_slice(&data[..i]);
+                } else {
+                    oversized = true;
+                }
+                reader.consume(i + 1);
+                break true;
+            }
+            if oversized || buf.len().saturating_add(data.len()) > MAX_HISTORY_LINE {
+                oversized = true;
+                buf.clear();
+                let n = data.len();
+                reader.consume(n);
+            } else {
+                let n = data.len();
+                buf.extend_from_slice(data);
+                reader.consume(n);
+            }
+        };
+        if !saw_newline && buf.is_empty() {
+            return Ok(None);
+        }
+        if oversized {
+            if saw_newline {
+                continue;
+            }
+            return Ok(None);
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        match String::from_utf8(buf) {
+            Ok(line) => return Ok(Some(line)),
+            Err(_) => {
+                if saw_newline {
+                    continue;
+                }
+                return Ok(None);
+            }
         }
     }
-    Ok(rows)
 }
 
 pub fn history_to_snapshots(rows: &[HistoryRow]) -> Vec<Snapshot> {
@@ -439,6 +495,7 @@ mod tests {
     use super::*;
     use quota_core::math::{can_start, pace_for};
     use quota_core::types::CanStartBasis;
+    use std::fs;
 
     fn fixtures() -> std::path::PathBuf {
         workspace_fixtures_dir()
@@ -671,6 +728,34 @@ mod tests {
         assert_eq!(rows[0].used_percent, 10.0);
         let tail = load_history_jsonl_tail(&path, 8).unwrap();
         assert_eq!(tail.len(), 1);
+        let tail_one = load_history_jsonl_tail(&path, 1).unwrap();
+        assert_eq!(tail_one.len(), 1);
+        assert_eq!(tail_one[0].used_percent, 10.0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn partial_tail_does_not_evict_valid_row() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-jsonl-cap-{stamp}.jsonl"));
+        let row = |pct: f64| {
+            format!(
+                r#"{{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":{pct},"windowKind":"secondary","windowMinutes":10080}}"#
+            )
+        };
+        let huge = "x".repeat(MAX_HISTORY_LINE + 8);
+        fs::write(
+            &path,
+            format!("{}\n{}\n{huge}\n{}", row(1.0), row(2.0), row(3.0)),
+        )
+        .unwrap();
+        let tail = load_history_jsonl_tail(&path, 2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].used_percent, 2.0);
+        assert_eq!(tail[1].used_percent, 3.0);
         let _ = fs::remove_file(&path);
     }
 

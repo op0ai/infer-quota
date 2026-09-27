@@ -24,7 +24,7 @@ pub use config::Config;
 pub use framing::{decode_len, encode_frame, FrameError, MAX_FRAME_BYTES};
 pub use fsutil::{
     chmod_private_file, create_private_file, ensure_private_dir, open_private_append,
-    path_has_parent_dir, read_file_capped, CapReadError,
+    open_regular_file, path_has_parent_dir, read_file_capped, CapReadError,
 };
 pub use math::{burn_percent_per_sec, can_start, eta_empty_secs, select_samples};
 pub use paths::{

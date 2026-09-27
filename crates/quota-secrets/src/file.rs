@@ -29,6 +29,9 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, SecretsError> {
         Err(CapReadError::NotFound(p)) => Err(SecretsError::NotFound(p)),
         Err(CapReadError::TooLarge(_)) => Err(SecretsError::Io("credential file too large".into())),
         Err(CapReadError::Symlink(p)) => Err(SecretsError::Io(format!("refusing symlink {p}"))),
+        Err(CapReadError::NotRegular(p)) => {
+            Err(SecretsError::Io(format!("not a regular file: {p}")))
+        }
         Err(CapReadError::Io(e)) => Err(SecretsError::Io(e)),
     }
 }

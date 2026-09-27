@@ -80,6 +80,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, CredsError> {
         Err(CapReadError::NotFound(p)) => Err(CredsError::NotFound(p)),
         Err(CapReadError::TooLarge(_)) => Err(CredsError::TooLarge),
         Err(CapReadError::Symlink(p)) => Err(CredsError::Symlink(p)),
+        Err(CapReadError::NotRegular(p)) => Err(CredsError::Io(format!("not a regular file: {p}"))),
         Err(CapReadError::Io(e)) => Err(CredsError::Io(e)),
     }
 }
