@@ -49,6 +49,25 @@ If `~/.codex/config.toml` sets `chatgpt_base_url`:
 `primary_window` is mapped to `kind: session` (CodexBar's "session" lane).
 `secondary_window` → `weekly`.
 
+### CodexBar local snapshot files (fixture parser, not a probe)
+
+CodexBar on macOS stores a different JSON shape under
+`~/Library/Application Support/CodexBar/` (do not copy raw). Redacted
+fixtures live in `fixtures/codexbar/`.
+
+Lanes `primary` / `secondary` / `tertiary` use `usedPercent`,
+`windowMinutes`, `resetsAt`. Null lanes are skipped. This capture is
+**secondary-only** (`windowMinutes=10080` → weekly). `creditsAvailable:
+false` maps to `credits.has_credits=false` — we do not invent a balance.
+
+Usage-history JSONL rows carry `source=live|backfill`. That is sample
+provenance, not a credential `Source`. Replay tests keep the distinction;
+the daemon never reads CodexBar's live files.
+
+**Hypothesis:** CodexBar's in-app snapshot is derived from the same
+undocumented `/wham/usage` family. We do not claim the on-disk shape is a
+stable API.
+
 ### Not in v0
 
 - `codex app-server` JSON-RPC (`account/rateLimits/read`)

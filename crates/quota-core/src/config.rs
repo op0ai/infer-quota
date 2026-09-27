@@ -37,6 +37,9 @@ pub struct Config {
     /// Probe Claude when true (default).
     #[serde(default = "default_true")]
     pub enable_claude: bool,
+    /// Override path for the account-metadata book (no secrets).
+    #[serde(default)]
+    pub accounts_path: Option<PathBuf>,
 }
 
 fn default_ring() -> usize {
@@ -67,6 +70,7 @@ impl Default for Config {
             http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             enable_codex: true,
             enable_claude: true,
+            accounts_path: None,
         }
     }
 }
@@ -122,6 +126,12 @@ impl Config {
     pub fn refresh_max_secs(&self) -> u64 {
         self.refresh_max_secs
             .clamp(self.refresh_min_secs(), 24 * 3600)
+    }
+
+    pub fn accounts_file(&self) -> PathBuf {
+        self.accounts_path
+            .clone()
+            .unwrap_or_else(|| default_state_dir().join("accounts.json"))
     }
 }
 

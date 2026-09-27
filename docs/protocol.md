@@ -34,14 +34,46 @@ legal JSON; the length prefix is the boundary).
 {"id": 1, "method": "status", "params": {"provider": "all"}}
 ```
 
-| method       | params                                              | result                                      |
-|--------------|-----------------------------------------------------|---------------------------------------------|
-| `ping`       | ignored                                             | `{"pong": true}`                            |
-| `version`    | ignored                                             | `{"name","version","protocol"}`             |
-| `status`     | `{ "provider": "all"\|"codex"\|"claude" }`          | `{ "snapshot": Snapshot }`                  |
-| `pace`       | `{ "provider": ... }`                               | `{ "reports": [PaceReport] }`               |
-| `can_start`  | `{ "tokens": u64, "deadline"?: i64, "provider" }`   | `{ "ok": bool, "answers": [CanStartAnswer] }` |
-| `watch`      | `{ "provider": ... }`                               | stream of `status` results, same `id`       |
+| method              | params                                              | result                                      |
+|---------------------|-----------------------------------------------------|---------------------------------------------|
+| `ping`              | ignored                                             | `{"pong": true}`                            |
+| `version`           | ignored                                             | `{"name","version","protocol"}`             |
+| `status`            | `{ "provider": "all"\|"codex"\|"claude" }`          | `{ "snapshot": Snapshot }`                  |
+| `pace`              | `{ "provider": ... }`                               | `{ "reports": [PaceReport] }`               |
+| `can_start`         | `{ "tokens": u64, "deadline"?: i64, "provider" }`   | `{ "ok": bool, "answers": [CanStartAnswer] }` |
+| `watch`             | `{ "provider": ... }`                               | stream of `status` results, same `id`       |
+| `refresh`           | `{ "provider": ... }`                               | `{ "snapshot": Snapshot }` after a probe    |
+| `accounts.list`     | `{}`                                                | `{ "version", "active_id", "accounts" }`    |
+| `accounts.add`      | see below                                           | `{ "account", "active_id" }`                |
+| `accounts.remove`   | `{ "id" }`                                          | same as `accounts.list`                     |
+| `accounts.select`   | `{ "id": string\|null }`                            | same as `accounts.list`                     |
+
+Existing `status` / `pace` / `can_start` / `ping` / `version` / `watch` are
+unchanged. New methods are additive; `protocol` stays `1`.
+
+### Account metadata (no secrets)
+
+`accounts.add` params:
+
+```json
+{
+  "id": "optional-stable-id",
+  "provider": "codex",
+  "email": "openai@ctx.op0.dev",
+  "workspace_label": "Personal",
+  "login_method": "pro",
+  "workspace_account_id": "optional",
+  "secret_ref": { "backend": "openbao", "path": "codex/work" },
+  "home_path": "/optional/isolated/CODEX_HOME",
+  "select": true
+}
+```
+
+`secret_ref` is a pointer. The socket must not carry passwords, JWTs, or
+access tokens — put those through `quota-secrets` / `quota-ctl secret put`.
+`quotad` still owns polling; `quota-ctl` is the mutating control surface.
+When an account is selected and `home_path` is set, the next `refresh`
+uses that path as `CODEX_HOME` for the Codex adapter.
 
 `deadline` is UTC unix seconds. When omitted, `can_start` binds to the window's
 published `reset_at`.
@@ -82,6 +114,10 @@ Clients **must ignore unknown fields**.
 ## Future clients (menu bar, Herdr, tmux, MCP)
 
 Talk to this socket. Do not re-implement provider HTTP.
+
+`quota-ctl` (library crate `quota_ctl`) is the CodexBar-shaped foil: add /
+list / remove / select accounts and `refresh`. Menu-bar / tmux / MCP clients
+should call the same methods — they must not become a second collector.
 
 Python sketch:
 

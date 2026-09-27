@@ -7,5 +7,6 @@
   "refresh_max_secs": 300,
   "http_timeout_secs": 10,
   "enable_codex": true,
-  "enable_claude": true
+  "enable_claude": true,
+  "accounts_path": null
 }

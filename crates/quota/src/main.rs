@@ -21,7 +21,7 @@ use quota_core::protocol::{
 };
 use quota_core::Config;
 
-use crate::client::{rpc, rpc_watch, ClientError};
+use crate::client::{decode_result, err_msg, rpc, rpc_watch, ClientError};
 use crate::render::{print_can_start, print_pace, print_status};
 
 #[derive(Parser, Debug)]
@@ -220,24 +220,4 @@ fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, ClientError> {
             Ok(ExitCode::SUCCESS)
         }
     }
-}
-
-fn decode_result<T: serde::de::DeserializeOwned>(
-    resp: &quota_core::protocol::Response,
-) -> Result<T, ClientError> {
-    if !resp.ok {
-        return Err(ClientError::Rpc(err_msg(resp)));
-    }
-    let value = resp
-        .result
-        .clone()
-        .ok_or_else(|| ClientError::Rpc("empty result".into()))?;
-    serde_json::from_value(value).map_err(|e| ClientError::Rpc(e.to_string()))
-}
-
-fn err_msg(resp: &quota_core::protocol::Response) -> String {
-    resp.error
-        .as_ref()
-        .map(|e| format!("{}: {}", e.code, e.message))
-        .unwrap_or_else(|| "request failed".into())
 }

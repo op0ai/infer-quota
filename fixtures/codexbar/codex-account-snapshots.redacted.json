@@ -1,0 +1,58 @@
+{
+  "records": [
+    {
+      "accountIdentity": {
+        "authFingerprint": "<redacted len=64>",
+        "normalizedEmail": "openai@ctx.op0.dev",
+        "selectionSource": {
+          "kind": "liveSystem"
+        },
+        "storedAccountID": "3D71AACB-624B-4702-ADB5-496FAD823580",
+        "workspaceAccountID": "072a8214-59be-4a01-a982-e42f80531441"
+      },
+      "credits": {
+        "balanceIsWorkspace": false,
+        "balanceReadSucceeded": true,
+        "creditsAvailable": false,
+        "events": [],
+        "remaining": 0,
+        "updatedAt": 812150790.700941
+      },
+      "id": "openai@ctx.op0.dev",
+      "snapshot": {
+        "accountEmail": "openai@ctx.op0.dev",
+        "codexResetCredits": {
+          "availableCount": 0,
+          "credits": [],
+          "updatedAt": 812150779.909332
+        },
+        "dataConfidence": "exact",
+        "identity": {
+          "accountEmail": "openai@ctx.op0.dev",
+          "loginMethod": "pro",
+          "providerID": "codex"
+        },
+        "loginMethod": "pro",
+        "primary": null,
+        "providerCost": {
+          "balanceUpdatedAt": 812150779.909338,
+          "currencyCode": "Credits",
+          "limit": 0,
+          "period": "Extra usage",
+          "updatedAt": 812150779.909338,
+          "used": 0
+        },
+        "secondary": {
+          "resetDescription": "Oct 3 at 10:28\u202fPM",
+          "resetsAt": 812739489,
+          "usedPercent": 59,
+          "windowMinutes": 10080
+        },
+        "tertiary": null,
+        "updatedAt": 812150779.909338
+      },
+      "sourceLabel": "oauth"
+    }
+  ],
+  "version": 1
+}

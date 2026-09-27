@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::{AccountBook, AccountRecord};
 use crate::types::{CanStartAnswer, PaceReport, ProviderId, Snapshot, PACKAGE_VERSION};
 
 /// Bump when adding a breaking field. Additive optional fields do not require a bump.
@@ -17,6 +18,12 @@ pub const METHOD_STATUS: &str = "status";
 pub const METHOD_PACE: &str = "pace";
 pub const METHOD_CAN_START: &str = "can_start";
 pub const METHOD_WATCH: &str = "watch";
+/// Immediate provider probe (same as the timer). Additive in protocol 1.
+pub const METHOD_REFRESH: &str = "refresh";
+pub const METHOD_ACCOUNTS_LIST: &str = "accounts.list";
+pub const METHOD_ACCOUNTS_ADD: &str = "accounts.add";
+pub const METHOD_ACCOUNTS_REMOVE: &str = "accounts.remove";
+pub const METHOD_ACCOUNTS_SELECT: &str = "accounts.select";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +91,73 @@ pub struct CanStartParams {
 pub struct WatchParams {
     #[serde(default = "default_all")]
     pub provider: ProviderFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RefreshParams {
+    #[serde(default = "default_all")]
+    pub provider: ProviderFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AccountsListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountsAddParams {
+    /// Caller-supplied id. Daemon generates one when omitted.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub provider: ProviderId,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub workspace_label: Option<String>,
+    #[serde(default)]
+    pub login_method: Option<String>,
+    #[serde(default)]
+    pub workspace_account_id: Option<String>,
+    #[serde(default)]
+    pub secret_ref: Option<crate::accounts::SecretRef>,
+    #[serde(default)]
+    pub home_path: Option<String>,
+    /// When true, this account becomes the active selection.
+    #[serde(default)]
+    pub select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountsRemoveParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountsSelectParams {
+    /// `null` / omitted clears the selection.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountsListResult {
+    pub version: u32,
+    pub active_id: Option<String>,
+    pub accounts: Vec<AccountRecord>,
+}
+
+impl From<&AccountBook> for AccountsListResult {
+    fn from(book: &AccountBook) -> Self {
+        Self {
+            version: book.version,
+            active_id: book.active_id.clone(),
+            accounts: book.accounts.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountMutationResult {
+    pub account: AccountRecord,
+    pub active_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

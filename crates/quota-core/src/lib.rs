@@ -6,14 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accounts;
 pub mod config;
 pub mod framing;
 pub mod math;
 pub mod paths;
 pub mod protocol;
+#[cfg(unix)]
+pub mod rpc;
 pub mod timeutil;
 pub mod types;
 
+pub use accounts::{AccountBook, AccountRecord, SecretRef};
 pub use config::Config;
 pub use framing::{decode_len, encode_frame, FrameError, MAX_FRAME_BYTES};
 pub use math::{burn_percent_per_sec, can_start, eta_empty_secs, select_samples};
@@ -22,9 +26,11 @@ pub use paths::{
     default_state_dir, home_dir,
 };
 pub use protocol::{
-    CanStartParams, ErrorBody, PaceParams, ProviderFilter, Request, Response, StatusParams,
-    WatchParams, METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_STATUS, METHOD_VERSION,
-    METHOD_WATCH, PROTOCOL_VERSION,
+    AccountMutationResult, AccountsAddParams, AccountsListResult, AccountsRemoveParams,
+    AccountsSelectParams, CanStartParams, ErrorBody, PaceParams, ProviderFilter, RefreshParams,
+    Request, Response, StatusParams, WatchParams, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST,
+    METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT, METHOD_CAN_START, METHOD_PACE, METHOD_PING,
+    METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH, PROTOCOL_VERSION,
 };
 pub use types::{
     AdapterError, Availability, CanStartAnswer, CanStartBasis, Credits, PaceReport, ProviderId,

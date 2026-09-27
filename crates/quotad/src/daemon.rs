@@ -12,9 +12,12 @@ use quota_adapters::{ClaudeAdapter, CodexAdapter};
 use quota_core::framing::{decode_len, encode_frame, FrameError};
 use quota_core::math::{can_start, pace_for};
 use quota_core::protocol::{
-    CanStartParams, CanStartResult, ErrorBody, PaceParams, PaceResult, ProviderFilter, Request,
-    Response, StatusParams, StatusResult, VersionInfo, WatchParams, METHOD_CAN_START, METHOD_PACE,
-    METHOD_PING, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH,
+    AccountMutationResult, AccountsAddParams, AccountsRemoveParams, AccountsSelectParams,
+    CanStartParams, CanStartResult, ErrorBody, PaceParams, PaceResult, ProviderFilter,
+    RefreshParams, Request, Response, StatusParams, StatusResult, VersionInfo, WatchParams,
+    METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT,
+    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION,
+    METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
 use quota_core::types::{Availability, Snapshot};
@@ -23,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::accounts::AccountStore;
 use crate::store::Store;
 
 pub fn run(cfg: Config) -> Result<(), DaemonError> {
@@ -42,6 +46,7 @@ pub enum DaemonError {
 struct App {
     cfg: Config,
     store: Store,
+    accounts: AccountStore,
     interval_secs: u64,
     watch_tx: broadcast::Sender<Snapshot>,
 }
@@ -70,9 +75,11 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     );
 
     let (watch_tx, _) = broadcast::channel(16);
+    let accounts = AccountStore::load(cfg.accounts_file());
     let app = Arc::new(Mutex::new(App {
         interval_secs: cfg.refresh_min_secs(),
         store: Store::new(&cfg),
+        accounts,
         cfg,
         watch_tx,
     }));
@@ -126,20 +133,27 @@ fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
 }
 
 async fn refresh(app: Arc<Mutex<App>>) {
-    let (timeout, enable_codex, enable_claude, min_s, max_s) = {
+    let (timeout, enable_codex, enable_claude, min_s, max_s, codex_home) = {
         let g = app.lock().await;
+        let home = g
+            .accounts
+            .book()
+            .active()
+            .and_then(|a| a.home_path.clone())
+            .map(std::path::PathBuf::from);
         (
             g.cfg.http_timeout_secs,
             g.cfg.enable_codex,
             g.cfg.enable_claude,
             g.cfg.refresh_min_secs(),
             g.cfg.refresh_max_secs(),
+            home,
         )
     };
 
     let snap = tokio::task::spawn_blocking(move || {
         let transport = TlsTransport::new(Duration::from_secs(timeout));
-        let codex = CodexAdapter::default();
+        let codex = CodexAdapter { home: codex_home };
         let claude = ClaudeAdapter;
         let mut providers: Vec<&dyn Provider> = Vec::new();
         if enable_codex {
@@ -330,6 +344,60 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
             let ok = !available.is_empty() && available.iter().all(|a| a.ok);
             Response::result(req.id, CanStartResult { ok, answers })
         }
+        METHOD_REFRESH => {
+            let params: RefreshParams = serde_json::from_value(req.params).unwrap_or_default();
+            refresh(app.clone()).await;
+            let g = app.lock().await;
+            let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+            Response::result(req.id, StatusResult { snapshot: snap })
+        }
+        METHOD_ACCOUNTS_LIST => {
+            let g = app.lock().await;
+            Response::result(req.id, g.accounts.list())
+        }
+        METHOD_ACCOUNTS_ADD => {
+            let params: AccountsAddParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Response::err(req.id, "bad_params", format!("accounts.add: {e}")),
+            };
+            let mut g = app.lock().await;
+            match g.accounts.add(params) {
+                Ok(account) => {
+                    let active_id = g.accounts.list().active_id;
+                    Response::result(req.id, AccountMutationResult { account, active_id })
+                }
+                Err(e) => Response::err(req.id, "accounts", e),
+            }
+        }
+        METHOD_ACCOUNTS_REMOVE => {
+            let params: AccountsRemoveParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::err(req.id, "bad_params", format!("accounts.remove: {e}"));
+                }
+            };
+            let mut g = app.lock().await;
+            match g.accounts.remove(&params.id) {
+                Ok(true) => Response::result(req.id, g.accounts.list()),
+                Ok(false) => {
+                    Response::err(req.id, "not_found", format!("no account {}", params.id))
+                }
+                Err(e) => Response::err(req.id, "accounts", e),
+            }
+        }
+        METHOD_ACCOUNTS_SELECT => {
+            let params: AccountsSelectParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::err(req.id, "bad_params", format!("accounts.select: {e}"));
+                }
+            };
+            let mut g = app.lock().await;
+            match g.accounts.select(params.id) {
+                Ok(_) => Response::result(req.id, g.accounts.list()),
+                Err(e) => Response::err(req.id, "accounts", e),
+            }
+        }
         unknown => Response {
             id: req.id,
             ok: false,
@@ -385,9 +453,15 @@ mod tests {
     use quota_core::types::{AdapterError, ProviderId, ProviderSnapshot};
 
     fn test_app() -> App {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let accounts_path = std::env::temp_dir().join(format!("quota-test-acct-{stamp}.json"));
         let cfg = Config {
             history: false,
             ring_capacity: 16,
+            accounts_path: Some(accounts_path.clone()),
             ..Config::default()
         };
         let (watch_tx, _) = broadcast::channel(4);
@@ -402,6 +476,7 @@ mod tests {
         App {
             interval_secs: 30,
             store,
+            accounts: AccountStore::load(accounts_path),
             cfg,
             watch_tx,
         }
@@ -446,5 +521,45 @@ mod tests {
         let a = Snapshot::new(1, vec![]);
         let b = Snapshot::new(2, vec![]);
         assert!(same_usage(&a, &b));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accounts_add_list_remove() {
+        let app = Arc::new(Mutex::new(test_app()));
+        let add = Request::with_params(
+            10,
+            METHOD_ACCOUNTS_ADD,
+            quota_core::AccountsAddParams {
+                id: Some("acct_x".into()),
+                provider: ProviderId::Codex,
+                email: Some("openai@ctx.op0.dev".into()),
+                workspace_label: Some("Personal".into()),
+                login_method: Some("pro".into()),
+                workspace_account_id: None,
+                secret_ref: None,
+                home_path: None,
+                select: true,
+            },
+        );
+        let resp = dispatch(&app, add).await;
+        assert!(resp.ok);
+        let listed = dispatch(&app, Request::new(11, METHOD_ACCOUNTS_LIST)).await;
+        let book: quota_core::AccountsListResult =
+            serde_json::from_value(listed.result.unwrap()).unwrap();
+        assert_eq!(book.accounts.len(), 1);
+        assert_eq!(book.active_id.as_deref(), Some("acct_x"));
+        let rm = Request::with_params(
+            12,
+            METHOD_ACCOUNTS_REMOVE,
+            quota_core::AccountsRemoveParams {
+                id: "acct_x".into(),
+            },
+        );
+        let gone = dispatch(&app, rm).await;
+        assert!(gone.ok);
+        let listed = dispatch(&app, Request::new(13, METHOD_ACCOUNTS_LIST)).await;
+        let book: quota_core::AccountsListResult =
+            serde_json::from_value(listed.result.unwrap()).unwrap();
+        assert!(book.accounts.is_empty());
     }
 }

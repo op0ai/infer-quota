@@ -1,0 +1,24 @@
+[package]
+name = "quota-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Companion control plane for quotad (accounts + refresh; no collector)"
+readme = false
+
+[lib]
+name = "quota_ctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quota-ctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+quota-core.workspace = true
+quota-secrets = { path = "../quota-secrets", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

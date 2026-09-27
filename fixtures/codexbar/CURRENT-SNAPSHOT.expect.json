@@ -1,0 +1,23 @@
+{
+  "provider": "codex",
+  "loginMethod": "pro",
+  "dataConfidence": "exact",
+  "secondary": {
+    "resetDescription": "Oct 3 at 10:28\u202fPM",
+    "resetsAt": 812739489,
+    "usedPercent": 59,
+    "windowMinutes": 10080
+  },
+  "primary": null,
+  "tertiary": null,
+  "providerCost": {
+    "balanceUpdatedAt": 812150779.909338,
+    "currencyCode": "Credits",
+    "limit": 0,
+    "period": "Extra usage",
+    "updatedAt": 812150779.909338,
+    "used": 0
+  },
+  "credits_remaining": 0,
+  "note": "Redacted from Arth Mac CodexBar 2026-09-27; accountKey hashed in usage-history; never commit real authFingerprints/tokens/session cookies."
+}

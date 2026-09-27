@@ -8,6 +8,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codexbar;
 pub mod creds;
 pub mod http;
 pub mod provider;

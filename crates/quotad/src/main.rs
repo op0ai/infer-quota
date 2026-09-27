@@ -8,6 +8,7 @@
 #[cfg(not(unix))]
 compile_error!("quotad requires a Unix domain socket (macOS or Linux)");
 
+mod accounts;
 mod daemon;
 mod store;
 

@@ -1,0 +1,17 @@
+{
+  "accounts": [
+    {
+      "authFingerprint": "<redacted>",
+      "createdAt": 1788505945.705807,
+      "email": "openai@ctx.op0.dev",
+      "id": "3D71AACB-624B-4702-ADB5-496FAD823580",
+      "lastAuthenticatedAt": 1789211877.630327,
+      "managedHomePath": "<redacted-path>",
+      "providerAccountID": "072a8214-59be-4a01-a982-e42f80531441",
+      "updatedAt": 1789211877.630327,
+      "workspaceAccountID": "072a8214-59be-4a01-a982-e42f80531441",
+      "workspaceLabel": "Personal"
+    }
+  ],
+  "version": 3
+}

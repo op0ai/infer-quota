@@ -1,0 +1,19 @@
+[package]
+name = "quota-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ordered secrets backends (OpenBao, OS keychain stub, local CLI files)"
+readme = false
+
+[features]
+default = []
+# Compiles the same OpenBao client; reserved so callers can feature-gate later.
+openbao = []
+
+[dependencies]
+quota-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
