@@ -120,7 +120,7 @@ fn write_book(path: &Path, book: &AccountBook) -> Result<(), String> {
     f.write_all(b"\n").map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    let _ = chmod_private_file(path);
+    chmod_private_file(path).map_err(|e| e.to_string())?;
     Ok(())
 }
 

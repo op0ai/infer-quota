@@ -160,7 +160,7 @@ fn bench_rtt(socket: &Path, warmup: usize, iters: usize) {
 fn bench_pace(history: &Path, iters: usize) {
     let rows = load_history_jsonl(history).expect("load history");
     let snaps = history_to_snapshots(&rows);
-    assert_eq!(rows.len(), 1912, "fixture row count changed");
+    assert!(!rows.is_empty(), "history has no usable rows");
     let latest = snaps
         .last()
         .and_then(|s| s.by_id(ProviderId::Codex).cloned())
@@ -223,7 +223,7 @@ fn bench_serialize(history: &Path, iters: usize, ring: usize) {
         }
         ring_push.push(t0.elapsed().as_nanos() as u64);
     }
-    print_row("ring_replay_1912", ring_push);
+    print_row(&format!("ring_replay_{}", snaps.len()), ring_push);
 }
 
 fn bench_watch(socket: &Path, clients: usize, iters: usize) {

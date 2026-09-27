@@ -103,20 +103,47 @@ pub fn chmod_private_file(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, perms)
 }
 
-/// Create or truncate `path` with mode `0600` at open (not after write).
-pub fn create_private_file(path: &Path) -> io::Result<File> {
+fn private_open_opts() -> OpenOptions {
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
     opts.mode(0o600);
-    opts.open(path)
+    if O_NOFOLLOW != 0 {
+        opts.custom_flags(O_NOFOLLOW);
+    }
+    opts
+}
+
+/// Create or truncate `path` with mode `0600` at open (not after write).
+/// Refuses a final-component symlink and a file that is group/other-readable.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut opts = private_open_opts();
+    opts.write(true).create(true).truncate(true);
+    let file = opts.open(path)?;
+    require_owner_only(&file)?;
+    Ok(file)
 }
 
 /// Open `path` for append, creating it as `0600` when new.
+/// Refuses a symlink and an existing file with group or other permission bits
+/// so history is not appended into a shared file.
 pub fn open_private_append(path: &Path) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
+    let mut opts = private_open_opts();
     opts.create(true).append(true);
-    opts.mode(0o600);
-    opts.open(path)
+    let file = opts.open(path)?;
+    require_owner_only(&file)?;
+    Ok(file)
+}
+
+/// The opened inode must not grant group or other access.
+pub fn require_owner_only(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing mode {mode:o}; file must be owner-only"),
+        ));
+    }
+    Ok(())
 }
 
 /// True when every path segment is a normal name (no `..`, no empty).
@@ -177,6 +204,28 @@ mod tests {
     fn parent_dir_detection() {
         assert!(path_has_parent_dir(Path::new("a/../b")));
         assert!(!path_has_parent_dir(Path::new("/home/user/.codex")));
+    }
+
+    #[test]
+    fn append_refuses_group_readable_and_symlink() {
+        let dir = scratch("append");
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared.jsonl");
+        fs::write(&shared, b"{}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&shared).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&shared, perms).unwrap();
+        let err = open_private_append(&shared).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let target = dir.join("target.jsonl");
+        let link = dir.join("link.jsonl");
+        fs::write(&target, b"x").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(create_private_file(&link).is_err());
+        assert!(open_private_append(&link).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

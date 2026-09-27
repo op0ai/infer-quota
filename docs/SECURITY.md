@@ -25,7 +25,7 @@ socket is the control plane for the user session, not a multi-tenant API.
 | HTTP errors | Status code only in snapshots. Response bodies are not copied into `error.message` or history JSONL. |
 | CodexBar ingest | Fixed filenames only. Never `cursor-session.json`. Malformed/partial JSONL lines are skipped (writer race). Empty/unparseable history candidates fall through. Snapshot reads are size-capped and symlink-safe. |
 | OpenBao | Plain HTTP is **exact** loopback (`127.0.0.1`, `localhost`, `::1`) unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. Nested prefixes (`quota/prod`) are allowed; `..` is not. `put` values capped at 32 KiB. Response bodies capped. `secret get` prints `present=true` only. `secret put` requires `--from-env` (never argv). File backend is read-only. |
-| State files | Accounts / optional history dirs `0700`. Files are created `0600` (`O_CREAT` mode), not chmod-after-write. |
+| State files | Accounts / optional history dirs we create are `0700`. Files are opened `0600` with `O_NOFOLLOW` and refused when the inode is group- or other-readable, before any bytes are written. |
 | Instance lock | Atomic `mkdir` on `{socket}.lock` (pid file; stale dir removed if `kill -0` fails) before unlinking a stale socket, so two startups cannot steal each other’s bind. |
 | Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watchers cannot exhaust `status`/`refresh`. |
 | Window kinds | Unknown slot + no duration → `extra`/`unknown`, not invented `weekly`. |
@@ -49,9 +49,13 @@ socket is the control plane for the user session, not a multi-tenant API.
 4. **Keychain backend is a stub** (`unimplemented`). The chain falls
    through to the file backend.
 
-5. **Custom `--socket` under `/tmp`.** Parent is created `0700`, symlink
-   bind is refused, but a world-writable *ancestor* is still a local
-   attack surface. Prefer `$XDG_RUNTIME_DIR`.
+5. **Custom `--socket` under `/tmp`.** A *subdirectory we create*
+   (for example `/tmp/quota-run/`) is `0700`. `/tmp` itself stays
+   shared: `ensure_private_dir` does not chmod an existing parent when
+   that chmod is denied, and a socket path of `/tmp/quota.sock` does
+   not get a private parent. Symlink bind is still refused. There is
+   also a short window between `bind` and `chmod 0600` on the socket
+   inode. Prefer `$XDG_RUNTIME_DIR`.
 
 6. **`rustls-webpki` 0.101.7 advisories (accepted).** `quotad` stays on
    `rustls 0.21.12` for MSRV 1.83 without pulling `url`/`icu`. CI

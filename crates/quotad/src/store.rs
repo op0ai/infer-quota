@@ -57,7 +57,7 @@ fn append_jsonl(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
     let mut f = quota_core::open_private_append(path)?;
     serde_json::to_writer(&mut f, snap).map_err(std::io::Error::other)?;
     f.write_all(b"\n")?;
-    let _ = quota_core::chmod_private_file(path);
+    quota_core::chmod_private_file(path)?;
     Ok(())
 }
 
