@@ -18,12 +18,22 @@ pub enum SecretsError {
     Config(String),
 }
 
-/// A retrieved secret. Never log `value`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A retrieved secret. `Debug` redacts `value` so logs cannot print it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretRecord {
     pub backend: &'static str,
     pub path: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for SecretRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretRecord")
+            .field("backend", &self.backend)
+            .field("path", &self.path)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 pub trait SecretsBackend: Send + Sync {

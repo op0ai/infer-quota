@@ -71,8 +71,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let _lock = acquire_instance_lock(&socket)?;
     prepare_socket(&socket)?;
 
-    let listener = UnixListener::bind(&socket).map_err(|e| DaemonError::Io(e.to_string()))?;
-    let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
+    let listener = bind_private_socket(&socket)?;
     let rpc_slots = Arc::new(Semaphore::new(MAX_RPC_CLIENTS));
     let watch_slots = Arc::new(Semaphore::new(MAX_WATCH_CLIENTS));
 
@@ -232,6 +231,44 @@ fn acquire_instance_lock(socket: &Path) -> Result<InstanceLock, DaemonError> {
         "could not acquire instance lock at {}",
         dir.display()
     )))
+}
+
+/// Bind with umask `0177` so the inode is created mode `0600`, then chmod
+/// again and refuse to listen if group/other bits remain.
+fn bind_private_socket(path: &Path) -> Result<UnixListener, DaemonError> {
+    let listener = {
+        let previous = rustix::process::umask(
+            rustix::fs::Mode::XUSR | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+        );
+        let _restore = UmaskGuard(previous);
+        UnixListener::bind(path).map_err(|e| DaemonError::Io(e.to_string()))?
+    };
+    let mut perms = fs::metadata(path)
+        .map_err(|e| DaemonError::Io(e.to_string()))?
+        .permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+        .map_err(|e| DaemonError::Io(format!("chmod 0600 {}: {e}", path.display())))?;
+    let mode = fs::metadata(path)
+        .map_err(|e| DaemonError::Io(e.to_string()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(DaemonError::Io(format!(
+            "socket {} mode is {mode:o}; refusing to listen",
+            path.display()
+        )));
+    }
+    Ok(listener)
+}
+
+struct UmaskGuard(rustix::fs::Mode);
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        rustix::process::umask(self.0);
+    }
 }
 
 fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
@@ -842,6 +879,26 @@ mod tests {
         drop(listener);
         prepare_socket(&sock).unwrap();
         assert!(!sock.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_is_owner_only() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-mode-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt.block_on(async { bind_private_socket(&sock).unwrap() });
+        let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,25 +1,55 @@
 # Secrets
 
 `quota-secrets` is the unified lookup crate. `quota-ctl` is the human CLI.
-`quotad` never stores passwords, API keys, or JWTs.
+`quotad` never stores passwords, API keys, or JWTs, and does not depend on
+this crate.
 
 ## Order (first hit wins)
 
-1. **OpenBao** (optional) — KV v2. Used for material the companion *adds*
-   (managed account keys). Not required for `cargo test` or a default
-   `quotad` that only reuses existing CLI sessions.
-2. **OS keychain** — macOS Keychain / Linux secret-service. **Scaffold** in
-   this tree: the trait is there; Security.framework is not linked. On
-   non-macOS the backend returns `unimplemented`.
+1. **OpenBao** (feature `openbao`) — KV v2. `quota-ctl` enables the feature.
+   Building `quota-secrets` without it omits the HTTP client and rustls.
+   Used for material the companion *adds*. Not required for `cargo test` or
+   a default `quotad` that only reuses existing CLI sessions.
+2. **OS keychain**
+   - **Linux:** secret-service over the session bus (`secret-service` 4,
+     zbus, RustCrypto, no libdbus). Item attributes:
+     `application=infer-quota`, `path=<logical path>`. If there is no
+     session bus, the backend returns `Unavailable` and the chain skips it.
+   - **macOS:** Security.framework generic password, service `infer-quota`,
+     account = logical path. This code is compiled only for
+     `target_os = "macos"`.
+   - **Other OS:** `Unavailable` with an explicit message. The chain skips
+     it. This is not a silent success.
 3. **CLI files** (read-only, last resort) — the same paths `quota-adapters`
    already consult:
    - `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
    - `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`
 
-File writes are refused. Official CLIs own those files (`codex login`,
-Claude Code `/login`).
+File writes are refused (`ReadOnly`). Official CLIs own those files
+(`codex login`, Claude Code `/login`). `secret put` never creates or
+rewrites them.
 
-## OpenBao (local, not production)
+`secret get` prints `backend=`, `path=`, and `present=true` only. The
+secret bytes are not an argument of that formatter. `secret put` reads
+material from `--from-env` (never argv) and refuses an empty value.
+`Debug` on the OpenBao client and on `SecretRecord` redacts the token and
+the value.
+
+## OpenBao
+
+`https://` uses rustls 0.21 with the webpki root set. Set
+`QUOTA_OPENBAO_CA_FILE` to a PEM file of extra CA certificates for a
+private endpoint. `http://` is exact loopback (`127.0.0.1`, `localhost`,
+`::1`, including bracketed IPv6) unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`.
+URLs must not embed userinfo. Logical KV paths may contain nested segments
+(`quota/prod`) and must not contain `..`. `put` values are capped at 32 KiB.
+Response bodies are capped at 64 KiB. Error strings carry HTTP status codes,
+not response bodies or the token.
+
+### Local HTTP (dev only)
+
+`docker-compose.dev.yml` starts OpenBao in `-dev` mode. The token below is
+a dummy label, not a production credential.
 
 ```bash
 docker compose -f docker-compose.dev.yml up -d
@@ -27,24 +57,32 @@ export QUOTA_OPENBAO_ADDR=http://127.0.0.1:8200
 export QUOTA_OPENBAO_TOKEN=dev-only-not-for-prod
 export QUOTA_OPENBAO_MOUNT=secret
 export QUOTA_OPENBAO_PREFIX=quota
-quota-ctl secret backends          # openbao keychain file
+quota-ctl secret backends
 # material from env — never argv, never committed
 export QUOTA_PUT=sk-example-not-real
 quota-ctl secret put codex/work --from-env QUOTA_PUT
-quota-ctl secret get codex/work    # prints backend= and present=true only
+quota-ctl secret get codex/work    # backend= path= present=true
 ```
 
-The compose file starts **dev** OpenBao with a well-known root token. That
-token is not a secret; do not reuse it anywhere else. The HTTP client in
-`quota-secrets` is **plain HTTP** (no rustls) and is **loopback-only**
-unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. For TLS, put a proxy in front
-or extend the scaffold. Logical KV paths may not contain `..`.
+### TLS
+
+```bash
+export QUOTA_OPENBAO_ADDR=https://bao.example:8200
+export QUOTA_OPENBAO_TOKEN=...          # not from argv, not committed
+export QUOTA_OPENBAO_CA_FILE=/path/to/ca.pem   # optional extra roots
+```
+
+Default port for `https://` with no port is 443.
+
+## What `cargo test` does
+
+`cargo test --workspace` does **not** start Docker and does **not** dial
+`:8200`. OpenBao tests use an in-process TCP listener (plain HTTP) and an
+in-process rustls listener with an rcgen certificate. Keychain tests skip
+cleanly when the session bus (or macOS keychain) is unavailable.
 
 `quotad` does not call this crate. `secret_ref` on an account is metadata
 for humans / future wiring — the daemon still reads CLI session files.
-
-Default `cargo test --workspace` does not start OpenBao and does not open
-sockets to `:8200`.
 
 ## What never goes in git
 
@@ -55,8 +93,28 @@ sockets to `:8200`.
 Account metadata on the Unix socket (`accounts.add`) may include a
 `secret_ref` `{ backend, path }` — a pointer, not the bytes.
 
-## Feature flag
+## VERIFIED / UNVERIFIED
 
-Crate feature `openbao` is reserved and currently empty: the HTTP client
-always compiles so tests can cover URL parsing without a live server.
-Enable it in dependents if you want to advertise the optional dep.
+**VERIFIED** (this tree, `cargo test`, no live OpenBao):
+
+- Feature `openbao` compiles the client and rustls; without the feature the
+  module is absent. `quota-ctl` enables it. `quotad` does not depend on
+  `quota-secrets`.
+- Plain-HTTP loopback fence, nested prefix, 32 KiB put cap, empty-secret
+  refusal, credential-in-URL refusal.
+- In-process mock HTTP get/put/delete.
+- In-process rustls handshake to `localhost`. The test mints a CA and a
+  leaf with `rcgen` at runtime. No certificate or key is committed.
+- `Debug` redacts the OpenBao token and `SecretRecord.value`.
+- `secret get` presence line does not contain the material.
+- File backend `put` returns `ReadOnly`.
+- Linux keychain calls secret-service. With no session bus the test returns
+  `Unavailable` and does not panic.
+
+**UNVERIFIED:**
+
+- A live `docker compose` OpenBao (dev HTTP). The commands above match the
+  compose file; they were not required for the default test run.
+- A live Linux secret-service roundtrip (this environment has no session bus).
+- macOS Security.framework (no macOS runner here). The calls match
+  `security-framework` 2.11 generic-password APIs.

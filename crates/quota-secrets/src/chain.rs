@@ -1,9 +1,11 @@
 use crate::file::FileOauthBackend;
 use crate::keychain::KeychainBackend;
+#[cfg(feature = "openbao")]
 use crate::openbao::OpenBaoBackend;
 use crate::types::{SecretRecord, SecretsBackend, SecretsError};
 
-/// Ordered fallback: OpenBao (if configured) → keychain stub → file OAuth.
+/// Ordered fallback: OpenBao (if the `openbao` feature is on and env is set)
+/// → OS keychain → read-only CLI files.
 pub struct SecretChain {
     backends: Vec<Box<dyn SecretsBackend>>,
 }
@@ -73,9 +75,11 @@ impl SecretsBackend for SecretChain {
     }
 }
 
-/// Build the default ordered chain. OpenBao is included only when env is set.
+/// Build the default ordered chain. OpenBao is included only when the
+/// `openbao` feature is enabled and `QUOTA_OPENBAO_ADDR` is set.
 pub fn from_env() -> Result<SecretChain, SecretsError> {
     let mut backends: Vec<Box<dyn SecretsBackend>> = Vec::new();
+    #[cfg(feature = "openbao")]
     if let Some(bao) = OpenBaoBackend::from_env()? {
         backends.push(Box::new(bao));
     }

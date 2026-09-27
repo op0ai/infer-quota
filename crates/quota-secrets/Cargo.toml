@@ -4,16 +4,43 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Ordered secrets backends (OpenBao, OS keychain stub, local CLI files)"
+description = "Ordered secrets backends (OpenBao, OS keychain, read-only CLI files)"
 readme = false
 
 [features]
 default = []
-# Compiles the same OpenBao client; reserved so callers can feature-gate later.
-openbao = []
+# Optional OpenBao KV client (rustls). `quota-ctl` enables this. `quotad` does not.
+openbao = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 
 [dependencies]
 quota-core.workspace = true
+# Pins for MSRV 1.83 (Cargo 1.83 cannot parse edition2024).
+# zbus_macros accepts proc-macro-crate ^3.1. 3.4+ pulls toml_edit 0.23,
+# which pulls toml_parser (edition2024). 3.5 pulls toml_edit 0.25.
+# indexmap 2.12+ pulls hashbrown 0.17 (edition2024).
+indexmap = "=2.11.4"
+proc-macro-crate = "=3.3.0"
+toml_edit = "=0.22.24"
+# 3.4.2 raises MSRV to 1.85. zbus 4 accepts ^3.
+async-lock = "=3.4.1"
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { version = "=1.0.4", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+# In-process TLS fixture. Pins keep `time`/`time-core` off edition2024 (Rust 1.88).
+rcgen = "=0.12.1"
+time = "=0.3.36"
+time-core = "=0.1.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 4.0.0: zbus 4 + RustCrypto `cbc` (not the unmaintained `block-modes` crate).
+# async-io runtime so quota-ctl does not pull a second Tokio. No libdbus.
+secret-service = { version = "=4.0.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "=2.11.1"
+
