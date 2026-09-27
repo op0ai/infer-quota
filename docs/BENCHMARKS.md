@@ -19,7 +19,7 @@ Anthropic.”
 | `cargo -V` | `cargo 1.83.0 (5ffbef321 2024-10-29)` |
 | CPU | 4× `Intel(R) Xeon(R) Processor` @ 2400 MHz (`siblings=4`, `cpu cores=4`) |
 | RAM | 15 GiB, **0** swap (`free -h` at 2026-09-27 12:00 UTC: ~8.9 GiB used, ~6.8 GiB available) |
-| Tools | Python 3 `time.perf_counter` (hyperfine and GNU `time` **not installed**; `apt-get` lock not writable). `quota-bench` for socket / pace / serialize / start. |
+| Tools | Python 3 `time.perf_counter` (hyperfine and GNU `time` **not installed**). This session: `sudo apt-get install musl-tools` succeeded (`musl-gcc` present). `quota-bench` for socket / pace / serialize / start. |
 
 Default release profile (`Cargo.toml`): `lto = "thin"`, `codegen-units = 1`,
 `strip = "debuginfo"`, `panic = "abort"`, `opt-level = "s"`.
@@ -31,18 +31,192 @@ Optional size profile (not default): `[profile.dist]` inherits release with
 longer compile, **no `.symtab`** (harder field debug). Default `release` is
 unchanged.
 
+`opt-level = "z"` was measured on this host and **rejected**: every product
+binary grew vs `"s"` (quota +39 768, quotad +193 368, quota-ctl +306 432).
+
 ---
 
-## 2026-09-27 13:16 UTC re-measure (VERIFIED)
+## 2026-09-27 14:12 UTC Pareto pass (VERIFIED)
+
+Same VM class as the 13:16 UTC row (`uname` / `rustc` 1.83.0 / 4× Xeon @
+2400 MHz / 15 GiB, 0 swap; `free -h` at 14:12 UTC: ~8.9 GiB used, ~6.7 GiB
+available). Tree is `63a66a3` plus this pass. Nothing here is an estimate.
+
+`x86_64-unknown-linux-musl` **is installed** on this host (`rustup target
+add` + `musl-gcc` from `musl-tools`). Musl sizes are VERIFIED below.
+`/proc/sys/vm/drop_caches` is still Permission denied. No live
+`~/.codex/auth.json` / `~/.claude/.credentials.json`.
+
+### Kept changes (measured)
+
+| change | axis | before → after | trade? |
+|--------|------|----------------|--------|
+| `kill -0` via `Command` → `rustix::process::test_kill_process`; first probe on the accept-loop thread; Tokio blocking pool `max_blocking_threads=1`, `keep_alive=1ms`; Linux `SO_PEERCRED`; watch write 15s + idle 600s | **quotad** release size | 2 416 032 → **2 377 696** (−38 336, −1.6%) | net smaller. Peercred + watch timers did not offset the `Command` drop. |
+| same | **quotad** dist | 1 792 592 → **1 759 832** (−32 760) | same |
+| same | **quotad** musl release | 2 560 544 → **2 513 728** (−46 816) | same. Baseline musl taken on `63a66a3` this session, then rebuilt. |
+| first probe sync + 1ms keep-alive | idle **Threads** | 2 → **1** (immediately after first `quota ping`) | **kept:** `max_blocking_threads=1` serializes scheduled vs client `refresh` HTTPS. Do not bump the pool without re-measuring Threads/VSZ. |
+| same | idle **VmRSS** | 3308 → **3252** kB (−56). RssAnon 252 → 236. VSZ 72392 → **4752** (no parked blocking-thread stack). | none |
+| unused `serde`/`thiserror` on `quota` / `quota-ctl` | quota release | 1 061 216 → 1 061 216 (0) | lock hygiene only |
+| Linux `SO_PEERCRED` + watch timeouts | socket RTT | see §3. Three repeats: `status` mean **21.2** µs. This-host baseline 22.6 µs (one noisier run). #4 docs 21.5 µs. **Not claimed as a latency win.** | cost in the noise |
+
+**Rejected (measured, not kept):** `opt-level = "z"` (all three bins larger).
+Fat-LTO / `strip = "symbols"` as default `release` still trades compile time
+and `.symtab`. Feature-gating rustls out of `quotad` drops HTTPS probes.
+Default-off keychain on `quota-ctl` drops the OS backend.
+
+`quota-ctl` release 4 096 608 → 4 098 288 (+1 680) and dist 2 779 904 →
+2 775 816 (−4 088): **not claimed**. No `quota-ctl` code change except
+unused-dep rows; treat as LTO noise.
+
+### 1. Release binaries (VERIFIED)
+
+`ls` / `stat` after `cargo build --locked --workspace --release`
+(2026-09-27 14:12 UTC):
+
+| path | bytes | vs 13:16 UTC | `ls -lh` |
+|------|------:|-------------:|----------|
+| `target/release/quota` | 1 061 216 | 0 | 1.1M |
+| `target/release/quotad` | 2 377 696 | −38 336 | 2.3M |
+| `target/release/quota-ctl` | 4 098 288 | +1 680 | 4.0M |
+
+`file`: ELF 64-bit LSB pie, x86-64, dynamically linked, **not stripped**.
+`readelf -S`: no `.debug*`; all three have `.symtab`.
+
+`sha256sum`:
+
+```
+1187dfb3c82475fd391298a2c374a7ff8d6c9e8e47722866119da00b42e91dd9  target/release/quota
+a6fc28d4d1077c3329cc74c1e9799d853c32a0344a2c8526c191d50fd547672d  target/release/quotad
+8b192aeeaf39975ab905273d807a7422fb47de920d2b27d7da858aaecfaab191  target/release/quota-ctl
+```
+
+`ldd` (quotad): `linux-vdso`, `libgcc_s.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2`. No OpenBao/keychain.
+
+Harness `target/release/quota-bench`: 742 968 bytes (unchanged).
+
+### 1b. Optional `dist` size pass (VERIFIED)
+
+`cargo build --locked --workspace --profile dist --bins`. `file`: stripped.
+
+| path | bytes | vs 13:16 UTC dist |
+|------|------:|------------------:|
+| `target/dist/quota` | 780 712 | 0 |
+| `target/dist/quotad` | 1 759 832 | −32 760 |
+| `target/dist/quota-ctl` | 2 775 816 | −4 088 (not claimed) |
+
+### 1c. musl (VERIFIED)
+
+`rustup target add x86_64-unknown-linux-musl` + `CC=musl-gcc`
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc`.
+`file`: ELF 64-bit LSB pie, **static-pie**.
+
+| path | release bytes | dist bytes |
+|------|-------------:|-----------:|
+| `quota` | 1 170 216 | 870 624 |
+| `quotad` | 2 513 728 | 1 874 304 |
+| `quota-ctl` | 4 240 384 | 2 898 496 |
+
+Musl release vs glibc release: quota +109 000, quotad +136 032,
+quota-ctl +142 096 (static libc). Dist musl vs dist glibc: quota +89 912,
+quotad +114 472, quota-ctl +122 680. Expected for static-pie; not a
+regression of the glibc lean path.
+
+`63a66a3` musl release (this session, before the pass): quota 1 170 216,
+quotad 2 560 544, quota-ctl 4 240 400.
+
+### 2. Fixture pace / serialize / JSONL (VERIFIED)
+
+Same commands as 13:16 UTC. Offline.
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `pace` (1912-row fixture) | 200 | 6.5 µs | 1.2 µs | 6.2 µs | 23.6 µs | 6.3 µs | 6.8 µs | 6.8 µs |
+| `status_serialize` | 200 | 0.9 µs | 1.2 µs | 0.7 µs | 15.5 µs | 0.7 µs | 0.8 µs | 2.4 µs |
+| `ring_replay_1912` | 200 | 210.9 µs | 11.2 µs | 204.1 µs | 300.7 µs | 206.2 µs | 227.7 µs | 247.7 µs |
+| `jsonl_full_1912` | 50 | 934.2 µs | 28.9 µs | 916.0 µs | 1052.8 µs | 923.7 µs | 1020.8 µs | 1052.8 µs |
+| `jsonl_tail_128` | 50 | 917.2 µs | 25.5 µs | 902.2 µs | 1019.4 µs | 907.6 µs | 988.6 µs | 1019.4 µs |
+
+Same band as 13:16 UTC. Not claimed as a math win. Burn 12.9865 %/h.
+
+### 3. Socket RTT / many clients / start (VERIFIED)
+
+Isolated `$HOME`. First probe is local FS misses only.
+
+This-host **before** (63a66a3 binaries, 13:59 UTC): ping 12.1 µs / status
+22.6 µs (n=1000; status max 432 µs). After the pass, three repeats on the
+new `quotad`:
+
+| run | ping mean | status mean |
+|----:|-----------|-------------|
+| 1 | 11.3 µs | 21.2 µs |
+| 2 | 10.6 µs | 21.2 µs |
+| 3 | 11.7 µs | 21.2 µs |
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| socket `ping` (run 2) | 1000 | 10.6 µs | 2.5 µs | 7.8 µs | 44.6 µs | 9.5 µs | 14.5 µs | 17.2 µs |
+| socket `status` (run 2) | 1000 | 21.2 µs | 1.8 µs | 19.4 µs | 43.7 µs | 20.8 µs | 23.0 µs | 30.2 µs |
+| `status_clients_8` | 1600 | 62.7 µs | 171.2 µs | 11.2 µs | 1555.7 µs | 35.3 µs | 152.1 µs | 1149.9 µs |
+| `daemon_start_to_ping` | 8 | 5379 µs | 75 µs | 5283 µs | 5481 µs | 5403 µs | 5481 µs | 5481 µs |
+| `daemon_warm_ping` | 8 | 103 µs | 119 µs | 30 µs | 332 µs | 36 µs | 332 µs | 332 µs |
+
+`watch` first frame 661 bytes, `ok`. 8-client row is noisy (p99 1.1 ms on
+a shared VM) — **not** claimed. Start-to-ping same band as 13:16 UTC
+(5460 µs).
+
+### 4. RSS (VERIFIED)
+
+Idle `quotad` after first `quota ping` (both providers `unavailable`).
+First probe ran on the runtime thread; blocking pool not created.
+
+| metric | this-host 63a66a3 | after | source |
+|--------|------------------:|------:|--------|
+| VmRSS | 3308 kB | **3252** kB | `/proc/<pid>/status` |
+| RssAnon | 252 kB | **236** kB | same |
+| RssFile | 3056 kB | **3016** kB | same |
+| Threads | 2 | **1** | same |
+| VSZ | 72392 kB | **4752** kB | `ps -o vsz` |
+| PSS | 1548 kB | 1557 kB | `smaps_rollup` |
+| USS | 1484 kB | 1492 kB | Private_Clean + Private_Dirty |
+
+`ps -o rss` agreed: **3252**. After the RTT/watch/start harness: VmRSS
+3276 kB, Threads still 1. #4 docs idle was 3428 kB / 2 threads on a
+busier RSS sample of the same tree class.
+
+`max_blocking_threads=1` is the VSZ/Threads win: scheduled refresh and a
+client `refresh` share one `spawn_blocking` slot (HTTPS serializes).
+Leave the pool at 1 unless Threads/VSZ are re-measured.
+
+### 5. CLI spawn (VERIFIED)
+
+Python `time.perf_counter` / `subprocess.run`, warmup 5, warm page cache.
+`quota` bytes unchanged — treat deltas as host noise.
+
+| command | n | this-host 63a66a3 | after |
+|---------|--:|-------------------|-------|
+| `quota --socket … version` | 80 | 574.2 ± 110.0 µs | 512.9 ± 73.9 µs |
+| `quota --socket … ping` | 80 | 538.4 ± 94.2 µs | 487.3 ± 44.0 µs |
+| `quota-ctl --socket … ping` | 40 | 642.3 ± 115.9 µs | 583.9 ± 63.3 µs |
+
+**Not claimed.** Same `quota` inode size; overlap with the 13:16 UTC
+table (665 / 635 / 705 µs).
+
+**Not measured:** live HTTPS usage-fetch, cold-page-fault distribution
+(`drop_caches` Permission denied).
+
+---
+
+## 2026-09-27 13:16 UTC re-measure (VERIFIED, historical)
 
 Same VM class (`uname` / `rustc` 1.83.0 / 4× Xeon @ 2400 MHz / 15 GiB, 0
 swap; `free -h` at 13:14 UTC: ~8.9 GiB used, ~6.8 GiB available). Tree is
 PR #1 tip `8b4f132` plus this PR’s tests, `install.sh`, and `docs/AGENT.md`.
-Nothing here is an estimate. **Not a size-optimization pass.**
+Nothing here is an estimate. **Not a size-optimization pass.** Replaced
+for day-to-day numbers by the 14:12 UTC Pareto section above.
 
-`x86_64-unknown-linux-musl` is **not installed** (`rustup target list
---installed` is only `x86_64-unknown-linux-gnu`). Musl sizes stay
-**UNVERIFIED**. Do not invent them. `/proc/sys/vm/drop_caches` is
+`x86_64-unknown-linux-musl` was **not installed** in that session. Musl
+is VERIFIED in the 14:12 UTC section. `/proc/sys/vm/drop_caches` is
 Permission denied.
 
 ### 1. Release binaries (VERIFIED)
@@ -513,6 +687,11 @@ SOCK=/tmp/quota-bench.sock
 
 # optional size pass (does not change default release)
 cargo build --workspace --profile dist --bins
+
+# musl (needs rust-std + musl-gcc)
+rustup target add x86_64-unknown-linux-musl
+CC=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+  cargo build --locked --workspace --release --target x86_64-unknown-linux-musl --bins
 
 # RSS
 PID=$(pidof quotad)

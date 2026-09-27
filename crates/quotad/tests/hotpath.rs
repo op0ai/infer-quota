@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use quota_core::framing::{decode_len, encode_frame, read_frame, write_frame, MAX_FRAME_BYTES};
 use quota_core::protocol::{
     CanStartResult, Request, Response, StatusResult, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST,
-    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_STATUS,
+    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_STATUS, METHOD_WATCH,
 };
 use quota_core::types::{Availability, CanStartBasis, ProviderId};
 
@@ -81,6 +81,7 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .env("XDG_STATE_HOME", home.join("xdg-state"))
         .env("XDG_RUNTIME_DIR", &dir)
         .env_remove("QUOTA_SOCKET")
+        .env("QUOTA_WATCH_IDLE_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -280,4 +281,20 @@ fn decode_len_helper_matches_daemon_cap() {
     assert!(decode_len(((MAX_FRAME_BYTES as u32) + 1).to_le_bytes()).is_err());
     let frame = encode_frame(br#"{"id":1,"method":"ping"}"#).unwrap();
     assert_eq!(&frame[..4], &(frame.len() as u32 - 4).to_le_bytes());
+}
+
+#[test]
+fn watch_subscribe_then_idle_timeout() {
+    let d = spawn_daemon(false);
+    let mut s = UnixStream::connect(&d.socket).unwrap();
+    let req = Request::new(70, METHOD_WATCH);
+    write_frame(&mut s, &serde_json::to_vec(&req).unwrap()).unwrap();
+    let first = read_frame(&mut s).expect("watch first frame");
+    let resp: Response = serde_json::from_slice(&first).unwrap();
+    assert!(resp.ok);
+    // Daemon refresh is 3600s; idle override is 1s. No further snapshots.
+    thread::sleep(Duration::from_millis(1500));
+    let mut buf = Vec::new();
+    let n = s.read_to_end(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "watch slot must drop after idle timeout, got {buf:?}");
 }

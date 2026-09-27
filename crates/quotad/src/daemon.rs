@@ -1,6 +1,7 @@
 //! Accept loop, adaptive refresh, and request dispatch.
 
 use std::fs::{self, DirBuilder};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,13 @@ use tokio::sync::{broadcast, RwLock, Semaphore};
 const MAX_RPC_CLIENTS: usize = 16;
 const MAX_WATCH_CLIENTS: usize = 48;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+/// Drop a watch writer that is not draining snapshots (slowloris).
+const WATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Floor so a default `refresh_max` (300s) still drops a wedged silent slot.
+const WATCH_IDLE_FLOOR_SECS: u64 = 600;
+/// Slack past `refresh_max_secs` so a live configured refresh cannot race
+/// the idle timer. Bundled `quota watch` has no heartbeat.
+const WATCH_IDLE_SLACK_SECS: u64 = 30;
 
 use crate::accounts::AccountStore;
 use crate::store::Store;
@@ -38,9 +46,63 @@ use crate::store::Store;
 pub fn run(cfg: Config) -> Result<(), DaemonError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .max_blocking_threads(1)
+        .thread_keep_alive(Duration::from_millis(1))
         .build()
         .map_err(|e| DaemonError::Io(e.to_string()))?;
     rt.block_on(run_async(cfg))
+}
+
+fn watch_idle_override_secs() -> Option<u64> {
+    std::env::var("QUOTA_WATCH_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Idle after subscribe: `max(600, refresh_max + 30)` unless
+/// `QUOTA_WATCH_IDLE_SECS` is set. A live refresh interval cannot outlast
+/// this timer. Override is for tests / operators.
+fn watch_idle_secs(refresh_max_secs: u64, override_secs: Option<u64>) -> Duration {
+    if let Some(n) = override_secs {
+        return Duration::from_secs(n);
+    }
+    Duration::from_secs(
+        refresh_max_secs
+            .saturating_add(WATCH_IDLE_SLACK_SECS)
+            .max(WATCH_IDLE_FLOOR_SECS),
+    )
+}
+
+fn watch_idle_timeout(refresh_max_secs: u64) -> Duration {
+    watch_idle_secs(refresh_max_secs, watch_idle_override_secs())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    match rustix::process::Pid::from_raw(raw) {
+        Some(p) => rustix::process::test_kill_process(p).is_ok(),
+        None => false,
+    }
+}
+
+/// Linux `SO_PEERCRED`: refuse a peer whose uid is not ours. Fail closed if
+/// the sockopt fails. Other Unixes stay on the `0600` inode check only.
+fn peer_is_same_uid<Fd: AsFd>(fd: Fd) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match rustix::net::sockopt::socket_peercred(fd) {
+            Ok(cred) => cred.uid == rustix::process::geteuid(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        true
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,8 +156,15 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
         watch_tx,
     }));
 
-    // First probe before serving so `status` is not empty.
-    refresh(app.clone()).await;
+    // First probe on this thread (accept loop is not up yet). Avoids creating
+    // the blocking-pool thread before the first scheduled refresh.
+    {
+        let plan = {
+            let g = app.read().await;
+            probe_plan(&g)
+        };
+        apply_snapshot(&app, collect_snapshot(plan)).await;
+    }
 
     loop {
         let wait = {
@@ -160,14 +229,6 @@ impl Drop for InstanceLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
-}
-
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn claim_lock_dir(dir: &Path) -> bool {
@@ -304,67 +365,58 @@ fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-async fn refresh(app: Arc<RwLock<App>>) {
-    let (
-        timeout,
-        enable_codex,
-        enable_claude,
-        min_s,
-        max_s,
+struct ProbePlan {
+    timeout: u64,
+    enable_codex: bool,
+    enable_claude: bool,
+    codex_home: Option<PathBuf>,
+    claude_home: Option<PathBuf>,
+    codexbar_dir: PathBuf,
+    enable_codexbar_files: bool,
+}
+
+fn probe_plan(g: &App) -> ProbePlan {
+    let (codex_home, claude_home) = match g.accounts.book().active() {
+        Some(a) if a.provider == ProviderId::Codex => {
+            (a.home_path.clone().map(PathBuf::from), None)
+        }
+        Some(a) if a.provider == ProviderId::Claude => {
+            (None, a.home_path.clone().map(PathBuf::from))
+        }
+        _ => (None, None),
+    };
+    ProbePlan {
+        timeout: g.cfg.http_timeout_secs,
+        enable_codex: g.cfg.enable_codex,
+        enable_claude: g.cfg.enable_claude,
         codex_home,
         claude_home,
-        codexbar_dir,
-        enable_codexbar_files,
-    ) = {
-        let g = app.read().await;
-        let (codex_home, claude_home) = match g.accounts.book().active() {
-            Some(a) if a.provider == ProviderId::Codex => {
-                (a.home_path.clone().map(std::path::PathBuf::from), None)
-            }
-            Some(a) if a.provider == ProviderId::Claude => {
-                (None, a.home_path.clone().map(std::path::PathBuf::from))
-            }
-            _ => (None, None),
-        };
-        (
-            g.cfg.http_timeout_secs,
-            g.cfg.enable_codex,
-            g.cfg.enable_claude,
-            g.cfg.refresh_min_secs(),
-            g.cfg.refresh_max_secs(),
-            codex_home,
-            claude_home,
-            g.cfg.codexbar_dir(),
-            g.cfg.enable_codexbar_files,
-        )
+        codexbar_dir: g.cfg.codexbar_dir(),
+        enable_codexbar_files: g.cfg.enable_codexbar_files,
+    }
+}
+
+fn collect_snapshot(plan: ProbePlan) -> Snapshot {
+    let transport = TlsTransport::new(Duration::from_secs(plan.timeout));
+    let codex = CodexAdapter {
+        home: plan.codex_home,
+        codexbar_dir: Some(plan.codexbar_dir),
+        enable_codexbar_files: plan.enable_codexbar_files,
     };
-
-    let snap = tokio::task::spawn_blocking(move || {
-        let transport = TlsTransport::new(Duration::from_secs(timeout));
-        let codex = CodexAdapter {
-            home: codex_home,
-            codexbar_dir: Some(codexbar_dir),
-            enable_codexbar_files,
-        };
-        let claude = ClaudeAdapter {
-            config_dir: claude_home,
-        };
-        let mut providers: Vec<&dyn Provider> = Vec::new();
-        if enable_codex {
-            providers.push(&codex);
-        }
-        if enable_claude {
-            providers.push(&claude);
-        }
-        quota_adapters::probe_all(&providers, &transport)
-    })
-    .await;
-
-    let Ok(snap) = snap else {
-        eprintln!("quotad: refresh task failed");
-        return;
+    let claude = ClaudeAdapter {
+        config_dir: plan.claude_home,
     };
+    let mut providers: Vec<&dyn Provider> = Vec::new();
+    if plan.enable_codex {
+        providers.push(&codex);
+    }
+    if plan.enable_claude {
+        providers.push(&claude);
+    }
+    quota_adapters::probe_all(&providers, &transport)
+}
 
+async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
     let mut g = app.write().await;
     let changed = match g.store.latest() {
         Some(prev) => !same_usage(prev, &snap),
@@ -376,6 +428,8 @@ async fn refresh(app: Arc<RwLock<App>>) {
         .iter()
         .any(|p| p.error.as_ref().is_some_and(|e| e.code == "rate_limited"));
 
+    let min_s = g.cfg.refresh_min_secs();
+    let max_s = g.cfg.refresh_max_secs();
     // Adaptive refresh: stay faster while numbers move; idle longer when stable
     // or unavailable so we do not hammer undocumented endpoints.
     g.interval_secs = if rate_limited {
@@ -390,6 +444,21 @@ async fn refresh(app: Arc<RwLock<App>>) {
 
     let _ = g.watch_tx.send(snap.clone());
     g.store.push(snap);
+}
+
+async fn refresh(app: Arc<RwLock<App>>) {
+    let plan = {
+        let g = app.read().await;
+        probe_plan(&g)
+    };
+
+    let snap = tokio::task::spawn_blocking(move || collect_snapshot(plan)).await;
+
+    let Ok(snap) = snap else {
+        eprintln!("quotad: refresh task failed");
+        return;
+    };
+    apply_snapshot(&app, snap).await;
 }
 
 fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
@@ -439,6 +508,9 @@ async fn handle_client(
     rpc_slots: Arc<Semaphore>,
     watch_slots: Arc<Semaphore>,
 ) -> Result<(), ClientError> {
+    if !peer_is_same_uid(&stream) {
+        return Err(ClientError::Other("peer uid mismatch".into()));
+    }
     let mut rpc_permit = None;
     loop {
         let payload = read_frame_timed(&mut stream).await?;
@@ -463,27 +535,31 @@ async fn handle_client(
             };
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
-            let mut rx = {
+            let (mut rx, idle_dur) = {
                 let g = app.read().await;
                 let snap = filter_snapshot(g.store.latest(), params.provider);
-                write_frame_async(
+                write_frame_timed(
                     &mut stream,
                     &Response::result(req.id, StatusResult { snapshot: snap }),
                 )
                 .await?;
-                g.watch_tx.subscribe()
+                let idle_dur = watch_idle_timeout(g.cfg.refresh_max_secs());
+                (g.watch_tx.subscribe(), idle_dur)
             };
+            let idle = tokio::time::sleep(idle_dur);
+            tokio::pin!(idle);
             loop {
                 tokio::select! {
                     next = rx.recv() => {
                         match next {
                             Ok(snap) => {
                                 let snap = filter_snapshot(Some(&snap), params.provider);
-                                write_frame_async(
+                                write_frame_timed(
                                     &mut stream,
                                     &Response::result(req.id, StatusResult { snapshot: snap }),
                                 )
                                 .await?;
+                                idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
                             }
                             Err(_) => return Ok(()),
                         }
@@ -491,19 +567,25 @@ async fn handle_client(
                     incoming = read_frame_async(&mut stream) => {
                         match incoming {
                             Ok(bytes) => {
+                                // Only a documented `ping` keepalive resets idle.
+                                // Junk / other methods must not hold the slot.
                                 if let Ok(r) = serde_json::from_slice::<Request>(&bytes) {
                                     if r.method == METHOD_PING {
-                                        write_frame_async(
+                                        write_frame_timed(
                                             &mut stream,
                                             &Response::result(r.id, quota_core::protocol::Pong { pong: true }),
                                         )
                                         .await?;
+                                        idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
                                     }
                                 }
                             }
                             Err(FrameError::UnexpectedEof) => return Err(ClientError::Eof),
                             Err(e) => return Err(e.into()),
                         }
+                    }
+                    _ = &mut idle => {
+                        return Err(ClientError::Other("watch idle timeout".into()));
                     }
                 }
             }
@@ -700,6 +782,13 @@ async fn write_frame_async(stream: &mut UnixStream, resp: &Response) -> Result<(
     Ok(())
 }
 
+async fn write_frame_timed(stream: &mut UnixStream, resp: &Response) -> Result<(), ClientError> {
+    match tokio::time::timeout(WATCH_WRITE_TIMEOUT, write_frame_async(stream, resp)).await {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Other("watch write timeout".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,6 +969,36 @@ mod tests {
         prepare_socket(&sock).unwrap();
         assert!(!sock.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peercred_same_uid_on_socketpair() {
+        let (a, _b) = StdUnixStream::pair().unwrap();
+        assert!(peer_is_same_uid(&a));
+    }
+
+    #[test]
+    fn rustix_pid_alive_self() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn watch_idle_outlasts_configured_refresh() {
+        assert_eq!(
+            watch_idle_secs(300, None),
+            Duration::from_secs(WATCH_IDLE_FLOOR_SECS)
+        );
+        assert_eq!(
+            watch_idle_secs(600, None),
+            Duration::from_secs(600 + WATCH_IDLE_SLACK_SECS)
+        );
+        assert_eq!(
+            watch_idle_secs(3600, None),
+            Duration::from_secs(3600 + WATCH_IDLE_SLACK_SECS)
+        );
+        assert_eq!(watch_idle_secs(86400, Some(1)), Duration::from_secs(1));
+        assert!(watch_idle_secs(86400, None) > Duration::from_secs(86400));
     }
 
     #[test]
