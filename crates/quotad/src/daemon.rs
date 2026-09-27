@@ -1,7 +1,8 @@
 //! Accept loop, adaptive refresh, and request dispatch.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +21,14 @@ use quota_core::protocol::{
     METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
-use quota_core::types::{Availability, Snapshot};
+use quota_core::types::{Availability, ProviderId, Snapshot};
 use quota_core::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, RwLock, Semaphore};
+
+/// Same-UID local DoS cap. The socket is already `0600`.
+const MAX_CLIENTS: usize = 64;
 
 use crate::accounts::AccountStore;
 use crate::store::Store;
@@ -66,6 +70,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
 
     let listener = UnixListener::bind(&socket).map_err(|e| DaemonError::Io(e.to_string()))?;
     let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
+    let inflight = Arc::new(Semaphore::new(MAX_CLIENTS));
 
     eprintln!(
         "quotad {} listening on {} (protocol {})",
@@ -78,7 +83,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let accounts = AccountStore::load(cfg.accounts_file());
     let mut store = Store::new(&cfg);
     seed_codexbar_history(&mut store, &cfg);
-    let app = Arc::new(Mutex::new(App {
+    let app = Arc::new(RwLock::new(App {
         interval_secs: cfg.refresh_min_secs(),
         store,
         accounts,
@@ -91,7 +96,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
 
     loop {
         let wait = {
-            let g = app.lock().await;
+            let g = app.read().await;
             Duration::from_secs(g.interval_secs)
         };
         tokio::select! {
@@ -102,8 +107,14 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
+                        let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                            drop(stream);
+                            eprintln!("quotad: client limit ({MAX_CLIENTS}) reached");
+                            continue;
+                        };
                         let app = app.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = handle_client(app, stream).await {
                                 if !matches!(e, ClientError::Eof) {
                                     eprintln!("quotad: client: {e}");
@@ -138,16 +149,38 @@ fn seed_codexbar_history(store: &mut Store, cfg: &Config) {
 
 fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        quota_core::ensure_private_dir(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
     }
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| DaemonError::Io(e.to_string()))?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(DaemonError::Io(format!(
+                    "socket path {} is a symlink; refuse to bind",
+                    path.display()
+                )));
+            }
+            if meta.file_type().is_socket() {
+                if StdUnixStream::connect(path).is_ok() {
+                    return Err(DaemonError::Io(format!(
+                        "already running (live socket at {})",
+                        path.display()
+                    )));
+                }
+                fs::remove_file(path).map_err(|e| DaemonError::Io(e.to_string()))?;
+                return Ok(());
+            }
+            return Err(DaemonError::Io(format!(
+                "socket path {} exists and is not a unix socket",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(DaemonError::Io(e.to_string())),
     }
     Ok(())
 }
 
-async fn refresh(app: Arc<Mutex<App>>) {
+async fn refresh(app: Arc<RwLock<App>>) {
     let (
         timeout,
         enable_codex,
@@ -155,23 +188,28 @@ async fn refresh(app: Arc<Mutex<App>>) {
         min_s,
         max_s,
         codex_home,
+        claude_home,
         codexbar_dir,
         enable_codexbar_files,
     ) = {
-        let g = app.lock().await;
-        let home = g
-            .accounts
-            .book()
-            .active()
-            .and_then(|a| a.home_path.clone())
-            .map(std::path::PathBuf::from);
+        let g = app.read().await;
+        let (codex_home, claude_home) = match g.accounts.book().active() {
+            Some(a) if a.provider == ProviderId::Codex => {
+                (a.home_path.clone().map(std::path::PathBuf::from), None)
+            }
+            Some(a) if a.provider == ProviderId::Claude => {
+                (None, a.home_path.clone().map(std::path::PathBuf::from))
+            }
+            _ => (None, None),
+        };
         (
             g.cfg.http_timeout_secs,
             g.cfg.enable_codex,
             g.cfg.enable_claude,
             g.cfg.refresh_min_secs(),
             g.cfg.refresh_max_secs(),
-            home,
+            codex_home,
+            claude_home,
             g.cfg.codexbar_dir(),
             g.cfg.enable_codexbar_files,
         )
@@ -184,7 +222,9 @@ async fn refresh(app: Arc<Mutex<App>>) {
             codexbar_dir: Some(codexbar_dir),
             enable_codexbar_files,
         };
-        let claude = ClaudeAdapter;
+        let claude = ClaudeAdapter {
+            config_dir: claude_home,
+        };
         let mut providers: Vec<&dyn Provider> = Vec::new();
         if enable_codex {
             providers.push(&codex);
@@ -201,7 +241,7 @@ async fn refresh(app: Arc<Mutex<App>>) {
         return;
     };
 
-    let mut g = app.lock().await;
+    let mut g = app.write().await;
     let changed = match g.store.latest() {
         Some(prev) => !same_usage(prev, &snap),
         None => true,
@@ -235,10 +275,11 @@ fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
     a.providers.iter().zip(b.providers.iter()).all(|(x, y)| {
         x.provider == y.provider
             && x.status == y.status
+            && x.windows.len() == y.windows.len()
             && x.windows
                 .iter()
-                .map(|w| (w.kind.clone(), w.used_percent))
-                .eq(y.windows.iter().map(|w| (w.kind.clone(), w.used_percent)))
+                .zip(y.windows.iter())
+                .all(|(a, b)| a.kind == b.kind && a.used_percent == b.used_percent)
     })
 }
 
@@ -259,7 +300,7 @@ impl From<FrameError> for ClientError {
     }
 }
 
-async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(), ClientError> {
+async fn handle_client(app: Arc<RwLock<App>>, mut stream: UnixStream) -> Result<(), ClientError> {
     loop {
         let payload = match read_frame_async(&mut stream).await {
             Ok(p) => p,
@@ -273,8 +314,8 @@ async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
             let mut rx = {
-                let g = app.lock().await;
-                let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+                let g = app.read().await;
+                let snap = filter_snapshot(g.store.latest(), params.provider);
                 write_frame_async(
                     &mut stream,
                     &Response::result(req.id, StatusResult { snapshot: snap }),
@@ -287,7 +328,7 @@ async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(
                     next = rx.recv() => {
                         match next {
                             Ok(snap) => {
-                                let snap = filter_snapshot(snap, params.provider);
+                                let snap = filter_snapshot(Some(&snap), params.provider);
                                 write_frame_async(
                                     &mut stream,
                                     &Response::result(req.id, StatusResult { snapshot: snap }),
@@ -323,20 +364,19 @@ async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(
     }
 }
 
-async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
+async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
     match req.method.as_str() {
         METHOD_PING => Response::result(req.id, quota_core::protocol::Pong { pong: true }),
         METHOD_VERSION => Response::result(req.id, VersionInfo::current()),
         METHOD_STATUS => {
             let params: StatusParams = serde_json::from_value(req.params).unwrap_or_default();
-            let g = app.lock().await;
-            let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+            let g = app.read().await;
+            let snap = filter_snapshot(g.store.latest(), params.provider);
             Response::result(req.id, StatusResult { snapshot: snap })
         }
         METHOD_PACE => {
             let params: PaceParams = serde_json::from_value(req.params).unwrap_or_default();
-            let g = app.lock().await;
-            let history = g.store.history();
+            let g = app.read().await;
             let latest = g.snapshot_or_empty();
             let mut reports = Vec::new();
             for p in latest
@@ -344,7 +384,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                reports.push(pace_for(&history, p));
+                reports.push(pace_for(g.store.history_ref(), p));
             }
             Response::result(req.id, PaceResult { reports })
         }
@@ -355,8 +395,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("can_start: {e}"));
                 }
             };
-            let g = app.lock().await;
-            let history = g.store.history();
+            let g = app.read().await;
             let latest = g.snapshot_or_empty();
             let now = now_unix();
             let mut answers = Vec::new();
@@ -365,7 +404,13 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                answers.push(can_start(p, &history, params.tokens, params.deadline, now));
+                answers.push(can_start(
+                    p,
+                    g.store.history_ref(),
+                    params.tokens,
+                    params.deadline,
+                    now,
+                ));
             }
             let available: Vec<_> = answers
                 .iter()
@@ -377,12 +422,12 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
         METHOD_REFRESH => {
             let params: RefreshParams = serde_json::from_value(req.params).unwrap_or_default();
             refresh(app.clone()).await;
-            let g = app.lock().await;
-            let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+            let g = app.read().await;
+            let snap = filter_snapshot(g.store.latest(), params.provider);
             Response::result(req.id, StatusResult { snapshot: snap })
         }
         METHOD_ACCOUNTS_LIST => {
-            let g = app.lock().await;
+            let g = app.read().await;
             Response::result(req.id, g.accounts.list())
         }
         METHOD_ACCOUNTS_ADD => {
@@ -390,7 +435,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::err(req.id, "bad_params", format!("accounts.add: {e}")),
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.add(params) {
                 Ok(account) => {
                     let active_id = g.accounts.list().active_id;
@@ -406,7 +451,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("accounts.remove: {e}"));
                 }
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.remove(&params.id) {
                 Ok(true) => Response::result(req.id, g.accounts.list()),
                 Ok(false) => {
@@ -422,7 +467,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("accounts.select: {e}"));
                 }
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.select(params.id) {
                 Ok(_) => Response::result(req.id, g.accounts.list()),
                 Err(e) => Response::err(req.id, "accounts", e),
@@ -440,12 +485,19 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
     }
 }
 
-fn filter_snapshot(mut snap: Snapshot, filter: ProviderFilter) -> Snapshot {
-    if filter == ProviderFilter::All {
-        return snap;
+fn filter_snapshot(snap: Option<&Snapshot>, filter: ProviderFilter) -> Snapshot {
+    match snap {
+        Some(s) if filter == ProviderFilter::All => s.clone(),
+        Some(s) => Snapshot::new(
+            s.fetched_at,
+            s.providers
+                .iter()
+                .filter(|p| filter.matches(p.provider))
+                .cloned()
+                .collect(),
+        ),
+        None => Snapshot::new(now_unix(), Vec::new()),
     }
-    snap.providers.retain(|p| filter.matches(p.provider));
-    snap
 }
 
 async fn read_frame_async(stream: &mut UnixStream) -> Result<Vec<u8>, FrameError> {
@@ -514,7 +566,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ping_and_version() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let ping = dispatch(&app, Request::new(1, METHOD_PING)).await;
         assert!(ping.ok);
         let ver = dispatch(&app, Request::new(2, METHOD_VERSION)).await;
@@ -525,7 +577,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn status_filters_provider() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let req = Request::with_params(
             3,
             METHOD_STATUS,
@@ -540,7 +592,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unknown_method() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let resp = dispatch(&app, Request::new(9, "explode")).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, "unknown_method");
@@ -555,7 +607,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn accounts_add_list_remove() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let add = Request::with_params(
             10,
             METHOD_ACCOUNTS_ADD,
@@ -591,5 +643,52 @@ mod tests {
         let book: quota_core::AccountsListResult =
             serde_json::from_value(listed.result.unwrap()).unwrap();
         assert!(book.accounts.is_empty());
+    }
+
+    #[test]
+    fn prepare_socket_refuses_symlink() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-sym-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.sock");
+        let link = dir.join("quota.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = prepare_socket(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_socket_refuses_live_instance() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-live-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = prepare_socket(&sock).unwrap_err();
+        assert!(err.to_string().contains("already running"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_socket_unlinks_stale() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-stale-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        prepare_socket(&sock).unwrap();
+        assert!(!sock.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

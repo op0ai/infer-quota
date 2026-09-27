@@ -49,7 +49,8 @@ pub fn classify_codex_window(
         Some("secondary") | Some("weekly") => (WindowKind::Weekly, "weekly".into()),
         Some("tertiary") | Some("extra") => (WindowKind::Extra, "extra".into()),
         Some("monthly") => (WindowKind::Monthly, "monthly".into()),
-        _ => (WindowKind::Weekly, "weekly".into()),
+        // Unknown slot + no duration: do not invent weekly (that binds pace).
+        _ => (WindowKind::Extra, "unknown".into()),
     }
 }
 
@@ -86,5 +87,15 @@ mod tests {
         let (kind, label) = classify_codex_window(Some("primary"), None, None);
         assert_eq!(kind, WindowKind::Session);
         assert_eq!(label, "5h");
+    }
+
+    #[test]
+    fn unknown_slot_without_duration_is_not_weekly() {
+        let (kind, label) = classify_codex_window(Some("mystery"), None, None);
+        assert_eq!(kind, WindowKind::Extra);
+        assert_eq!(label, "unknown");
+        let (kind, label) = classify_codex_window(None, None, None);
+        assert_eq!(kind, WindowKind::Extra);
+        assert_eq!(label, "unknown");
     }
 }

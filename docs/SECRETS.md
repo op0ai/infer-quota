@@ -36,8 +36,12 @@ quota-ctl secret get codex/work    # prints backend= and present=true only
 
 The compose file starts **dev** OpenBao with a well-known root token. That
 token is not a secret; do not reuse it anywhere else. The HTTP client in
-`quota-secrets` is **plain HTTP** (no rustls). For TLS, put a proxy in front
-or extend the scaffold.
+`quota-secrets` is **plain HTTP** (no rustls) and is **loopback-only**
+unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. For TLS, put a proxy in front
+or extend the scaffold. Logical KV paths may not contain `..`.
+
+`quotad` does not call this crate. `secret_ref` on an account is metadata
+for humans / future wiring — the daemon still reads CLI session files.
 
 Default `cargo test --workspace` does not start OpenBao and does not open
 sockets to `:8200`.

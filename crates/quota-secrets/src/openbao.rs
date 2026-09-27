@@ -4,13 +4,21 @@
 //! Default tests never construct a live client. HTTPS is accepted as a URL
 //! scheme but the scaffold speaks **plain HTTP** (docker-compose.dev.yml).
 //! Talk TLS through a local proxy if you need it.
+//!
+//! Plain HTTP is fenced to loopback (`127.0.0.1`, `localhost`, `::1`) unless
+//! `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1` is set. Logical KV paths reject `..`.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::types::{SecretRecord, SecretsBackend, SecretsError};
-use crate::{ENV_OPENBAO_ADDR, ENV_OPENBAO_MOUNT, ENV_OPENBAO_PREFIX, ENV_OPENBAO_TOKEN};
+use crate::{
+    ENV_OPENBAO_ADDR, ENV_OPENBAO_ALLOW_PLAINTEXT, ENV_OPENBAO_MOUNT, ENV_OPENBAO_PREFIX,
+    ENV_OPENBAO_TOKEN,
+};
+
+const MAX_BAO_BODY: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OpenBaoBackend {
@@ -37,34 +45,102 @@ impl OpenBaoBackend {
         }
         let mount = std::env::var(ENV_OPENBAO_MOUNT).unwrap_or_else(|_| "secret".into());
         let prefix = std::env::var(ENV_OPENBAO_PREFIX).unwrap_or_else(|_| "quota".into());
+        let allow_plain = std::env::var(ENV_OPENBAO_ALLOW_PLAINTEXT)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let addr = addr.trim_end_matches('/').to_string();
+        fence_plain_http(&addr, allow_plain)?;
+        let mount = validate_kv_segment(mount.trim().trim_matches('/'), "mount")?;
+        let prefix = validate_kv_segment(prefix.trim().trim_matches('/'), "prefix")?;
         Ok(Some(Self {
-            addr: addr.trim_end_matches('/').to_string(),
+            addr,
             token: token.trim().to_string(),
-            mount: mount.trim().trim_matches('/').to_string(),
-            prefix: prefix.trim().trim_matches('/').to_string(),
+            mount,
+            prefix,
             timeout: Duration::from_secs(5),
         }))
     }
 
-    fn kv_path(&self, logical: &str) -> String {
-        let logical = logical.trim_start_matches('/');
+    fn kv_path(&self, logical: &str) -> Result<String, SecretsError> {
+        let logical = validate_logical_path(logical)?;
         if self.prefix.is_empty() {
-            logical.to_string()
+            Ok(logical)
         } else if logical.is_empty() {
-            self.prefix.clone()
+            Ok(self.prefix.clone())
         } else {
-            format!("{}/{}", self.prefix, logical)
+            Ok(format!("{}/{}", self.prefix, logical))
         }
     }
 
-    fn kv_url(&self, logical: &str) -> String {
-        format!(
+    fn kv_url(&self, logical: &str) -> Result<String, SecretsError> {
+        Ok(format!(
             "{}/v1/{}/data/{}",
             self.addr,
             self.mount,
-            self.kv_path(logical)
-        )
+            self.kv_path(logical)?
+        ))
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "127.0.0.1:8200"
+    ) || host.starts_with("127.0.0.1")
+        || host == "localhost"
+}
+
+fn fence_plain_http(addr: &str, allow_plain: bool) -> Result<(), SecretsError> {
+    let rest = match addr.strip_prefix("http://") {
+        Some(r) => r,
+        None if addr.starts_with("https://") => return Ok(()),
+        None => return Ok(()),
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = host.split(':').next().unwrap_or(host);
+    if is_loopback_host(host) || allow_plain {
+        return Ok(());
+    }
+    Err(SecretsError::Config(format!(
+        "plain HTTP OpenBao to {host} is refused (loopback only; set {ENV_OPENBAO_ALLOW_PLAINTEXT}=1 for local-dev)"
+    )))
+}
+
+fn valid_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && !seg.contains('\\')
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn validate_kv_segment(raw: &str, what: &str) -> Result<String, SecretsError> {
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    if !valid_segment(raw) {
+        return Err(SecretsError::Config(format!("invalid OpenBao {what}")));
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_logical_path(path: &str) -> Result<String, SecretsError> {
+    let p = path.trim().trim_start_matches('/');
+    if p.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::new();
+    for seg in p.split('/') {
+        if !valid_segment(seg) {
+            return Err(SecretsError::Config(format!(
+                "invalid OpenBao path segment {seg:?}"
+            )));
+        }
+        parts.push(seg);
+    }
+    Ok(parts.join("/"))
 }
 
 impl SecretsBackend for OpenBaoBackend {
@@ -73,7 +149,7 @@ impl SecretsBackend for OpenBaoBackend {
     }
 
     fn get(&self, path: &str) -> Result<Option<SecretRecord>, SecretsError> {
-        let url = self.kv_url(path);
+        let url = self.kv_url(path)?;
         let (status, body) = http_json("GET", &url, &self.token, None, self.timeout)?;
         if status == 404 {
             return Ok(None);
@@ -102,7 +178,7 @@ impl SecretsBackend for OpenBaoBackend {
     }
 
     fn put(&self, path: &str, value: &str) -> Result<(), SecretsError> {
-        let url = self.kv_url(path);
+        let url = self.kv_url(path)?;
         let payload = serde_json::json!({ "data": { "value": value } });
         let bytes = serde_json::to_vec(&payload).map_err(|e| SecretsError::Parse(e.to_string()))?;
         let (status, _) = http_json("POST", &url, &self.token, Some(&bytes), self.timeout)?;
@@ -119,7 +195,7 @@ impl SecretsBackend for OpenBaoBackend {
             "{}/v1/{}/metadata/{}",
             self.addr,
             self.mount,
-            self.kv_path(path)
+            self.kv_path(path)?
         );
         let (status, _) = http_json("DELETE", &url, &self.token, None, self.timeout)?;
         if status == 404 || (200..300).contains(&status) {
@@ -197,9 +273,19 @@ fn http_json(
     }
 
     let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| SecretsError::Io(e.to_string()))?;
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if raw.len() + n > MAX_BAO_BODY + 8192 {
+                    return Err(SecretsError::Io("OpenBao response too large".into()));
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => return Err(SecretsError::Io(e.to_string())),
+        }
+    }
     parse_status_body(&raw)
 }
 
@@ -256,10 +342,33 @@ mod tests {
             prefix: "quota".into(),
             timeout: Duration::from_secs(1),
         };
-        assert_eq!(b.kv_path("codex/work"), "quota/codex/work");
+        assert_eq!(b.kv_path("codex/work").unwrap(), "quota/codex/work");
         assert_eq!(
-            b.kv_url("codex/work"),
+            b.kv_url("codex/work").unwrap(),
             "http://127.0.0.1:8200/v1/secret/data/quota/codex/work"
         );
+    }
+
+    #[test]
+    fn rejects_parent_dir_path() {
+        let b = OpenBaoBackend {
+            addr: "http://127.0.0.1:8200".into(),
+            token: "dev".into(),
+            mount: "secret".into(),
+            prefix: "quota".into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(b.kv_path("../other").is_err());
+        assert!(b.kv_path("a/../../b").is_err());
+        assert!(b.kv_path("ok/name").is_ok());
+    }
+
+    #[test]
+    fn fence_non_loopback_http() {
+        let err = fence_plain_http("http://evil.example:8200", false).unwrap_err();
+        assert!(matches!(err, SecretsError::Config(_)));
+        assert!(fence_plain_http("http://127.0.0.1:8200", false).is_ok());
+        assert!(fence_plain_http("http://localhost:8200", false).is_ok());
+        assert!(fence_plain_http("http://evil.example:8200", true).is_ok());
     }
 }

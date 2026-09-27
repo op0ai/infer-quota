@@ -21,3 +21,20 @@ jobs:
         run: cargo test --locked --workspace
       - name: release build
         run: cargo build --locked --workspace --release
+      - name: fixture redaction
+        run: |
+          if grep -R -n -E --include='*.json' --include='*.jsonl' --include='*.md' \
+            'eyJ[A-Za-z0-9_-]{8,}' fixtures docs; then
+            echo "possible JWT-like material in fixtures/docs" >&2
+            exit 1
+          fi
+          if grep -R -l -E --include='*.json' --include='*.jsonl' \
+            '"access_token"|"refresh_token"|"WorkosCursorSessionToken"' fixtures \
+            | grep -v redacted; then
+            echo "unredacted credential field names outside *.redacted.*" >&2
+            exit 1
+          fi
+      - name: cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

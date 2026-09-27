@@ -10,7 +10,6 @@
 //!
 //! We never write `auth.json`. Token refresh is owned by `codex login`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use quota_core::types::{
@@ -92,6 +91,7 @@ fn creds_code(e: &CredsError) -> &'static str {
         CredsError::TooLarge => "creds_too_large",
         CredsError::Io(_) => "creds_io",
         CredsError::Parse(_) => "creds_parse",
+        CredsError::Symlink(_) => "creds_symlink",
     }
 }
 
@@ -107,9 +107,9 @@ fn usage_url(home: Option<&Path>) -> String {
         .map(PathBuf::from)
         .unwrap_or_else(quota_core::codex_home);
     let cfg = home.join("config.toml");
-    if let Ok(text) = fs::read_to_string(&cfg) {
-        if text.len() <= 64 * 1024 {
-            if let Some(base) = parse_chatgpt_base_url(&text) {
+    if let Ok(bytes) = quota_core::read_file_capped(&cfg, 64 * 1024) {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Some(base) = parse_chatgpt_base_url(text) {
                 return join_usage_url(&base);
             }
         }
@@ -184,11 +184,10 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         return snap;
     }
     if !(200..300).contains(&status) {
-        let hint = String::from_utf8_lossy(body);
-        let hint = hint.chars().take(160).collect::<String>();
+        let _ = body;
         let mut snap = ProviderSnapshot::unavailable(
             ProviderId::Codex,
-            AdapterError::new("http", format!("HTTP {status}: {hint}")),
+            AdapterError::new("http", format!("HTTP {status}")),
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
@@ -360,10 +359,18 @@ mod tests {
 
     #[test]
     fn unauthorized_is_unavailable() {
-        let snap = parse_usage_http(401, b"{}", Path::new("auth.json"));
+        let snap = parse_usage_http(401, br#"{"access_token":"leak"}"#, Path::new("auth.json"));
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "unauthorized");
         assert!(snap.windows.is_empty());
+        assert!(!snap.error.as_ref().unwrap().message.contains("leak"));
+    }
+
+    #[test]
+    fn http_error_omits_body() {
+        let snap = parse_usage_http(503, b"upstream token=secret", Path::new("auth.json"));
+        assert_eq!(snap.error.as_ref().unwrap().code, "http");
+        assert_eq!(snap.error.as_ref().unwrap().message, "HTTP 503");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! HTTP probing stays in [`crate::codex`]. This module is for fixtures,
 //! tests, and any later importer that already has a CodexBar JSON file.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -144,6 +145,7 @@ struct SnapshotBody {
     #[serde(default)]
     login_method: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     data_confidence: Option<String>,
     #[serde(default)]
     primary: Option<Lane>,
@@ -299,7 +301,8 @@ fn body_to_provider(
         credits,
         plan: body.login_method.clone(),
         error: None,
-        credential_path: body.data_confidence.clone(),
+        // `data_confidence` is not a filesystem path.
+        credential_path: None,
     }
 }
 
@@ -325,14 +328,41 @@ pub fn load_history_jsonl(path: &Path) -> Result<Vec<HistoryRow>, CodexBarError>
     let file = fs::File::open(path).map_err(|e| CodexBarError::Io(e.to_string()))?;
     let reader = BufReader::new(file);
     let mut rows = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let line = line.map_err(|e| CodexBarError::Io(e.to_string()))?;
         if line.trim().is_empty() {
             continue;
         }
-        let row: HistoryRow = serde_json::from_str(&line)
-            .map_err(|e| CodexBarError::Parse(format!("line {}: {e}", i + 1)))?;
-        rows.push(row);
+        // Skip malformed/partial lines (CodexBar may still be appending).
+        if let Ok(row) = serde_json::from_str::<HistoryRow>(&line) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Stream the file once, keep only the last `cap` *lines*, then parse those.
+/// Avoids allocating a `HistoryRow` per historical sample at daemon seed.
+pub fn load_history_jsonl_tail(path: &Path, cap: usize) -> Result<Vec<HistoryRow>, CodexBarError> {
+    let cap = cap.max(1);
+    let file = fs::File::open(path).map_err(|e| CodexBarError::Io(e.to_string()))?;
+    let reader = BufReader::new(file);
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(cap);
+    for line in reader.lines() {
+        let line = line.map_err(|e| CodexBarError::Io(e.to_string()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if ring.len() == cap {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+    let mut rows = Vec::with_capacity(ring.len());
+    for line in ring {
+        if let Ok(row) = serde_json::from_str::<HistoryRow>(&line) {
+            rows.push(row);
+        }
     }
     Ok(rows)
 }
@@ -368,13 +398,7 @@ pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)>
         if name == "cursor-session.json" {
             continue;
         }
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        if meta.len() > MAX_SNAPSHOT_BYTES {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok(bytes) = quota_core::read_file_capped(&path, MAX_SNAPSHOT_BYTES as usize) else {
             continue;
         };
         if let Ok(snaps) = parse_account_snapshots(&bytes) {
@@ -399,12 +423,10 @@ pub fn load_history_snapshots_from_dir(dir: &Path, cap: usize) -> Vec<Snapshot> 
         if name == "cursor-session.json" {
             continue;
         }
-        let Ok(rows) = load_history_jsonl(&path) else {
+        let Ok(rows) = load_history_jsonl_tail(&path, cap.min(MAX_HISTORY_ROWS)) else {
             continue;
         };
-        let n = rows.len();
-        let start = n.saturating_sub(cap.min(MAX_HISTORY_ROWS));
-        return history_to_snapshots(&rows[start..]);
+        return history_to_snapshots(&rows);
     }
     Vec::new()
 }
@@ -580,6 +602,10 @@ mod tests {
         assert_eq!(snap.windows[0].used_percent, Some(59.0));
         let hist = load_history_snapshots_from_dir(&fixtures(), 16);
         assert_eq!(hist.len(), 16);
+        let tail =
+            load_history_jsonl_tail(&fixtures().join("usage-history.redacted.jsonl"), 16).unwrap();
+        assert_eq!(tail.len(), 16);
+        assert!((tail.last().unwrap().used_percent - 59.0).abs() < 1e-9);
         assert_eq!(
             hist.last()
                 .unwrap()
@@ -606,5 +632,29 @@ mod tests {
         .unwrap();
         assert!(load_snapshot_from_dir(&dir).is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_last_jsonl_line_is_skipped() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-jsonl-trunc-{stamp}.jsonl"));
+        let good = r#"{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#;
+        fs::write(&path, format!("{good}\n{{\"accountKey\":\"partial")).unwrap();
+        let rows = load_history_jsonl(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].used_percent, 10.0);
+        let tail = load_history_jsonl_tail(&path, 8).unwrap();
+        assert_eq!(tail.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_does_not_put_confidence_in_credential_path() {
+        let bytes = fs::read(fixtures().join("CURRENT-SNAPSHOT.expect.json")).unwrap();
+        let snap = parse_expect_snapshot(&bytes).unwrap();
+        assert!(snap.credential_path.is_none());
     }
 }

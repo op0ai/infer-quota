@@ -30,7 +30,10 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 #[derive(Default)]
-pub struct ClaudeAdapter;
+pub struct ClaudeAdapter {
+    /// When set, only this Claude config dir is consulted (`home_path` isolation).
+    pub config_dir: Option<std::path::PathBuf>,
+}
 
 impl Provider for ClaudeAdapter {
     fn id(&self) -> ProviderId {
@@ -38,7 +41,7 @@ impl Provider for ClaudeAdapter {
     }
 
     fn probe(&self, ctx: &ProbeCtx<'_>) -> ProviderSnapshot {
-        match load_claude_creds() {
+        match load_claude_creds(self.config_dir.as_deref()) {
             Ok(creds) => fetch_usage(ctx.transport, &creds, ctx.now),
             Err(e) => {
                 let mut snap = ProviderSnapshot::unavailable(
@@ -63,6 +66,7 @@ fn creds_code(e: &CredsError) -> &'static str {
         CredsError::TooLarge => "creds_too_large",
         CredsError::Io(_) => "creds_io",
         CredsError::Parse(_) => "creds_parse",
+        CredsError::Symlink(_) => "creds_symlink",
     }
 }
 
@@ -131,11 +135,10 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         return snap;
     }
     if !(200..300).contains(&status) {
-        let hint = String::from_utf8_lossy(body);
-        let hint = hint.chars().take(160).collect::<String>();
+        let _ = body;
         let mut snap = ProviderSnapshot::unavailable(
             ProviderId::Claude,
-            AdapterError::new("http", format!("HTTP {status}: {hint}")),
+            AdapterError::new("http", format!("HTTP {status}")),
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
@@ -304,6 +307,44 @@ mod tests {
         let snap = parse_usage_http(429, b"{}", Path::new("c.json"));
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "rate_limited");
+    }
+
+    #[test]
+    fn unauthorized() {
+        let snap = parse_usage_http(401, br#"{"token":"should-not-leak"}"#, Path::new("c.json"));
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.error.as_ref().unwrap().code, "unauthorized");
+        assert!(!snap
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("should-not-leak"));
+    }
+
+    #[test]
+    fn http_error_omits_body() {
+        let snap = parse_usage_http(500, b"internal secret xyz", Path::new("c.json"));
+        assert_eq!(snap.error.as_ref().unwrap().code, "http");
+        assert_eq!(snap.error.as_ref().unwrap().message, "HTTP 500");
+    }
+
+    #[test]
+    fn isolated_config_dir_missing_does_not_panic() {
+        let t = MockTransport {
+            next: Some(Err(TransportError::Message("offline".into()))),
+            last_url: std::sync::Mutex::new(None),
+        };
+        let adapter = ClaudeAdapter {
+            config_dir: Some(PathBuf::from("/no/such/claude-home-quota-test")),
+        };
+        let ctx = crate::provider::ProbeCtx {
+            transport: &t,
+            now: 1,
+        };
+        let snap = adapter.probe(&ctx);
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.error.as_ref().unwrap().code, "no_credentials");
     }
 
     #[test]

@@ -9,6 +9,7 @@
 pub mod accounts;
 pub mod config;
 pub mod framing;
+pub mod fsutil;
 pub mod math;
 pub mod paths;
 pub mod protocol;
@@ -21,6 +22,9 @@ pub mod windows;
 pub use accounts::{AccountBook, AccountRecord, SecretRef};
 pub use config::Config;
 pub use framing::{decode_len, encode_frame, FrameError, MAX_FRAME_BYTES};
+pub use fsutil::{
+    chmod_private_file, ensure_private_dir, path_has_parent_dir, read_file_capped, CapReadError,
+};
 pub use math::{burn_percent_per_sec, can_start, eta_empty_secs, select_samples};
 pub use paths::{
     claude_config_dirs, codex_home, codexbar_history_candidates, codexbar_snapshot_candidates,

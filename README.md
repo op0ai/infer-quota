@@ -140,8 +140,9 @@ no. A published token/credit remaining is compared directly.
 - Optional JSONL history (`"history": true` in config) records snapshots
   (percents, reset times) — not secrets. Off by default.
 - Account book (`accounts.json`) is metadata + optional `secret_ref` paths.
-- Socket mode `0600`, directory `0700`.
+- Socket mode `0600`, directory `0700`. Symlink socket paths are refused.
 - Fixtures in-repo are redacted (`accountKey` hashed; fingerprints stripped).
+- Threat model and residual gaps: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Performance / memory
 

@@ -28,3 +28,5 @@ pub const ENV_OPENBAO_ADDR: &str = "QUOTA_OPENBAO_ADDR";
 pub const ENV_OPENBAO_TOKEN: &str = "QUOTA_OPENBAO_TOKEN";
 pub const ENV_OPENBAO_MOUNT: &str = "QUOTA_OPENBAO_MOUNT";
 pub const ENV_OPENBAO_PREFIX: &str = "QUOTA_OPENBAO_PREFIX";
+/// Set to `1` to allow plain HTTP to a non-loopback OpenBao (local-dev only).
+pub const ENV_OPENBAO_ALLOW_PLAINTEXT: &str = "QUOTA_OPENBAO_ALLOW_PLAINTEXT";
