@@ -1,0 +1,36 @@
+---
+title: quotad
+description: Foreground daemon that polls Codex and Claude, keeps a snapshot ring, and serves the Unix socket.
+---
+
+`quotad` is the source of truth. It is a foreground process: one Tokio `current_thread` runtime, HTTPS probes in `spawn_blocking`, and a Unix socket for every client.
+
+```bash
+quotad run
+quotad run --socket /path/to/quota.sock
+quotad --config ~/.config/quota/config.json
+```
+
+The only subcommand is `run`. Omitting it still starts the daemon.
+
+## What it reads
+
+It reuses session files the official CLIs already wrote. It does not write those files, store passwords, or refresh OAuth. Access tokens stay in memory for one HTTP GET. If a token is stale, sign in again with `codex login` or Claude Code `/login`.
+
+Credential and usage details, including which routes are hypotheses, are in [`docs/SOURCES.md`](https://github.com/op0ai/infer-quota/blob/main/docs/SOURCES.md). v0 probes **Codex** and **Claude** only.
+
+When `enable_codexbar_files` is true (the default), `quotad` may read CodexBar's on-disk snapshot and usage-history files under `$QUOTA_CODEXBAR_DIR` or `~/Library/Application Support/CodexBar/`. It does not open `cursor-session.json`. History JSONL seeds the in-memory pace ring (newest `ring_capacity` rows). That path is a fallback and a seed, not a second product.
+
+## Refresh and storage
+
+Adaptive refresh waits `refresh_min_secs` (default 30) while numbers move, and backs off toward `refresh_max_secs` (default 300) when the snapshot is stable, unavailable, or the provider returns HTTP 429.
+
+The in-memory ring defaults to 128 snapshots. Optional JSONL history (`"history": true`) appends snapshots — percents and reset times, not secrets — and is not replayed on startup. It is off by default.
+
+Account metadata (no secret bytes) is stored in an account book. `quota-ctl` is the CLI that edits it. When an account is selected and `home_path` is set, the next refresh uses that path as `CODEX_HOME` for the Codex adapter.
+
+## Socket
+
+The listening socket is mode `0600`. The parent directory is created if needed and its mode is set to `0700`. Point `--socket` at a directory this process owns, such as `$XDG_RUNTIME_DIR/quota/quota.sock`. Path order is on the [Protocol](/protocol) page.
+
+Caps in this tree: credential files and HTTP bodies at 64 KiB, socket frames at 256 KiB. Release builds use thin LTO, `opt-level = s`, `panic = abort`, and stripped debuginfo. See [`docs/BENCHMARKS.md`](https://github.com/op0ai/infer-quota/blob/main/docs/BENCHMARKS.md) for one measured host.

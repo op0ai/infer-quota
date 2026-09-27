@@ -21,3 +21,35 @@ jobs:
         run: cargo test --locked --workspace
       - name: release build
         run: cargo build --locked --workspace --release
+
+  docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: install
+        run: bun install --frozen-lockfile
+      - name: format
+        run: bun run fmt:check
+      - name: lint
+        run: bun run lint
+      - name: check
+        run: bun run check
+      - name: build
+        run: bun run build
+      - name: agent artifacts
+        run: |
+          test -f dist/llms.txt
+          test -f dist/llms-full.txt
+          test -f dist/agent-readability.json
+          test -f dist/api/docs/pages.json
+          test -f dist/openapi.json
+          test -f dist/quotad.md

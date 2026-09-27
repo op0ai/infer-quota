@@ -6,9 +6,9 @@
 
 Resolution order:
 
-1. `--socket` on `quotad` / `quota`
-2. `QUOTA_SOCKET`
-3. `socket` in `~/.config/quota/config.json` (or `$XDG_CONFIG_HOME/quota/config.json`)
+1. `--socket` on `quotad` / `quota` / `quota-ctl`
+2. `socket` in the config file (`--config`, else `$XDG_CONFIG_HOME/quota/config.json`, else `~/.config/quota/config.json`)
+3. `QUOTA_SOCKET`
 4. `$XDG_RUNTIME_DIR/quota/quota.sock` when `XDG_RUNTIME_DIR` is set and non-empty
 5. `~/.local/share/quota/quota.sock`
 

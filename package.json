@@ -1,0 +1,14 @@
+{
+  "name": "infer-quota",
+  "private": true,
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "dev": "bun --cwd site run dev",
+    "build": "bun --cwd site run build",
+    "check": "bun --cwd site run check",
+    "lint": "bun --cwd site run lint",
+    "fmt": "bun --cwd site run fmt",
+    "fmt:check": "bun --cwd site run fmt:check",
+    "docs:install": "bun install --cwd site --frozen-lockfile"
+  }
+}

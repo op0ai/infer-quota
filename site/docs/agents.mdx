@@ -1,0 +1,62 @@
+---
+title: Agents
+description: llms.txt, Markdown mirrors, and the JSON API shipped with the static docs. MCP is optional and off in v1.
+---
+
+These docs are the source agents should read. `blume build` emits the machine-readable surface below into `site/dist/`. v1 is a static site. No docs server is required.
+
+After a local build:
+
+```bash
+cd site
+bun run build
+test -f dist/llms.txt
+test -f dist/llms-full.txt
+test -f dist/agent-readability.json
+test -f dist/api/docs/pages.json
+```
+
+## What a static build emits
+
+| Artifact                            | Path                                                         |
+| ----------------------------------- | ------------------------------------------------------------ |
+| Compact index                       | `/llms.txt`                                                  |
+| Full corpus                         | `/llms-full.txt`                                             |
+| Page Markdown                       | append `.md` to the page URL (`/quotad.md`, `/quota-ctl.md`) |
+| Page index                          | `/api/docs/pages.json`                                       |
+| One page                            | `/api/docs/pages/{route}.json` (`index` for the home page)   |
+| Navigation                          | `/api/docs/navigation.json`                                  |
+| OpenAPI description of this surface | `/openapi.json`                                              |
+| Discovery manifest                  | `/agent-readability.json`                                    |
+
+`/llms.txt` lists every public page with its description, then links the other artifacts. The `details` block in `site/blume.config.ts` tells an agent when to reach for this repository and which binaries exist.
+
+`/api/docs/search` is a live endpoint. It is not part of the static build. Use `pages.json` or `llms-full.txt` offline.
+
+On a static host, fetch the `.md` URL. `Accept: text/markdown` on the HTML URL works in `blume dev`, and on a Vercel or Cloudflare **server** deploy. A static Pages or Vercel deploy serves the prerendered `.md` file instead of negotiating that header.
+
+`deployment.site` is unset until a custom domain exists, so manifest URLs are root-relative. Set the origin when the domain is attached so agents see absolute links. See [`DEPLOY.md`](https://github.com/op0ai/infer-quota/blob/main/site/DEPLOY.md).
+
+## MCP later
+
+The hosted MCP server is off (`agents.mcp.enabled: false`). Turning it on requires server output, which this v1 site does not deploy:
+
+```ts
+import { defineConfig } from "blume";
+import { vercel } from "blume/deploy";
+
+export default defineConfig({
+  deployment: vercel({
+    site: "https://example.com",
+  }),
+  agents: {
+    mcp: { enabled: true, route: "/mcp" },
+  },
+});
+```
+
+`node()` and `cloudflare()` from `blume/deploy` are the other adapters. `cloudflare()` needs `@astrojs/cloudflare` installed. A static build with `mcp.enabled` fails on purpose.
+
+When that server is deployed, Blume mounts read-only tools (`search_docs`, `get_page`, `list_pages`, `get_navigation`) and writes `/.well-known/mcp.json`. That is a docs MCP for these pages. It is separate from a future quota MCP that would call the [Unix socket](/protocol). Do not point a quota client at `/mcp` on this site.
+
+The Rust workspace does not ship an MCP server in v0. Compose one beside `quotad` if you need tools for `status` and `pace`.

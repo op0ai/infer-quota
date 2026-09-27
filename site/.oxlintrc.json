@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    ".blume/**",
+    ".blume-verify/**",
+    "dist/**",
+    "node_modules/**",
+    "**/*.md",
+    "**/*.mdx"
+  ]
+}

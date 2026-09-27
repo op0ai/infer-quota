@@ -1,0 +1,109 @@
+---
+title: Protocol
+description: Unix socket framing and JSON methods for quotad. Protocol version 1.
+---
+
+`quotad` listens on a Unix domain socket. Clients are `quota`, `quota-ctl`, and any later process that should not call providers itself. Protocol version is **1**. Additive optional fields do not bump it. Removing or renaming a field does.
+
+The field-level note in the repository is [`docs/protocol.md`](https://github.com/op0ai/infer-quota/blob/main/docs/protocol.md). Types live in `quota-core` (`protocol.rs`, `types.rs`). Clients must ignore unknown JSON fields.
+
+## Path
+
+Implemented order:
+
+1. `--socket` on `quotad`, `quota`, or `quota-ctl`
+2. `socket` in the config file (`--config`, or `$XDG_CONFIG_HOME/quota/config.json`, or `~/.config/quota/config.json`)
+3. `QUOTA_SOCKET`
+4. `$XDG_RUNTIME_DIR/quota/quota.sock` when `XDG_RUNTIME_DIR` is set and non-empty
+5. `~/.local/share/quota/quota.sock`
+
+The socket file is mode `0600`. The parent directory is created if needed and its mode is set to `0700`. Use a private directory (`$XDG_RUNTIME_DIR/quota`), because that mode is applied to the parent.
+
+## Framing
+
+Little-endian length prefix, then compact UTF-8 JSON:
+
+```text
+[u32 LE payload_len][payload_len bytes]
+```
+
+Maximum payload: **262144** bytes (`256 * 1024`). Larger frames are rejected. The length prefix is the boundary; pretty-printed JSON is not used on the wire.
+
+## Request and response
+
+```json
+{ "id": 1, "method": "status", "params": { "provider": "all" } }
+```
+
+```json
+{ "id": 1, "ok": true, "result": {} }
+```
+
+```json
+{ "id": 1, "ok": false, "error": { "code": "unknown_method", "message": "..." } }
+```
+
+| Method            | Params                                          | Result                                      |
+| ----------------- | ----------------------------------------------- | ------------------------------------------- |
+| `ping`            | ignored                                         | `{"pong": true}`                            |
+| `version`         | ignored                                         | `{"name","version","protocol"}`             |
+| `status`          | `{"provider": "all"\|"codex"\|"claude"}`        | `{"snapshot": Snapshot}`                    |
+| `pace`            | same provider filter                            | `{"reports": [PaceReport]}`                 |
+| `can_start`       | `{"tokens": u64, "deadline"?: i64, "provider"}` | `{"ok": bool, "answers": [CanStartAnswer]}` |
+| `watch`           | provider filter                                 | stream of `status` results, same `id`       |
+| `refresh`         | provider filter                                 | `{"snapshot": Snapshot}` after a probe      |
+| `accounts.list`   | `{}`                                            | `{"version","active_id","accounts"}`        |
+| `accounts.add`    | account metadata                                | `{"account","active_id"}`                   |
+| `accounts.remove` | `{"id"}`                                        | same shape as `accounts.list`               |
+| `accounts.select` | `{"id": string\|null}`                          | same shape as `accounts.list`               |
+
+`deadline` is UTC unix seconds. When it is omitted, `can_start` uses the window's published `reset_at`.
+
+`watch` keeps the connection open. After the first snapshot, each refresh sends another response with the same `id`. Closing the socket unsubscribes.
+
+`accounts.add` may include `secret_ref: { "backend", "path" }`, `home_path`, and `select`. The socket carries pointers and labels. Passwords, JWTs, and access tokens stay off this socket; use `quota-ctl secret put`.
+
+## Snapshot
+
+Stable names on `Snapshot`:
+
+- `fetched_at`, `fetched_at_rfc3339`
+- `providers[]`: `provider`, `status` (`ok` or `unavailable`), optional `source` (`oauth`, `cli`, `cookie`, `file`), `windows[]`, optional `credits`, `plan`, `error` (`code`, `message`), `credential_path`
+
+Each window: `kind` (`session`, `five_hour`, `weekly`, `monthly`, `extra`), `label`, and optional `used_percent`, `remaining_percent`, `remaining`, `limit`, `unit`, `reset_at`, `reset_at_rfc3339`, `limit_window_seconds`.
+
+`can_start` answers use `basis`: `token_budget`, `percent_only`, or `unavailable`.
+
+Window kind follows published length. About 18000 seconds is a session (`5h`). About 604800 seconds is weekly, including when that duration arrives in `primary_window`.
+
+## Minimal client
+
+```python
+import json, os, socket, struct
+from pathlib import Path
+
+def socket_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "quota" / "quota.sock"
+    return Path.home() / ".local/share/quota/quota.sock"
+
+def rpc(method, params=None, sock_path=None):
+    payload = json.dumps(
+        {"id": 1, "method": method, "params": params or {}}
+    ).encode()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(str(sock_path or socket_path()))
+    s.sendall(struct.pack("<I", len(payload)) + payload)
+    header = s.recv(4)
+    n = struct.unpack("<I", header)[0]
+    body = b""
+    while len(body) < n:
+        chunk = s.recv(n - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return json.loads(body)
+```
+
+This sketch uses the default path only. It does not read `QUOTA_SOCKET` or the config file.

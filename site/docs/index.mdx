@@ -1,0 +1,33 @@
+---
+title: fetchquota
+description: Fetch, observe, and compose inference quota. One small Unix block for Codex and Claude session quotas.
+sidebar:
+  label: Overview
+---
+
+**fetchquota** is the public name for [infer-quota](https://github.com/op0ai/infer-quota): a small MIT-licensed quota block. It fetches what the official CLIs already know, keeps a snapshot, and lets anything else on the machine observe it.
+
+The crates and binaries stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. op0 publishes the repository. A custom domain can point here later; the names in Cargo do not move with the domain.
+
+```
+  Codex ~/.codex/auth.json ──┐
+                             ├──► quotad
+  Claude ~/.claude/          │         │
+         .credentials.json ──┘         │  length-prefixed JSON
+                                       ▼
+                              Unix socket ── quota
+                                           ── quota-ctl
+                                           ── anything else that should not probe again
+```
+
+| Binary                    | Job                                                                               |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| [`quotad`](/quotad)       | Foreground daemon. Polls, stores the snapshot, owns the socket.                   |
+| [`quota`](/quota)         | Read client. Status, pace, can-start, watch. No HTTP.                             |
+| [`quota-ctl`](/quota-ctl) | Accounts, refresh, and local secret pointers. Usage collection stays in `quotad`. |
+
+Providers in v0 are **Codex** and **Claude**. A failed probe is `status: unavailable` plus a reason. Token remaining shows up only when the source published a real budget. Percent-only windows stay percent-only.
+
+This block is the piece a larger setup calls. A menu bar, a status line, or an orchestrator should speak the [socket](/protocol). [CodexBar](https://github.com/steipete/CodexBar) is a separate product (menu bar, many providers, its own UI). When its on-disk snapshots exist, `quotad` can read them as a fallback. See [Compose](/compose).
+
+Engineering notes that are not this site live in the repository `docs/` directory: protocol field notes, credential hypotheses, secrets, and measured benches. Start with [Install](/install).

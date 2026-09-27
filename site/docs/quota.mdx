@@ -1,0 +1,47 @@
+---
+title: quota
+description: Read-only CLI for quotad. Status, pace, can-start, and watch over the Unix socket.
+---
+
+`quota` asks `quotad` for numbers. It does not open provider HTTP and it does not read credential files.
+
+```bash
+quota status
+quota status --json --provider codex
+quota pace --provider claude
+quota can-start --tokens 50000
+quota can-start --tokens 50000 --deadline 1760000000 --provider all
+quota watch
+quota ping
+quota version
+quota --socket /path/to/quota.sock status
+```
+
+`--provider` is `codex`, `claude`, or `all` (default `all`). `--json` prints the daemon payload. `--socket` overrides path resolution for that process.
+
+## Commands
+
+| Command                | Result                                     |
+| ---------------------- | ------------------------------------------ |
+| `status`               | Latest snapshot                            |
+| `pace`                 | Burn rate and ETA from the in-memory ring  |
+| `can-start --tokens N` | Whether a job fits before reset            |
+| `watch`                | Print a snapshot after each daemon refresh |
+| `ping`                 | `pong`                                     |
+| `version`              | Daemon name, version, and protocol number  |
+
+`can-start` takes `--deadline` as UTC unix seconds. When it is omitted, the deadline is the window's published `reset_at`.
+
+## Exit codes
+
+| Code | Meaning                          |
+| ---- | -------------------------------- |
+| `0`  | Ok                               |
+| `1`  | Transport or RPC error           |
+| `2`  | `can-start` overall answer is no |
+
+## can-start and percent windows
+
+Codex `/wham/usage` and Claude `/api/oauth/usage` usually publish percent used, not a token budget. `can-start` then returns `basis: percent_only` with an explanation. A published token or credit remaining is `basis: token_budget` and is compared to `--tokens`. Exhausted (0% left) is a hard no. `basis: unavailable` means the daemon does not have a usable window. `--tokens` is never turned into a made-up percent budget.
+
+`pace` reports `burn_percent_per_hour`, `eta_empty_secs`, sample count, and a short explanation per provider window. Fields are omitted when the ring cannot support them.

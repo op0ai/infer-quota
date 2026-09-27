@@ -98,10 +98,11 @@ Dev-only. Not a production vault. Details: [docs/SECRETS.md](docs/SECRETS.md).
 
 ### Socket path
 
-1. `--socket` / `QUOTA_SOCKET`
-2. `~/.config/quota/config.json` → `socket`
-3. `$XDG_RUNTIME_DIR/quota/quota.sock`
-4. `~/.local/share/quota/quota.sock`
+1. `--socket`
+2. `socket` in the config file (`--config`, else `$XDG_CONFIG_HOME/quota/config.json`, else `~/.config/quota/config.json`)
+3. `QUOTA_SOCKET`
+4. `$XDG_RUNTIME_DIR/quota/quota.sock`
+5. `~/.local/share/quota/quota.sock`
 
 Protocol: **4-byte little-endian length + compact JSON**. Methods: `status`,
 `pace`, `can_start`, `ping`, `version`, `watch`, plus additive `refresh` and
@@ -188,6 +189,24 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Clients | Any process that can speak the socket | App-centric |
 
 A menu bar can sit on this daemon the same way `quota watch` does.
+
+## Docs
+
+Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: fetch, observe, and compose inference quota. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/).
+
+```bash
+cd site
+bun install
+bun run dev     # http://localhost:4321
+bun run build   # site/dist
+bun run check   # blume check
+```
+
+Node.js 22.12+ and Bun 1.4. From the repo root, `bun run docs:install`, `bun run dev`, `bun run build`, and `bun run check` call the same scripts. Deploy on Vercel or Cloudflare Pages: [site/DEPLOY.md](site/DEPLOY.md). A custom domain is not attached yet.
+
+Agent entry points after `bun run build`: `site/dist/llms.txt`, `site/dist/llms-full.txt`, per-page `.md` mirrors, and `site/dist/api/docs/pages.json`. The docs MCP server stays off so v1 remains static.
+
+An earlier static share stub (`docs/site`, pull request #2) is superseded by this Blume site. Publish `site/`, not a second HTML page under `docs/`.
 
 ## License
 
