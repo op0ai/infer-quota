@@ -1,0 +1,46 @@
+---
+title: Adapters
+description: Provider-agnostic collectors. Codex and Claude are the first implementations of the Provider trait.
+---
+
+fetchquota is a quota and pool-math block. A provider is an adapter that turns some quota source into a [`ProviderSnapshot`](/protocol). The daemon, the ring, pace, and `can_start` stay the same whichever adapter filled the snapshot.
+
+Codex and Claude are the **first shipped** collectors. They exist because early dogfood used CodexBar-shaped files and Claude usage endpoints. That pair is the current code, not a limit on which quota sources belong here. Anything that exposes quota is in scope for a later adapter. No other collectors ship in this tree.
+
+## What is pluggable today
+
+`quota-adapters` defines the collector interface:
+
+```rust
+pub trait Provider {
+    fn id(&self) -> ProviderId;
+    fn probe(&self, ctx: &ProbeCtx<'_>) -> ProviderSnapshot;
+}
+```
+
+`ProbeCtx` carries a `Transport` and the probe timestamp. `probe_all` runs a slice of `&dyn Provider` and builds one `Snapshot`. A failed probe is `status: unavailable` with a reason. Token remaining is set only when that source published a real budget.
+
+`quotad` builds the slice on each refresh (`crates/quotad/src/daemon.rs`):
+
+- `CodexAdapter` when `enable_codex` is true (default)
+- `ClaudeAdapter` when `enable_claude` is true (default)
+
+Both flags live in the JSON config. See [`docs/config.example.json`](https://github.com/op0ai/infer-quota/blob/main/docs/config.example.json).
+
+CodexBar on-disk snapshots are a fallback inside `CodexAdapter` (`enable_codexbar_files`, default true). They are not a third provider id.
+
+## Current ids
+
+`ProviderId` in `quota-core` is an enum: `codex` and `claude` (lowercase on the wire). `ProviderFilter` is `all`, `codex`, or `claude`. The `quota` and `quota-ctl` `--provider` flags use those names.
+
+Field notes for the two probes, including which URLs are hypotheses, stay in [`docs/SOURCES.md`](https://github.com/op0ai/infer-quota/blob/main/docs/SOURCES.md).
+
+## Adding a collector
+
+Registration is a change in this repository. Config today toggles the two shipped adapters (`enable_codex`, `enable_claude`). A new provider follows these steps:
+
+1. Implement `Provider` in `quota-adapters`. `probe` returns a `ProviderSnapshot` and leaves unknown source fields uninvented.
+2. Add a `ProviderId` variant (and the `ProviderFilter` / CLI arms that name it). Serde already uses lowercase id strings.
+3. Push the adapter onto the slice in `quotad`'s refresh, behind a config flag if it should be optional the way `enable_codex` and `enable_claude` are.
+
+Clients keep ignoring unknown JSON fields, so additive snapshot fields do not bump protocol 1. A new id is a code change on both sides of the socket until callers learn the name.

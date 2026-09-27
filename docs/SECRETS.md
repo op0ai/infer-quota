@@ -1,7 +1,9 @@
 # Secrets
 
 `quota-secrets` is the unified lookup crate. `quota-ctl` is the human CLI.
-`quotad` never stores passwords, API keys, or JWTs.
+`quotad` never stores passwords, API keys, or JWTs. The chain is shared
+across adapters. The CLI-file paths below are what the first shipped
+collectors (Codex and Claude) read.
 
 ## Order (first hit wins)
 

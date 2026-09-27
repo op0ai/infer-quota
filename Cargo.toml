@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.83"
-description = "Tiny Unix inference-quota daemon and CLI (Codex + Claude)"
+description = "Rust-native inference quota daemon and CLI (quotad, quota, quota-ctl)"
 repository = "https://github.com/op0ai/infer-quota"
 
 [workspace.dependencies]

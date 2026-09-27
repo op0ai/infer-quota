@@ -57,6 +57,8 @@ Maximum payload: **262144** bytes (`256 * 1024`). Larger frames are rejected. Th
 | `accounts.remove` | `{"id"}`                                        | same shape as `accounts.list`               |
 | `accounts.select` | `{"id": string\|null}`                          | same shape as `accounts.list`               |
 
+`provider` on these methods is `all`, `codex`, or `claude` today, matching `ProviderId`. A new adapter adds a variant in code. See [Adapters](/adapters).
+
 `deadline` is UTC unix seconds. When it is omitted, `can_start` uses the window's published `reset_at`.
 
 `watch` keeps the connection open. After the first snapshot, each refresh sends another response with the same `id`. Closing the socket unsubscribes.

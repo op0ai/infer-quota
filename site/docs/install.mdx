@@ -3,7 +3,9 @@ title: Install
 description: Build quotad, quota, and quota-ctl from the infer-quota repository on macOS or Linux.
 ---
 
-v0 is built from the [infer-quota](https://github.com/op0ai/infer-quota) repository. Rust **1.83+** (stable). macOS or Linux: each binary requires a Unix domain socket.
+v0 is built from the [infer-quota](https://github.com/op0ai/infer-quota) repository. Rust-native inference quota: **quotad · quota · quota-ctl**. Rust **1.83+** (stable). macOS or Linux: each binary requires a Unix domain socket.
+
+The quickstart below uses the first shipped adapters, Codex and Claude. How another quota source plugs in: [Adapters](/adapters).
 
 ```bash
 git clone https://github.com/op0ai/infer-quota

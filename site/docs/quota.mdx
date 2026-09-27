@@ -17,7 +17,7 @@ quota version
 quota --socket /path/to/quota.sock status
 ```
 
-`--provider` is `codex`, `claude`, or `all` (default `all`). `--json` prints the daemon payload. `--socket` overrides path resolution for that process.
+`--provider` today is `codex`, `claude`, or `all` (default `all`) — the ids on the shipped adapters. `--json` prints the daemon payload. `--socket` overrides path resolution for that process. A new collector extends those ids in code; see [Adapters](/adapters).
 
 ## Commands
 
@@ -42,6 +42,6 @@ quota --socket /path/to/quota.sock status
 
 ## can-start and percent windows
 
-Codex `/wham/usage` and Claude `/api/oauth/usage` usually publish percent used, not a token budget. `can-start` then returns `basis: percent_only` with an explanation. A published token or credit remaining is `basis: token_budget` and is compared to `--tokens`. Exhausted (0% left) is a hard no. `basis: unavailable` means the daemon does not have a usable window. `--tokens` is never turned into a made-up percent budget.
+The shipped Codex and Claude probes usually publish percent used, not a token budget (`/wham/usage`, `/api/oauth/usage`). `can-start` then returns `basis: percent_only` with an explanation. The same rule applies to any later adapter: a percent window stays percent-only. A published token or credit remaining is `basis: token_budget` and is compared to `--tokens`. Exhausted (0% left) is a hard no. `basis: unavailable` means the daemon does not have a usable window. `--tokens` is never turned into a made-up percent budget.
 
 `pace` reports `burn_percent_per_hour`, `eta_empty_secs`, sample count, and a short explanation per provider window. Fields are omitted when the ring cannot support them.

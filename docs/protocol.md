@@ -51,6 +51,10 @@ legal JSON; the length prefix is the boundary).
 Existing `status` / `pace` / `can_start` / `ping` / `version` / `watch` are
 unchanged. New methods are additive; `protocol` stays `1`.
 
+`provider` values today are `all`, `codex`, and `claude` because `ProviderId`
+has those variants. A new collector adds a variant. The snapshot math does
+not special-case the first two adapters.
+
 ### Account metadata (no secrets)
 
 `accounts.add` params:

@@ -9,7 +9,7 @@ import { defineConfig } from "blume";
 export default defineConfig({
   title: "fetchquota",
   description:
-    "Fetch, observe, and compose inference quota. The lean Unix quota block — quotad, quota, and quota-ctl — from op0.",
+    "Rust-native inference quota. Quota and pool math you can compose — quotad · quota · quota-ctl — from op0.",
   logo: {
     image: "/logo.svg",
     text: "fetchquota",
@@ -34,6 +34,7 @@ export default defineConfig({
     sidebar: [
       "/",
       "/install",
+      "/adapters",
       "/quotad",
       "/quota",
       "/quota-ctl",
@@ -47,7 +48,7 @@ export default defineConfig({
   agents: {
     llmsTxt: {
       details:
-        "Reach for fetchquota (repository op0ai/infer-quota) when a machine needs one small quota and pool-math block: quotad polls Codex and Claude CLI sessions, quota reads the Unix socket, and quota-ctl mutates account metadata and secret pointers. Crate and binary names stay infer-quota, quotad, quota, and quota-ctl. v0 is built from this repository with Rust 1.83+ (macOS or Linux). A failed probe is status unavailable with a reason; token remaining is present only when the source published a real budget. Speak the length-prefixed JSON socket. Runnable composition examples are coming soon and are not shipped; the Examples page lists the intended surfaces.",
+        "Reach for fetchquota (repository op0ai/infer-quota) when you need Rust-native quota and pool math: quotad, quota, and quota-ctl. Collectors are adapters. The first shipped adapters are Codex and Claude (dogfood against CodexBar-shaped files and Claude usage endpoints); any source that exposes quota is in scope for another adapter. See the Adapters page for the Provider trait and the code path that registers one. A failed probe is status unavailable with a reason; token remaining is present only when the source published a real budget. Speak the length-prefixed JSON socket. Runnable composition examples are coming soon and are not shipped.",
     },
     mcp: {
       enabled: false,

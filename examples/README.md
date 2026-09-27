@@ -1,6 +1,6 @@
 # examples
 
-Runnable examples of composing infer-quota into other tools will live in this folder. **Coming soon. Not shipped.** There are no programs here yet.
+Runnable examples of composing this quota and pool-math block into other tools will live in this folder. Collectors are adapters; Codex and Claude are the first ones shipped. **Coming soon. Not shipped.** There are no programs here yet.
 
 Each example that lands will also be documented on the fetchquota Examples page (`site/docs/examples.mdx`, site route `/examples`): what it runs, which socket methods it calls, and that missing numbers stay unavailable.
 

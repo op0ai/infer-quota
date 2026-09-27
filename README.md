@@ -1,35 +1,43 @@
 # quota
 
-Tiny, MIT-licensed inference-quota **daemon + CLI + control plane** for
-machines that already have Codex and/or Claude Code logged in.
+Rust-native inference quota. Tiny, MIT-licensed **quotad · quota · quota-ctl**:
+daemon, read CLI, and control plane for quota and pool math.
 
-`quotad` is the source of truth (polling + snapshots). `quota` is a thin
-read client. `quota-ctl` is the mutating companion (accounts / refresh /
-local secrets pointers) — a CodexBar-shaped foil that does **not** collect
-usage itself.
+Collectors are adapters. The first shipped ones read Codex and Claude
+sessions — early dogfood against CodexBar-shaped files and Claude usage
+endpoints, not an architectural limit. Any source that exposes quota belongs
+in another adapter. See [site/docs/adapters.mdx](site/docs/adapters.mdx).
 
-A later macOS menu bar, Herdr statusline, tmux segment, or MCP server
-should speak the same Unix socket — not scrape providers again.
+`quotad` polls enabled adapters, stores the snapshot, and owns the Unix
+socket. `quota` is a thin read client. `quota-ctl` mutates accounts, refresh,
+and local secret pointers. Usage collection stays in `quotad`.
+
+A menu bar, Herdr statusline, tmux segment, or MCP server should speak that
+socket. Provider HTTP stays in the adapters.
 
 | | URL |
 |--|-----|
 | Origin (working forge) | https://origin.cursor.com/op0/infer-quota |
 | GitHub (public mirror) | https://github.com/op0ai/infer-quota |
 
-This is **not** [CodexBar](https://github.com/steipete/CodexBar). CodexBar is a
-full menu-bar product with many providers, cookies, widgets, and UI.
-`quota` is the small rust-native core: reuse sessions, publish numbers, do the
-math.
+[CodexBar](https://github.com/steipete/CodexBar) is a separate menu-bar
+product (many providers, cookies, widgets, UI). This repository is the small
+Rust core: adapters, a snapshot, the math, a socket.
 
 ```
-  Codex ~/.codex/auth.json ──┐
-                             ├──► quotad (1 OS thread + blocking HTTP)
-  Claude ~/.claude/          │         │
-         .credentials.json ──┘         │  length-prefixed JSON
-                                       ▼
-                              Unix socket ── quota CLI
-                                           ── quota-ctl (accounts / refresh)
-                                           ── future menu bar / tmux / MCP
+  quota source
+       │
+       ▼
+  adapter          shipped today: Codex, Claude
+       │
+       ▼
+    quotad         snapshot + pool math
+       │
+       │  length-prefixed JSON
+       ▼
+  Unix socket ── quota
+              ── quota-ctl
+              ── other surfaces
 ```
 
 ## What v0 does
@@ -42,7 +50,10 @@ math.
   several are **undocumented hypotheses**). On failure: `status: unavailable`
   plus a reason — **no fake remaining tokens**.
 - Math: burn rate from a bounded snapshot ring, ETA to empty, `can_start`.
-- Providers: **Codex** and **Claude** only.
+- First collectors: **Codex** and **Claude** adapters (`Provider` in
+  `quota-adapters`). `enable_codex` / `enable_claude` default on. Another
+  provider is a code change on that trait, `ProviderId`, and the probe list
+  in `quotad`.
 - Offline CodexBar fixture parser + 1912-row history replay in tests.
 - Optional read of CodexBar's macOS snapshot/history files when the live
   API is down (never `cursor-session.json`).
@@ -54,7 +65,6 @@ math.
 - Menu bar / WidgetKit / Qt
 - MCP server
 - Cookie-DB scraping (we refuse to hold a browser cookie database in memory)
-- The rest of CodexBar's provider zoo
 - Claiming calibrated accuracy beyond what the source published
 - Converting `--tokens N` into a percent-only window
 
@@ -170,7 +180,7 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Crate | Role |
 |-------|------|
 | `quota-core` | Types, snapshot schema, math, framing, config, paths, Unix RPC |
-| `quota-adapters` | Codex + Claude + CodexBar file parser (`Provider` trait, mocked HTTP) |
+| `quota-adapters` | `Provider` trait. First collectors: Codex, Claude, plus the CodexBar file fallback |
 | `quota-secrets` | OpenBao / keychain stub / file OAuth chain |
 | `quotad` | Daemon |
 | `quota` | Read CLI (sync socket client; no HTTP) |
@@ -181,9 +191,9 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | | quota / quotad / quota-ctl | CodexBar |
 |--|----------------------------|----------|
-| Job | Core: session reuse, snapshot, math, socket | Product: menu bar, widgets, many providers |
+| Job | Core: adapters, snapshot, math, socket | Product: menu bar, widgets, many providers |
 | UI | None in v0 | Native macOS UI |
-| Providers (v0) | Codex, Claude | Large set + cookies + cost scanners |
+| Collectors | First adapters: Codex, Claude. Math and socket stay provider-agnostic | Large set + cookies + cost scanners |
 | Credential writes | Never (files). Optional OpenBao for *new* keys | Refresh/cookie import in some paths |
 | Accuracy | Honest `percent_only` when no token budget | Richer UI; still often percent windows |
 | Clients | Any process that can speak the socket | App-centric |
@@ -192,7 +202,7 @@ A menu bar can sit on this daemon the same way `quota watch` does.
 
 ## Docs
 
-Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: fetch, observe, and compose inference quota. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/). Runnable composition examples will live in [`examples/`](examples/) and on the docs Examples page; none are shipped yet.
+Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: Rust-native inference quota, quota and pool math, quotad · quota · quota-ctl. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/). Runnable composition examples will live in [`examples/`](examples/) and on the docs Examples page; none are shipped yet.
 
 ```bash
 cd site

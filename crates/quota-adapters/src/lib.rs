@@ -1,4 +1,4 @@
-//! Best-effort Codex + Claude adapters.
+//! Quota collectors. Codex and Claude are the first `Provider` implementations.
 //!
 //! These modules reuse *already logged-in* local sessions. They never store
 //! passwords, never write credential files, and never invent quota numbers.

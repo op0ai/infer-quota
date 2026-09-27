@@ -1,9 +1,9 @@
 ---
 title: quotad
-description: Foreground daemon that polls Codex and Claude, keeps a snapshot ring, and serves the Unix socket.
+description: Foreground daemon that polls enabled adapters, keeps a snapshot ring, and serves the Unix socket.
 ---
 
-`quotad` is the source of truth. It is a foreground process: one Tokio `current_thread` runtime, HTTPS probes in `spawn_blocking`, and a Unix socket for every client.
+`quotad` is the source of truth for quota and pool math. It is a foreground process: one Tokio `current_thread` runtime, adapter probes in `spawn_blocking`, and a Unix socket for every client.
 
 ```bash
 quotad run
@@ -15,9 +15,9 @@ The only subcommand is `run`. Omitting it still starts the daemon.
 
 ## What it reads
 
-It reuses session files the official CLIs already wrote. It does not write those files, store passwords, or refresh OAuth. Access tokens stay in memory for one HTTP GET. If a token is stale, sign in again with `codex login` or Claude Code `/login`.
+The first adapters reuse session files the official CLIs already wrote. They do not write those files, store passwords, or refresh OAuth. Access tokens stay in memory for one HTTP GET. If a Codex or Claude token is stale, sign in again with `codex login` or Claude Code `/login`.
 
-Credential and usage details, including which routes are hypotheses, are in [`docs/SOURCES.md`](https://github.com/op0ai/infer-quota/blob/main/docs/SOURCES.md). v0 probes **Codex** and **Claude** only.
+Which adapters run, and how to add one, is on [Adapters](/adapters). Credential and usage details for the two shipped probes, including which routes are hypotheses, are in [`docs/SOURCES.md`](https://github.com/op0ai/infer-quota/blob/main/docs/SOURCES.md).
 
 When `enable_codexbar_files` is true (the default), `quotad` may read CodexBar's on-disk snapshot and usage-history files under `$QUOTA_CODEXBAR_DIR` or `~/Library/Application Support/CodexBar/`. It does not open `cursor-session.json`. History JSONL seeds the in-memory pace ring (newest `ring_capacity` rows). That path is a fallback and a seed, not a second product.
 

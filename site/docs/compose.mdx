@@ -3,17 +3,17 @@ title: Compose
 description: How the quota block stays one socket while menu bars, status lines, and orchestrators sit beside it.
 ---
 
-infer-quota does one job: session reuse, a snapshot, the math, and a Unix socket. The public name fetchquota is that block — the quota and pool-math piece to reach for, small enough to drop into a larger workflow. [Examples](/examples) will document real composition patterns (web app, local process, a thread across pools, widget or menu bar, and other hosts) as they ship. Coming soon; `examples/` has no programs yet. Crate names stay put so a larger system can depend on a small surface.
+infer-quota is Rust-native quota and pool math: a snapshot, the math, and a Unix socket. Collectors are [adapters](/adapters). The public name fetchquota is that block — small enough to drop into a larger workflow. [Examples](/examples) will document real composition patterns (web app, local process, a thread across pools, widget or menu bar, and other hosts) as they ship. Coming soon; `examples/` has no programs yet. Crate names stay put so a larger system can depend on a small surface.
 
-Anything that needs the numbers — a menu bar, a tmux or Herdr status line, an MCP tool, a fleet orchestrator — should call [`quotad`](/quotad). It should not open Codex or Claude usage URLs on its own, and it should not become a second writer of `auth.json`.
+Anything that needs the numbers — a menu bar, a tmux or Herdr status line, an MCP tool, a fleet orchestrator — should call [`quotad`](/quotad). Provider HTTP stays in the adapters. A client does not become a second writer of credential files.
 
-| Piece                                            | Role next to this block                                                                                                                          |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `quota`                                          | Reference read client                                                                                                                            |
-| `quota-ctl`                                      | Reference control client (accounts, refresh, secret pointers)                                                                                    |
-| [CodexBar](https://github.com/steipete/CodexBar) | Separate macOS product. `quotad` can read its snapshot and history files when the live probe is down. It does not import CodexBar's provider set |
-| A future renderer                                | `status`, `pace`, `watch` on the socket, then draw                                                                                               |
-| A future MCP server for quota                    | The same methods as tools. Still not a collector                                                                                                 |
+| Piece                                            | Role next to this block                                                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `quota`                                          | Reference read client                                                                                          |
+| `quota-ctl`                                      | Reference control client (accounts, refresh, secret pointers)                                                  |
+| [CodexBar](https://github.com/steipete/CodexBar) | Separate macOS product. The Codex adapter can read its snapshot and history files when that live probe is down |
+| A future renderer                                | `status`, `pace`, `watch` on the socket, then draw                                                             |
+| A future MCP server for quota                    | The same methods as tools. Still not a collector                                                               |
 
 v0 ships no menu bar, no WidgetKit, no cookie-database scraper, and no MCP server inside the Rust workspace. Those can sit in other repositories and speak [protocol 1](/protocol).
 

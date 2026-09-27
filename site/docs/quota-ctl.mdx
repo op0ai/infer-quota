@@ -24,18 +24,18 @@ quota-ctl secret put codex/work --from-env QUOTA_PUT
 
 `accounts add` sends metadata over the socket:
 
-| Flag                       | Role                                                                         |
-| -------------------------- | ---------------------------------------------------------------------------- |
-| `--provider codex\|claude` | Required                                                                     |
-| `--email`                  | Label                                                                        |
-| `--workspace-label`        | Label                                                                        |
-| `--login-method`           | Label (for example `pro`)                                                    |
-| `--id`                     | Stable id; the daemon generates one when omitted                             |
-| `--home-path`              | Isolated `CODEX_HOME` used on the next refresh when this account is selected |
-| `--secret-backend`         | `openbao`, `keychain`, or `file`                                             |
-| `--secret-path`            | Pointer path. The socket does not carry the secret bytes                     |
-| `--select`                 | Make this account active                                                     |
-| `--json`                   | Print the RPC result                                                         |
+| Flag                | Role                                                                         |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `--provider`        | Required. Shipped ids: `codex`, `claude`                                     |
+| `--email`           | Label                                                                        |
+| `--workspace-label` | Label                                                                        |
+| `--login-method`    | Label (for example `pro`)                                                    |
+| `--id`              | Stable id; the daemon generates one when omitted                             |
+| `--home-path`       | Isolated `CODEX_HOME` used on the next refresh when this account is selected |
+| `--secret-backend`  | `openbao`, `keychain`, or `file`                                             |
+| `--secret-path`     | Pointer path. The socket does not carry the secret bytes                     |
+| `--select`          | Make this account active                                                     |
+| `--json`            | Print the RPC result                                                         |
 
 `accounts select` with `--id` omitted, or an empty `--id`, clears the active account. `accounts list` prints ids, provider, email, and workspace label.
 
