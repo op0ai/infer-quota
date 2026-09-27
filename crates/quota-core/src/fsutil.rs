@@ -103,6 +103,22 @@ pub fn chmod_private_file(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, perms)
 }
 
+/// Create or truncate `path` with mode `0600` at open (not after write).
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts.mode(0o600);
+    opts.open(path)
+}
+
+/// Open `path` for append, creating it as `0600` when new.
+pub fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    opts.mode(0o600);
+    opts.open(path)
+}
+
 /// True when every path segment is a normal name (no `..`, no empty).
 pub fn path_has_parent_dir(path: &Path) -> bool {
     use std::path::Component;
@@ -161,6 +177,18 @@ mod tests {
     fn parent_dir_detection() {
         assert!(path_has_parent_dir(Path::new("a/../b")));
         assert!(!path_has_parent_dir(Path::new("/home/user/.codex")));
+    }
+
+    #[test]
+    fn create_private_file_is_0600() {
+        let dir = scratch("privfile");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.json");
+        let _ = create_private_file(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

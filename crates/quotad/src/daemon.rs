@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +27,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, RwLock, Semaphore};
 
-/// Same-UID local DoS cap. The socket is already `0600`.
-const MAX_CLIENTS: usize = 64;
+/// Same-UID local DoS cap. Watchers cannot consume the RPC pool.
+const MAX_RPC_CLIENTS: usize = 16;
+const MAX_WATCH_CLIENTS: usize = 48;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
 use crate::accounts::AccountStore;
 use crate::store::Store;
@@ -66,11 +68,13 @@ impl App {
 
 async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let socket = cfg.socket_path();
+    let _lock = acquire_instance_lock(&socket)?;
     prepare_socket(&socket)?;
 
     let listener = UnixListener::bind(&socket).map_err(|e| DaemonError::Io(e.to_string()))?;
     let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
-    let inflight = Arc::new(Semaphore::new(MAX_CLIENTS));
+    let rpc_slots = Arc::new(Semaphore::new(MAX_RPC_CLIENTS));
+    let watch_slots = Arc::new(Semaphore::new(MAX_WATCH_CLIENTS));
 
     eprintln!(
         "quotad {} listening on {} (protocol {})",
@@ -107,15 +111,13 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        let Ok(permit) = inflight.clone().try_acquire_owned() else {
-                            drop(stream);
-                            eprintln!("quotad: client limit ({MAX_CLIENTS}) reached");
-                            continue;
-                        };
                         let app = app.clone();
+                        let rpc_slots = rpc_slots.clone();
+                        let watch_slots = watch_slots.clone();
                         tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(e) = handle_client(app, stream).await {
+                            if let Err(e) =
+                                handle_client(app, stream, rpc_slots, watch_slots).await
+                            {
                                 if !matches!(e, ClientError::Eof) {
                                     eprintln!("quotad: client: {e}");
                                 }
@@ -145,6 +147,60 @@ fn seed_codexbar_history(store: &mut Store, cfg: &Config) {
     for snap in snaps {
         store.push_memory(snap);
     }
+}
+
+/// Directory lock so two startups cannot both pass the stale-socket check
+/// and unlink each other’s live bind. `create_dir` is atomic; a leftover
+/// dir from a crash is removed when its pid is no longer alive.
+#[derive(Debug)]
+struct InstanceLock {
+    dir: PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn acquire_instance_lock(socket: &Path) -> Result<InstanceLock, DaemonError> {
+    if let Some(dir) = socket.parent() {
+        quota_core::ensure_private_dir(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
+    }
+    let dir = socket.with_extension("lock");
+    for _ in 0..4 {
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let _ = fs::write(dir.join("pid"), std::process::id().to_string());
+                return Ok(InstanceLock { dir });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let pid = fs::read_to_string(dir.join("pid"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                if pid.is_some_and(pid_alive) {
+                    return Err(DaemonError::Io(format!(
+                        "already running (lock held at {})",
+                        dir.display()
+                    )));
+                }
+                let _ = fs::remove_dir_all(&dir);
+            }
+            Err(e) => return Err(DaemonError::Io(e.to_string())),
+        }
+    }
+    Err(DaemonError::Io(format!(
+        "could not acquire instance lock at {}",
+        dir.display()
+    )))
 }
 
 fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
@@ -300,17 +356,43 @@ impl From<FrameError> for ClientError {
     }
 }
 
-async fn handle_client(app: Arc<RwLock<App>>, mut stream: UnixStream) -> Result<(), ClientError> {
+async fn read_frame_timed(stream: &mut UnixStream) -> Result<Vec<u8>, ClientError> {
+    match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame_async(stream)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(FrameError::UnexpectedEof)) => Err(ClientError::Eof),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(ClientError::Other("idle handshake timeout".into())),
+    }
+}
+
+async fn handle_client(
+    app: Arc<RwLock<App>>,
+    mut stream: UnixStream,
+    rpc_slots: Arc<Semaphore>,
+    watch_slots: Arc<Semaphore>,
+) -> Result<(), ClientError> {
+    let mut rpc_permit = None;
     loop {
-        let payload = match read_frame_async(&mut stream).await {
-            Ok(p) => p,
-            Err(FrameError::UnexpectedEof) => return Err(ClientError::Eof),
-            Err(e) => return Err(e.into()),
-        };
+        let payload = read_frame_timed(&mut stream).await?;
         let req: Request = serde_json::from_slice(&payload)
             .map_err(|e| ClientError::Other(format!("bad request: {e}")))?;
 
         if req.method == METHOD_WATCH {
+            let _watch_permit = match watch_slots.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    write_frame_async(
+                        &mut stream,
+                        &Response::err(
+                            req.id,
+                            "too_many_watchers",
+                            format!("watch client limit ({MAX_WATCH_CLIENTS}) reached"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
             let mut rx = {
@@ -358,6 +440,28 @@ async fn handle_client(app: Arc<RwLock<App>>, mut stream: UnixStream) -> Result<
                 }
             }
         }
+
+        if rpc_permit.is_none() {
+            let p = match rpc_slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    write_frame_async(
+                        &mut stream,
+                        &Response::err(
+                            req.id,
+                            "too_many_clients",
+                            format!("rpc client limit ({MAX_RPC_CLIENTS}) reached"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            rpc_permit = Some(p);
+        }
+        let Some(ref _rpc_held) = rpc_permit else {
+            unreachable!("rpc permit set above");
+        };
 
         let resp = dispatch(&app, req).await;
         write_frame_async(&mut stream, &resp).await?;
@@ -643,6 +747,24 @@ mod tests {
         let book: quota_core::AccountsListResult =
             serde_json::from_value(listed.result.unwrap()).unwrap();
         assert!(book.accounts.is_empty());
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-lock-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let first = acquire_instance_lock(&sock).unwrap();
+        let err = acquire_instance_lock(&sock).unwrap_err();
+        assert!(err.to_string().contains("already running"));
+        drop(first);
+        let second = acquire_instance_lock(&sock).unwrap();
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

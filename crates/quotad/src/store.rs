@@ -4,9 +4,8 @@
 //! trail and is never read back in v0 (avoids loading unbounded files).
 
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use quota_core::types::Snapshot;
 use quota_core::Config;
@@ -51,11 +50,11 @@ impl Store {
     }
 }
 
-fn append_jsonl(path: &PathBuf, snap: &Snapshot) -> std::io::Result<()> {
+fn append_jsonl(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         quota_core::ensure_private_dir(dir)?;
     }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = quota_core::open_private_append(path)?;
     serde_json::to_writer(&mut f, snap).map_err(std::io::Error::other)?;
     f.write_all(b"\n")?;
     let _ = quota_core::chmod_private_file(path);

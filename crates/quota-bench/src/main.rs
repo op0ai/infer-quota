@@ -317,20 +317,22 @@ fn stop_child(mut child: Child) {
 }
 
 fn bench_jsonl(history: &Path, iters: usize, cap: usize) {
+    let expected_full = load_history_jsonl(history).expect("full jsonl").len();
+    let expected_tail = expected_full.min(cap.max(1));
     let mut full = Vec::with_capacity(iters);
     let mut tail = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
         let rows = load_history_jsonl(history).expect("full jsonl");
-        assert_eq!(rows.len(), 1912);
+        assert_eq!(rows.len(), expected_full);
         full.push(t0.elapsed().as_nanos() as u64);
         let t1 = Instant::now();
         let rows = load_history_jsonl_tail(history, cap).expect("tail jsonl");
-        assert_eq!(rows.len(), cap);
+        assert_eq!(rows.len(), expected_tail);
         tail.push(t1.elapsed().as_nanos() as u64);
     }
-    print_row("jsonl_full_1912", full);
-    print_row(&format!("jsonl_tail_{cap}"), tail);
+    print_row(&format!("jsonl_full_{expected_full}"), full);
+    print_row(&format!("jsonl_tail_{expected_tail}"), tail);
 }
 
 fn bench_start(quotad: &Path, socket: &Path, runs: usize) {

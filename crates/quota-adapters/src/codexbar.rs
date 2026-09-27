@@ -426,6 +426,9 @@ pub fn load_history_snapshots_from_dir(dir: &Path, cap: usize) -> Vec<Snapshot> 
         let Ok(rows) = load_history_jsonl_tail(&path, cap.min(MAX_HISTORY_ROWS)) else {
             continue;
         };
+        if rows.is_empty() {
+            continue;
+        }
         return history_to_snapshots(&rows);
     }
     Vec::new()
@@ -631,6 +634,26 @@ mod tests {
         )
         .unwrap();
         assert!(load_snapshot_from_dir(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_or_malformed_history_falls_through() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-jsonl-fallback-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("usage-history.jsonl"), "{not json}\n").unwrap();
+        let good = r#"{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#;
+        fs::write(
+            dir.join("usage-history.redacted.jsonl"),
+            format!("{good}\n"),
+        )
+        .unwrap();
+        let hist = load_history_snapshots_from_dir(&dir, 8);
+        assert_eq!(hist.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

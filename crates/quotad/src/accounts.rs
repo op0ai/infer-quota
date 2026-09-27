@@ -45,7 +45,7 @@ impl AccountStore {
             login_method: params.login_method,
             workspace_account_id: params.workspace_account_id,
             secret_ref: params.secret_ref,
-            home_path: sanitize_home_path(params.home_path),
+            home_path: sanitize_home_path(params.home_path)?,
             created_at,
             updated_at: now,
             source: Some("ctl".into()),
@@ -82,13 +82,16 @@ impl AccountStore {
     }
 }
 
-fn sanitize_home_path(raw: Option<String>) -> Option<String> {
-    let s = raw.filter(|s| !s.trim().is_empty())?;
+/// Empty / omitted is fine. A *provided* path must be absolute and `..`-free.
+fn sanitize_home_path(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(s) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
     let p = PathBuf::from(&s);
     if !p.is_absolute() || path_has_parent_dir(&p) {
-        return None;
+        return Err("home_path must be an absolute path without '..'".into());
     }
-    Some(s)
+    Ok(Some(s))
 }
 
 fn generate_id(email: Option<&str>, now: i64) -> String {
@@ -100,7 +103,11 @@ fn generate_id(email: Option<&str>, now: i64) -> String {
 
 fn read_book(path: &Path) -> Option<AccountBook> {
     let bytes = read_file_capped(path, 64 * 1024).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut book: AccountBook = serde_json::from_slice(&bytes).ok()?;
+    for rec in &mut book.accounts {
+        rec.home_path = sanitize_home_path(rec.home_path.take()).ok().flatten();
+    }
+    Some(book)
 }
 
 fn write_book(path: &Path, book: &AccountBook) -> Result<(), String> {
@@ -108,7 +115,7 @@ fn write_book(path: &Path, book: &AccountBook) -> Result<(), String> {
         ensure_private_dir(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
-    let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut f = quota_core::create_private_file(&tmp).map_err(|e| e.to_string())?;
     serde_json::to_writer_pretty(&mut f, book).map_err(|e| e.to_string())?;
     f.write_all(b"\n").map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
@@ -152,14 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn relative_or_dotdot_home_path_is_dropped() {
+    fn relative_or_dotdot_home_path_is_rejected() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quota-accounts-home-{stamp}.json"));
         let mut store = AccountStore::load(path.clone());
-        let rec = store
+        let err = store
             .add(AccountsAddParams {
                 id: Some("acct_bad_home".into()),
                 provider: ProviderId::Codex,
@@ -171,9 +178,9 @@ mod tests {
                 home_path: Some("../etc".into()),
                 select: false,
             })
-            .unwrap();
-        assert!(rec.home_path.is_none());
-        let rec = store
+            .unwrap_err();
+        assert!(err.contains("absolute"));
+        let err = store
             .add(AccountsAddParams {
                 id: Some("acct_rel_home".into()),
                 provider: ProviderId::Claude,
@@ -185,8 +192,8 @@ mod tests {
                 home_path: Some("relative/claude".into()),
                 select: false,
             })
-            .unwrap();
-        assert!(rec.home_path.is_none());
+            .unwrap_err();
+        assert!(err.contains("absolute"));
         let rec = store
             .add(AccountsAddParams {
                 id: Some("acct_ok_home".into()),
@@ -201,6 +208,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rec.home_path.as_deref(), Some("/tmp/isolated-claude"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisted_relative_home_path_is_dropped_on_load() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-accounts-load-{stamp}.json"));
+        fs::write(
+            &path,
+            r#"{"version":1,"active_id":"legacy","accounts":[{"id":"legacy","provider":"codex","home_path":"../etc","created_at":1,"updated_at":1}]}"#,
+        )
+        .unwrap();
+        let store = AccountStore::load(path.clone());
+        let rec = store.book().get("legacy").expect("legacy account");
+        assert!(rec.home_path.is_none());
         let _ = fs::remove_file(&path);
     }
 }

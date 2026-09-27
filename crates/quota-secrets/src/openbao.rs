@@ -50,8 +50,8 @@ impl OpenBaoBackend {
             .unwrap_or(false);
         let addr = addr.trim_end_matches('/').to_string();
         fence_plain_http(&addr, allow_plain)?;
-        let mount = validate_kv_segment(mount.trim().trim_matches('/'), "mount")?;
-        let prefix = validate_kv_segment(prefix.trim().trim_matches('/'), "prefix")?;
+        let mount = validate_logical_path(mount.trim().trim_matches('/'))?;
+        let prefix = validate_logical_path(prefix.trim().trim_matches('/'))?;
         Ok(Some(Self {
             addr,
             token: token.trim().to_string(),
@@ -83,11 +83,15 @@ impl OpenBaoBackend {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "127.0.0.1:8200"
-    ) || host.starts_with("127.0.0.1")
-        || host == "localhost"
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Authority host without port. `[::1]:8200` → `::1`; `127.0.0.1:8200` → `127.0.0.1`.
+fn host_from_authority(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(authority);
+    }
+    authority.split(':').next().unwrap_or(authority)
 }
 
 fn fence_plain_http(addr: &str, allow_plain: bool) -> Result<(), SecretsError> {
@@ -96,8 +100,8 @@ fn fence_plain_http(addr: &str, allow_plain: bool) -> Result<(), SecretsError> {
         None if addr.starts_with("https://") => return Ok(()),
         None => return Ok(()),
     };
-    let host = rest.split('/').next().unwrap_or(rest);
-    let host = host.split(':').next().unwrap_or(host);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = host_from_authority(authority);
     if is_loopback_host(host) || allow_plain {
         return Ok(());
     }
@@ -114,16 +118,6 @@ fn valid_segment(seg: &str) -> bool {
         && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-fn validate_kv_segment(raw: &str, what: &str) -> Result<String, SecretsError> {
-    if raw.is_empty() {
-        return Ok(String::new());
-    }
-    if !valid_segment(raw) {
-        return Err(SecretsError::Config(format!("invalid OpenBao {what}")));
-    }
-    Ok(raw.to_string())
 }
 
 fn validate_logical_path(path: &str) -> Result<String, SecretsError> {
@@ -178,6 +172,11 @@ impl SecretsBackend for OpenBaoBackend {
     }
 
     fn put(&self, path: &str, value: &str) -> Result<(), SecretsError> {
+        if value.len() > 32 * 1024 {
+            return Err(SecretsError::Config(
+                "secret value exceeds 32 KiB (must fit the OpenBao response cap)".into(),
+            ));
+        }
         let url = self.kv_url(path)?;
         let payload = serde_json::json!({ "data": { "value": value } });
         let bytes = serde_json::to_vec(&payload).map_err(|e| SecretsError::Parse(e.to_string()))?;
@@ -228,15 +227,34 @@ fn parse_http_url(url: &str) -> Result<HttpUrl, SecretsError> {
         Some((h, p)) => (h, format!("/{p}")),
         None => (rest, "/".into()),
     };
-    let (host, port) = if let Some((h, p)) = hostport.split_once(':') {
+    let (host, port) = split_host_port(hostport)?;
+    Ok(HttpUrl { host, port, path })
+}
+
+fn split_host_port(hostport: &str) -> Result<(String, u16), SecretsError> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| SecretsError::Config("invalid OpenBao IPv6 host".into()))?;
+        let port = if after.is_empty() {
+            80
+        } else {
+            after
+                .strip_prefix(':')
+                .ok_or_else(|| SecretsError::Config("invalid OpenBao IPv6 port".into()))?
+                .parse::<u16>()
+                .map_err(|_| SecretsError::Config("invalid OpenBao port".into()))?
+        };
+        return Ok((host.to_string(), port));
+    }
+    if let Some((h, p)) = hostport.split_once(':') {
         let port = p
             .parse::<u16>()
             .map_err(|_| SecretsError::Config("invalid OpenBao port".into()))?;
-        (h.to_string(), port)
+        Ok((h.to_string(), port))
     } else {
-        (hostport.to_string(), 80)
-    };
-    Ok(HttpUrl { host, port, path })
+        Ok((hostport.to_string(), 80))
+    }
 }
 
 fn http_json(
@@ -331,6 +349,9 @@ mod tests {
         assert_eq!(u.host, "127.0.0.1");
         assert_eq!(u.port, 8200);
         assert_eq!(u.path, "/v1/secret/data/quota/k");
+        let v6 = parse_http_url("http://[::1]:8200/v1/secret/data/x").unwrap();
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, 8200);
     }
 
     #[test]
@@ -369,6 +390,15 @@ mod tests {
         assert!(matches!(err, SecretsError::Config(_)));
         assert!(fence_plain_http("http://127.0.0.1:8200", false).is_ok());
         assert!(fence_plain_http("http://localhost:8200", false).is_ok());
+        assert!(fence_plain_http("http://[::1]:8200", false).is_ok());
         assert!(fence_plain_http("http://evil.example:8200", true).is_ok());
+        assert!(fence_plain_http("http://127.0.0.1.evil.example:8200", false).is_err());
+    }
+
+    #[test]
+    fn nested_prefix_is_allowed() {
+        let p = validate_logical_path("quota/prod").unwrap();
+        assert_eq!(p, "quota/prod");
+        assert!(validate_logical_path("quota/../etc").is_err());
     }
 }

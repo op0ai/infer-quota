@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,19 +25,19 @@ jobs:
       - name: release build
         run: cargo build --locked --workspace --release
       - name: fixture redaction
-        run: |
-          if grep -R -n -E --include='*.json' --include='*.jsonl' --include='*.md' \
-            'eyJ[A-Za-z0-9_-]{8,}' fixtures docs; then
-            echo "possible JWT-like material in fixtures/docs" >&2
-            exit 1
-          fi
-          if grep -R -l -E --include='*.json' --include='*.jsonl' \
-            '"access_token"|"refresh_token"|"WorkosCursorSessionToken"' fixtures \
-            | grep -v redacted; then
-            echo "unredacted credential field names outside *.redacted.*" >&2
-            exit 1
-          fi
+        run: python3 scripts/check_fixtures.py
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: cargo audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --locked
+          # rustls 0.21 / rustls-webpki 0.101.7 (MSRV 1.83). Patches live only
+          # in webpki 0.103+ / rustls 0.23, which pull url+icu. See docs/SECURITY.md.
+          cargo audit \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0099
