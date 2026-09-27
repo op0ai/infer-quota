@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Redacted first-run quota status. No tokens.">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Redacted first-run quota status. No tokens.">
   <title>quota status (redacted)</title>
   <defs>
     <style>
@@ -11,8 +11,8 @@
       .warn { fill: #d4b37a; }
     </style>
   </defs>
-  <rect width="760" height="400" rx="12" fill="#12110f"/>
-  <rect x="1" y="1" width="758" height="398" rx="11" fill="none" stroke="#2a2722"/>
+  <rect width="760" height="420" rx="12" fill="#12110f"/>
+  <rect x="1" y="1" width="758" height="418" rx="11" fill="none" stroke="#2a2722"/>
   <circle cx="22" cy="20" r="5" fill="#3a3530"/>
   <circle cx="40" cy="20" r="5" fill="#3a3530"/>
   <circle cx="58" cy="20" r="5" fill="#3a3530"/>
@@ -28,16 +28,18 @@
   <text x="24" y="148" class="prompt">$</text>
   <text x="40" y="148" class="cmd">quotad run &amp;</text>
   <text x="24" y="166" class="prompt">$</text>
-  <text x="40" y="166" class="cmd">quota status</text>
+  <text x="40" y="166" class="cmd">until quota ping &gt;/dev/null 2&gt;&amp;1; do sleep 0.1; done</text>
+  <text x="24" y="184" class="prompt">$</text>
+  <text x="40" y="184" class="cmd">quota status</text>
 
-  <text x="24" y="198" class="out dim">fetched 2026-09-27T14:12:00Z</text>
-  <text x="24" y="220"><tspan class="out">codex   </tspan><tspan class="warn">unavailable</tspan><tspan class="out dim">  src=oauth</tspan></text>
-  <text x="24" y="238" class="out dim">         no_credentials: credential file not found: ~/.codex/auth.json</text>
-  <text x="24" y="256" class="out dim">         consulted ~/.codex/auth.json</text>
-  <text x="24" y="280"><tspan class="out">claude  </tspan><tspan class="warn">unavailable</tspan><tspan class="out dim">  src=oauth</tspan></text>
-  <text x="24" y="298" class="out dim">         no_credentials: credential file not found: ~/.claude/.credentials.json</text>
-  <text x="24" y="316" class="out dim">         consulted ~/.claude/.credentials.json</text>
+  <text x="24" y="216" class="out dim">fetched 2026-09-27T14:12:00Z</text>
+  <text x="24" y="238"><tspan class="out">codex   </tspan><tspan class="warn">unavailable</tspan><tspan class="out dim">  src=oauth</tspan></text>
+  <text x="24" y="256" class="out dim">         no_credentials: credential file not found: ~/.codex/auth.json</text>
+  <text x="24" y="274" class="out dim">         consulted ~/.codex/auth.json</text>
+  <text x="24" y="298"><tspan class="out">claude  </tspan><tspan class="warn">unavailable</tspan><tspan class="out dim">  src=oauth</tspan></text>
+  <text x="24" y="316" class="out dim">         no_credentials: credential file not found: ~/.claude/.credentials.json</text>
+  <text x="24" y="334" class="out dim">         consulted ~/.claude/.credentials.json</text>
 
-  <text x="24" y="350" class="out ok">unavailable + a reason is a real answer. Do not invent remaining tokens.</text>
-  <text x="24" y="372" class="out dim">quotad reuses existing CLI sessions. quota never reads those files.</text>
+  <text x="24" y="368" class="out ok">unavailable + a reason is a real answer. Do not invent remaining tokens.</text>
+  <text x="24" y="390" class="out dim">quotad reuses existing CLI sessions. quota never reads those files.</text>
 </svg>

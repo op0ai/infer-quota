@@ -25,6 +25,7 @@ Rust **1.83+**. macOS or Linux (Unix domain socket).
 export PATH="$HOME/.local/bin:$PATH"
 
 quotad run &
+until quota ping >/dev/null 2>&1; do sleep 0.1; done
 quota status
 ```
 
