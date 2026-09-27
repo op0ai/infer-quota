@@ -4,14 +4,26 @@
 //! - `$XDG_RUNTIME_DIR/quota/quota.sock` when `XDG_RUNTIME_DIR` is a non-empty
 //!   absolute-ish path
 //! - otherwise `~/.local/share/quota/quota.sock`
+//!
+//! `$HOME` unset no longer falls back to `/` (that made cred probes look at
+//! `/.codex/auth.json`). Missing home → `None`; path helpers use a
+//! non-existent sentinel under `/var/empty`.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
-pub fn home_dir() -> PathBuf {
+/// User home from `$HOME`. `None` when unset or empty — callers must fail
+/// closed rather than probing `/`.
+pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Last-resort directory when `$HOME` and the relevant XDG var are both
+/// missing. Does not exist on a normal host; we never create it.
+fn no_home_sentinel() -> PathBuf {
+    PathBuf::from("/var/empty/quota-no-home")
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -21,7 +33,9 @@ pub fn default_socket_path() -> PathBuf {
             return Path::new(dir).join("quota").join("quota.sock");
         }
     }
-    home_dir().join(".local/share/quota/quota.sock")
+    home_dir()
+        .unwrap_or_else(no_home_sentinel)
+        .join(".local/share/quota/quota.sock")
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -31,7 +45,9 @@ pub fn default_config_path() -> PathBuf {
             return Path::new(dir).join("quota").join("config.json");
         }
     }
-    home_dir().join(".config/quota/config.json")
+    home_dir()
+        .unwrap_or_else(no_home_sentinel)
+        .join(".config/quota/config.json")
 }
 
 pub fn default_state_dir() -> PathBuf {
@@ -41,7 +57,9 @@ pub fn default_state_dir() -> PathBuf {
             return Path::new(dir).join("quota");
         }
     }
-    home_dir().join(".local/state/quota")
+    home_dir()
+        .unwrap_or_else(no_home_sentinel)
+        .join(".local/state/quota")
 }
 
 pub fn default_data_dir() -> PathBuf {
@@ -51,7 +69,9 @@ pub fn default_data_dir() -> PathBuf {
             return Path::new(dir).join("quota");
         }
     }
-    home_dir().join(".local/share/quota")
+    home_dir()
+        .unwrap_or_else(no_home_sentinel)
+        .join(".local/share/quota")
 }
 
 /// Codex home: `$CODEX_HOME` or `~/.codex`.
@@ -62,7 +82,7 @@ pub fn codex_home() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    home_dir().join(".codex")
+    home_dir().unwrap_or_else(no_home_sentinel).join(".codex")
 }
 
 /// Claude Code config dirs. `$CLAUDE_CONFIG_DIR` is comma-separated (Claude
@@ -79,7 +99,10 @@ pub fn claude_config_dirs() -> Vec<PathBuf> {
             return dirs;
         }
     }
-    vec![home_dir().join(".claude")]
+    match home_dir() {
+        Some(h) => vec![h.join(".claude")],
+        None => Vec::new(),
+    }
 }
 
 /// CodexBar support dir (macOS live path). Override with `QUOTA_CODEXBAR_DIR`.
@@ -93,7 +116,9 @@ pub fn default_codexbar_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    home_dir().join("Library/Application Support/CodexBar")
+    home_dir()
+        .unwrap_or_else(no_home_sentinel)
+        .join("Library/Application Support/CodexBar")
 }
 
 pub fn codexbar_snapshot_candidates(dir: &Path) -> Vec<PathBuf> {
@@ -119,5 +144,16 @@ mod tests {
         // Cannot safely mutate process env in parallel tests; just assert shape.
         let p = default_socket_path();
         assert!(p.ends_with("quota.sock"));
+        assert!(!p.starts_with("/.local"));
+    }
+
+    #[test]
+    fn home_dir_none_or_real() {
+        match home_dir() {
+            Some(h) => assert!(!h.as_os_str().is_empty()),
+            None => {
+                assert!(default_socket_path().starts_with("/var/empty/quota-no-home"));
+            }
+        }
     }
 }

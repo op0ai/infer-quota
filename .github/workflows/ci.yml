@@ -24,6 +24,23 @@ jobs:
         run: cargo test --locked --workspace
       - name: release build
         run: cargo build --locked --workspace --release
+      - name: fixture redaction
+        run: python3 scripts/check_fixtures.py
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          # rustls 0.21 / rustls-webpki 0.101.7 (MSRV 1.83). Patches live only
+          # in webpki 0.103+ / rustls 0.23, which pull url+icu. See docs/SECURITY.md.
+          cargo audit \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0099
 
   docs:
     runs-on: ubuntu-latest

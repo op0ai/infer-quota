@@ -23,6 +23,11 @@ non-default config is not visible to them; pass `--socket` or put `socket`
 in the default file.
 
 The directory is created with mode `0700`; the socket is `0600`.
+`quotad` refuses to bind if the socket path is a symlink, if a live
+instance is already listening, or if a non-socket file occupies the path.
+Stale sockets (connect fails) are unlinked. Concurrent clients are capped
+(64). The socket is a **same-UID** trust boundary — there is no extra
+peer-credential handshake.
 
 ## Framing
 
@@ -87,7 +92,10 @@ not special-case the first two adapters.
 access tokens — put those through `quota-secrets` / `quota-ctl secret put`.
 `quotad` still owns polling; `quota-ctl` is the mutating control surface.
 When an account is selected and `home_path` is set, the next `refresh`
-uses that path as `CODEX_HOME` for the Codex adapter.
+uses that path as `CODEX_HOME` (Codex) or the Claude config dir (Claude)
+**only if the active account’s provider matches**. Relative paths and
+`..` segments are dropped. `secret_ref` is stored as a pointer; `quotad`
+does not fetch vault material (see [SECURITY.md](SECURITY.md)).
 
 `deadline` is UTC unix seconds. When omitted, `can_start` binds to the window's
 published `reset_at`.

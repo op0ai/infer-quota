@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 quota-core.workspace = true
-quota-secrets = { path = "../quota-secrets", version = "0.1.0" }
+quota-secrets = { path = "../quota-secrets", version = "0.1.0", features = ["openbao"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -44,8 +44,9 @@ Rust core: adapters, a snapshot, the math, a socket.
 
 - Reuses **existing** OAuth / CLI session files. Never stores passwords. Never
   writes credential files.
-- Optional OpenBao KV for *new* material the companion adds. OS keychain is a
-  documented stub. See [docs/SECRETS.md](docs/SECRETS.md).
+- Optional OpenBao KV (rustls for `https://`) for *new* material the
+  companion adds. OS keychain is Linux secret-service and macOS
+  Security.framework. See [docs/SECRETS.md](docs/SECRETS.md).
 - Probes best-effort usage endpoints (see [docs/SOURCES.md](docs/SOURCES.md);
   several are **undocumented hypotheses**). On failure: `status: unavailable`
   plus a reason — **no fake remaining tokens**.
@@ -160,8 +161,9 @@ no. A published token/credit remaining is compared directly.
 - Optional JSONL history (`"history": true` in config) records snapshots
   (percents, reset times) — not secrets. Off by default.
 - Account book (`accounts.json`) is metadata + optional `secret_ref` paths.
-- Socket mode `0600`, directory `0700`.
+- Socket mode `0600`, directory `0700`. Symlink socket paths are refused.
 - Fixtures in-repo are redacted (`accountKey` hashed; fingerprints stripped).
+- Threat model and residual gaps: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Performance / memory
 
@@ -189,8 +191,8 @@ machine, no invented figures): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Crate | Role |
 |-------|------|
 | `quota-core` | Types, snapshot schema, math, framing, config, paths, Unix RPC |
-| `quota-adapters` | `Provider` trait. First collectors: Codex, Claude, plus the CodexBar file fallback |
-| `quota-secrets` | OpenBao / keychain stub / file OAuth chain |
+| `quota-adapters` | `Provider` trait. First collectors: Codex and Claude, plus the CodexBar file fallback |
+| `quota-secrets` | OpenBao (feature) / OS keychain / read-only file OAuth |
 | `quotad` | Daemon |
 | `quota` | Read CLI (sync socket client; no HTTP) |
 | `quota-ctl` | Control-plane CLI + `quota_ctl` library |

@@ -44,7 +44,7 @@ enum Command {
         json: bool,
     },
     Ping,
-    /// Local secrets chain (OpenBao → keychain stub → CLI files). Not RPC.
+    /// Local secrets chain (OpenBao → OS keychain → read-only CLI files). Not RPC.
     Secret {
         #[command(subcommand)]
         action: SecretCmd,
@@ -269,7 +269,10 @@ fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, Box<dyn std::error
                 let chain = from_env()?;
                 match chain.get(path)? {
                     Some(rec) => {
-                        println!("backend={} path={} present=true", rec.backend, rec.path);
+                        println!(
+                            "{}",
+                            quota_ctl::format_secret_presence(rec.backend, &rec.path)
+                        );
                         Ok(ExitCode::SUCCESS)
                     }
                     None => {
@@ -285,9 +288,7 @@ fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, Box<dyn std::error
                 let value = std::env::var(var).map_err(|_| {
                     format!("environment variable {var} is unset (refusing empty secret)")
                 })?;
-                if value.is_empty() {
-                    return Err("refusing to store an empty secret".into());
-                }
+                quota_ctl::require_secret_material(&value)?;
                 let chain = from_env()?;
                 chain.put(path, &value)?;
                 println!("stored path={path} (value not printed)");

@@ -2,9 +2,9 @@
 //! and account-id fields are retained; refresh tokens are dropped immediately
 //! after JSON parse of the tiny auth file.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use quota_core::fsutil::{read_file_capped, CapReadError};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -22,6 +22,8 @@ pub enum CredsError {
     Parse(String),
     #[error("no access token in {0}")]
     NoToken(String),
+    #[error("refusing symlink credential file: {0}")]
+    Symlink(String),
 }
 
 #[derive(Debug, Clone)]
@@ -73,17 +75,14 @@ struct ClaudeOauth {
 }
 
 fn read_capped(path: &Path) -> Result<Vec<u8>, CredsError> {
-    let meta = fs::metadata(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CredsError::NotFound(path.display().to_string())
-        } else {
-            CredsError::Io(e.to_string())
-        }
-    })?;
-    if meta.len() > MAX_CRED_BYTES as u64 {
-        return Err(CredsError::TooLarge);
+    match read_file_capped(path, MAX_CRED_BYTES) {
+        Ok(b) => Ok(b),
+        Err(CapReadError::NotFound(p)) => Err(CredsError::NotFound(p)),
+        Err(CapReadError::TooLarge(_)) => Err(CredsError::TooLarge),
+        Err(CapReadError::Symlink(p)) => Err(CredsError::Symlink(p)),
+        Err(CapReadError::NotRegular(p)) => Err(CredsError::Io(format!("not a regular file: {p}"))),
+        Err(CapReadError::Io(e)) => Err(CredsError::Io(e)),
     }
-    fs::read(path).map_err(|e| CredsError::Io(e.to_string()))
 }
 
 /// Locations consulted for Codex OAuth, in order, when `CODEX_HOME` is unset.
@@ -99,7 +98,9 @@ pub fn codex_auth_candidates(explicit_home: Option<&Path>) -> Vec<PathBuf> {
             return vec![PathBuf::from(dir).join("auth.json")];
         }
     }
-    let home = quota_core::home_dir();
+    let Some(home) = quota_core::home_dir() else {
+        return Vec::new();
+    };
     vec![
         home.join(".codex/auth.json"),
         home.join(".config/codex/auth.json"),
@@ -145,15 +146,18 @@ pub fn parse_codex_auth(path: &Path, bytes: &[u8]) -> Result<CodexCreds, CredsEr
     })
 }
 
-pub fn claude_cred_candidates() -> Vec<PathBuf> {
+pub fn claude_cred_candidates(explicit_config_dir: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(dir) = explicit_config_dir {
+        return vec![dir.join(".credentials.json")];
+    }
     quota_core::claude_config_dirs()
         .into_iter()
         .map(|d| d.join(".credentials.json"))
         .collect()
 }
 
-pub fn load_claude_creds() -> Result<ClaudeCreds, CredsError> {
-    let candidates = claude_cred_candidates();
+pub fn load_claude_creds(explicit_config_dir: Option<&Path>) -> Result<ClaudeCreds, CredsError> {
+    let candidates = claude_cred_candidates(explicit_config_dir);
     let primary = candidates
         .first()
         .map(|p| p.display().to_string())
@@ -263,5 +267,22 @@ mod tests {
             parse_chatgpt_base_url(t).as_deref(),
             Some("https://example.com/backend-api")
         );
+    }
+
+    #[test]
+    fn read_capped_refuses_symlink() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-creds-sym-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("auth.json");
+        let link = dir.join("link.json");
+        std::fs::write(&target, br#"{"access_token":"tok"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = read_capped(&link).unwrap_err();
+        assert!(matches!(err, CredsError::Symlink(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

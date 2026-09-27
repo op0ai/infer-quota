@@ -5,6 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use quota_core::accounts::{AccountBook, AccountRecord};
+use quota_core::fsutil::{
+    chmod_private_file, ensure_private_dir, path_has_parent_dir, read_file_capped,
+};
 use quota_core::protocol::{AccountsAddParams, AccountsListResult};
 use quota_core::timeutil::now_unix;
 
@@ -42,7 +45,7 @@ impl AccountStore {
             login_method: params.login_method,
             workspace_account_id: params.workspace_account_id,
             secret_ref: params.secret_ref,
-            home_path: params.home_path,
+            home_path: sanitize_home_path(params.home_path)?,
             created_at,
             updated_at: now,
             source: Some("ctl".into()),
@@ -79,6 +82,18 @@ impl AccountStore {
     }
 }
 
+/// Empty / omitted is fine. A *provided* path must be absolute and `..`-free.
+fn sanitize_home_path(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(s) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let p = PathBuf::from(&s);
+    if !p.is_absolute() || path_has_parent_dir(&p) {
+        return Err("home_path must be an absolute path without '..'".into());
+    }
+    Ok(Some(s))
+}
+
 fn generate_id(email: Option<&str>, now: i64) -> String {
     match email {
         Some(e) if !e.is_empty() => format!("acct_{}", e.replace(['@', '.'], "_")),
@@ -87,23 +102,25 @@ fn generate_id(email: Option<&str>, now: i64) -> String {
 }
 
 fn read_book(path: &Path) -> Option<AccountBook> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() > 64 * 1024 {
-        return None;
+    let bytes = read_file_capped(path, 64 * 1024).ok()?;
+    let mut book: AccountBook = serde_json::from_slice(&bytes).ok()?;
+    for rec in &mut book.accounts {
+        rec.home_path = sanitize_home_path(rec.home_path.take()).ok().flatten();
     }
-    serde_json::from_slice(&bytes).ok()
+    Some(book)
 }
 
 fn write_book(path: &Path, book: &AccountBook) -> Result<(), String> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        ensure_private_dir(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
-    let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut f = quota_core::create_private_file(&tmp).map_err(|e| e.to_string())?;
     serde_json::to_writer_pretty(&mut f, book).map_err(|e| e.to_string())?;
     f.write_all(b"\n").map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    chmod_private_file(path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -138,6 +155,77 @@ mod tests {
         assert_eq!(store.list().active_id.as_deref(), Some("acct_test"));
         assert!(store.remove("acct_test").unwrap());
         assert!(store.list().accounts.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn relative_or_dotdot_home_path_is_rejected() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-accounts-home-{stamp}.json"));
+        let mut store = AccountStore::load(path.clone());
+        let err = store
+            .add(AccountsAddParams {
+                id: Some("acct_bad_home".into()),
+                provider: ProviderId::Codex,
+                email: None,
+                workspace_label: None,
+                login_method: None,
+                workspace_account_id: None,
+                secret_ref: None,
+                home_path: Some("../etc".into()),
+                select: false,
+            })
+            .unwrap_err();
+        assert!(err.contains("absolute"));
+        let err = store
+            .add(AccountsAddParams {
+                id: Some("acct_rel_home".into()),
+                provider: ProviderId::Claude,
+                email: None,
+                workspace_label: None,
+                login_method: None,
+                workspace_account_id: None,
+                secret_ref: None,
+                home_path: Some("relative/claude".into()),
+                select: false,
+            })
+            .unwrap_err();
+        assert!(err.contains("absolute"));
+        let rec = store
+            .add(AccountsAddParams {
+                id: Some("acct_ok_home".into()),
+                provider: ProviderId::Claude,
+                email: None,
+                workspace_label: None,
+                login_method: None,
+                workspace_account_id: None,
+                secret_ref: None,
+                home_path: Some("/tmp/isolated-claude".into()),
+                select: false,
+            })
+            .unwrap();
+        assert_eq!(rec.home_path.as_deref(), Some("/tmp/isolated-claude"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisted_relative_home_path_is_dropped_on_load() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-accounts-load-{stamp}.json"));
+        fs::write(
+            &path,
+            r#"{"version":1,"active_id":"legacy","accounts":[{"id":"legacy","provider":"codex","home_path":"../etc","created_at":1,"updated_at":1}]}"#,
+        )
+        .unwrap();
+        let store = AccountStore::load(path.clone());
+        let rec = store.book().get("legacy").expect("legacy account");
+        assert!(rec.home_path.is_none());
         let _ = fs::remove_file(&path);
     }
 }

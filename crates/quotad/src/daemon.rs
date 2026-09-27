@@ -1,8 +1,9 @@
 //! Accept loop, adaptive refresh, and request dispatch.
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,11 +21,16 @@ use quota_core::protocol::{
     METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
-use quota_core::types::{Availability, Snapshot};
+use quota_core::types::{Availability, ProviderId, Snapshot};
 use quota_core::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, RwLock, Semaphore};
+
+/// Same-UID local DoS cap. Watchers cannot consume the RPC pool.
+const MAX_RPC_CLIENTS: usize = 16;
+const MAX_WATCH_CLIENTS: usize = 48;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
 use crate::accounts::AccountStore;
 use crate::store::Store;
@@ -62,10 +68,12 @@ impl App {
 
 async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let socket = cfg.socket_path();
+    let _lock = acquire_instance_lock(&socket)?;
     prepare_socket(&socket)?;
 
-    let listener = UnixListener::bind(&socket).map_err(|e| DaemonError::Io(e.to_string()))?;
-    let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
+    let listener = bind_private_socket(&socket)?;
+    let rpc_slots = Arc::new(Semaphore::new(MAX_RPC_CLIENTS));
+    let watch_slots = Arc::new(Semaphore::new(MAX_WATCH_CLIENTS));
 
     eprintln!(
         "quotad {} listening on {} (protocol {})",
@@ -78,7 +86,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let accounts = AccountStore::load(cfg.accounts_file());
     let mut store = Store::new(&cfg);
     seed_codexbar_history(&mut store, &cfg);
-    let app = Arc::new(Mutex::new(App {
+    let app = Arc::new(RwLock::new(App {
         interval_secs: cfg.refresh_min_secs(),
         store,
         accounts,
@@ -91,7 +99,7 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
 
     loop {
         let wait = {
-            let g = app.lock().await;
+            let g = app.read().await;
             Duration::from_secs(g.interval_secs)
         };
         tokio::select! {
@@ -103,8 +111,12 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
                 match accepted {
                     Ok((stream, _)) => {
                         let app = app.clone();
+                        let rpc_slots = rpc_slots.clone();
+                        let watch_slots = watch_slots.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(app, stream).await {
+                            if let Err(e) =
+                                handle_client(app, stream, rpc_slots, watch_slots).await
+                            {
                                 if !matches!(e, ClientError::Eof) {
                                     eprintln!("quotad: client: {e}");
                                 }
@@ -136,18 +148,163 @@ fn seed_codexbar_history(store: &mut Store, cfg: &Config) {
     }
 }
 
+/// Directory lock so two startups cannot both pass the stale-socket check
+/// and unlink each other’s live bind. `create_dir` is atomic; a leftover
+/// dir from a crash is removed when its pid is no longer alive.
+#[derive(Debug)]
+struct InstanceLock {
+    dir: PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn claim_lock_dir(dir: &Path) -> bool {
+    let pid_path = dir.join("pid");
+    let me = std::process::id().to_string();
+    if fs::write(&pid_path, format!("{me}\n")).is_err() {
+        return false;
+    }
+    fs::read_to_string(&pid_path)
+        .ok()
+        .is_some_and(|got| got.trim() == me)
+}
+
+fn lock_held_by_live_pid(dir: &Path) -> bool {
+    match fs::read_to_string(dir.join("pid")) {
+        Ok(raw) => raw.trim().parse::<u32>().ok().is_some_and(pid_alive),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let fresh = fs::metadata(dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < Duration::from_secs(2));
+            if fresh {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(raw) = fs::read_to_string(dir.join("pid")) {
+                    return raw.trim().parse::<u32>().ok().is_some_and(pid_alive);
+                }
+            }
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+fn acquire_instance_lock(socket: &Path) -> Result<InstanceLock, DaemonError> {
+    if let Some(dir) = socket.parent() {
+        quota_core::ensure_private_dir(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
+    }
+    let dir = socket.with_extension("lock");
+    for _ in 0..8 {
+        match DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {
+                if claim_lock_dir(&dir) {
+                    return Ok(InstanceLock { dir });
+                }
+                let _ = fs::remove_dir_all(&dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_held_by_live_pid(&dir) {
+                    return Err(DaemonError::Io(format!(
+                        "already running (lock held at {})",
+                        dir.display()
+                    )));
+                }
+                let _ = fs::remove_dir_all(&dir);
+            }
+            Err(e) => return Err(DaemonError::Io(e.to_string())),
+        }
+    }
+    Err(DaemonError::Io(format!(
+        "could not acquire instance lock at {}",
+        dir.display()
+    )))
+}
+
+/// Bind with umask `0177` so the inode is created mode `0600`, then chmod
+/// again and refuse to listen if group/other bits remain.
+fn bind_private_socket(path: &Path) -> Result<UnixListener, DaemonError> {
+    let listener = {
+        let previous = rustix::process::umask(
+            rustix::fs::Mode::XUSR | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+        );
+        let _restore = UmaskGuard(previous);
+        UnixListener::bind(path).map_err(|e| DaemonError::Io(e.to_string()))?
+    };
+    let mut perms = fs::metadata(path)
+        .map_err(|e| DaemonError::Io(e.to_string()))?
+        .permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+        .map_err(|e| DaemonError::Io(format!("chmod 0600 {}: {e}", path.display())))?;
+    let mode = fs::metadata(path)
+        .map_err(|e| DaemonError::Io(e.to_string()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(DaemonError::Io(format!(
+            "socket {} mode is {mode:o}; refusing to listen",
+            path.display()
+        )));
+    }
+    Ok(listener)
+}
+
+struct UmaskGuard(rustix::fs::Mode);
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        rustix::process::umask(self.0);
+    }
+}
+
 fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        quota_core::ensure_private_dir(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
     }
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| DaemonError::Io(e.to_string()))?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(DaemonError::Io(format!(
+                    "socket path {} is a symlink; refuse to bind",
+                    path.display()
+                )));
+            }
+            if meta.file_type().is_socket() {
+                if StdUnixStream::connect(path).is_ok() {
+                    return Err(DaemonError::Io(format!(
+                        "already running (live socket at {})",
+                        path.display()
+                    )));
+                }
+                fs::remove_file(path).map_err(|e| DaemonError::Io(e.to_string()))?;
+                return Ok(());
+            }
+            return Err(DaemonError::Io(format!(
+                "socket path {} exists and is not a unix socket",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(DaemonError::Io(e.to_string())),
     }
     Ok(())
 }
 
-async fn refresh(app: Arc<Mutex<App>>) {
+async fn refresh(app: Arc<RwLock<App>>) {
     let (
         timeout,
         enable_codex,
@@ -155,23 +312,28 @@ async fn refresh(app: Arc<Mutex<App>>) {
         min_s,
         max_s,
         codex_home,
+        claude_home,
         codexbar_dir,
         enable_codexbar_files,
     ) = {
-        let g = app.lock().await;
-        let home = g
-            .accounts
-            .book()
-            .active()
-            .and_then(|a| a.home_path.clone())
-            .map(std::path::PathBuf::from);
+        let g = app.read().await;
+        let (codex_home, claude_home) = match g.accounts.book().active() {
+            Some(a) if a.provider == ProviderId::Codex => {
+                (a.home_path.clone().map(std::path::PathBuf::from), None)
+            }
+            Some(a) if a.provider == ProviderId::Claude => {
+                (None, a.home_path.clone().map(std::path::PathBuf::from))
+            }
+            _ => (None, None),
+        };
         (
             g.cfg.http_timeout_secs,
             g.cfg.enable_codex,
             g.cfg.enable_claude,
             g.cfg.refresh_min_secs(),
             g.cfg.refresh_max_secs(),
-            home,
+            codex_home,
+            claude_home,
             g.cfg.codexbar_dir(),
             g.cfg.enable_codexbar_files,
         )
@@ -184,7 +346,9 @@ async fn refresh(app: Arc<Mutex<App>>) {
             codexbar_dir: Some(codexbar_dir),
             enable_codexbar_files,
         };
-        let claude = ClaudeAdapter;
+        let claude = ClaudeAdapter {
+            config_dir: claude_home,
+        };
         let mut providers: Vec<&dyn Provider> = Vec::new();
         if enable_codex {
             providers.push(&codex);
@@ -201,7 +365,7 @@ async fn refresh(app: Arc<Mutex<App>>) {
         return;
     };
 
-    let mut g = app.lock().await;
+    let mut g = app.write().await;
     let changed = match g.store.latest() {
         Some(prev) => !same_usage(prev, &snap),
         None => true,
@@ -235,10 +399,11 @@ fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
     a.providers.iter().zip(b.providers.iter()).all(|(x, y)| {
         x.provider == y.provider
             && x.status == y.status
+            && x.windows.len() == y.windows.len()
             && x.windows
                 .iter()
-                .map(|w| (w.kind.clone(), w.used_percent))
-                .eq(y.windows.iter().map(|w| (w.kind.clone(), w.used_percent)))
+                .zip(y.windows.iter())
+                .all(|(a, b)| a.kind == b.kind && a.used_percent == b.used_percent)
     })
 }
 
@@ -259,22 +424,48 @@ impl From<FrameError> for ClientError {
     }
 }
 
-async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(), ClientError> {
+async fn read_frame_timed(stream: &mut UnixStream) -> Result<Vec<u8>, ClientError> {
+    match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame_async(stream)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(FrameError::UnexpectedEof)) => Err(ClientError::Eof),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(ClientError::Other("idle handshake timeout".into())),
+    }
+}
+
+async fn handle_client(
+    app: Arc<RwLock<App>>,
+    mut stream: UnixStream,
+    rpc_slots: Arc<Semaphore>,
+    watch_slots: Arc<Semaphore>,
+) -> Result<(), ClientError> {
+    let mut rpc_permit = None;
     loop {
-        let payload = match read_frame_async(&mut stream).await {
-            Ok(p) => p,
-            Err(FrameError::UnexpectedEof) => return Err(ClientError::Eof),
-            Err(e) => return Err(e.into()),
-        };
+        let payload = read_frame_timed(&mut stream).await?;
         let req: Request = serde_json::from_slice(&payload)
             .map_err(|e| ClientError::Other(format!("bad request: {e}")))?;
 
         if req.method == METHOD_WATCH {
+            let _watch_permit = match watch_slots.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    write_frame_async(
+                        &mut stream,
+                        &Response::err(
+                            req.id,
+                            "too_many_watchers",
+                            format!("watch client limit ({MAX_WATCH_CLIENTS}) reached"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
             let mut rx = {
-                let g = app.lock().await;
-                let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+                let g = app.read().await;
+                let snap = filter_snapshot(g.store.latest(), params.provider);
                 write_frame_async(
                     &mut stream,
                     &Response::result(req.id, StatusResult { snapshot: snap }),
@@ -287,7 +478,7 @@ async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(
                     next = rx.recv() => {
                         match next {
                             Ok(snap) => {
-                                let snap = filter_snapshot(snap, params.provider);
+                                let snap = filter_snapshot(Some(&snap), params.provider);
                                 write_frame_async(
                                     &mut stream,
                                     &Response::result(req.id, StatusResult { snapshot: snap }),
@@ -318,25 +509,46 @@ async fn handle_client(app: Arc<Mutex<App>>, mut stream: UnixStream) -> Result<(
             }
         }
 
+        if rpc_permit.is_none() {
+            let p = match rpc_slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    write_frame_async(
+                        &mut stream,
+                        &Response::err(
+                            req.id,
+                            "too_many_clients",
+                            format!("rpc client limit ({MAX_RPC_CLIENTS}) reached"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            rpc_permit = Some(p);
+        }
+        let Some(ref _rpc_held) = rpc_permit else {
+            unreachable!("rpc permit set above");
+        };
+
         let resp = dispatch(&app, req).await;
         write_frame_async(&mut stream, &resp).await?;
     }
 }
 
-async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
+async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
     match req.method.as_str() {
         METHOD_PING => Response::result(req.id, quota_core::protocol::Pong { pong: true }),
         METHOD_VERSION => Response::result(req.id, VersionInfo::current()),
         METHOD_STATUS => {
             let params: StatusParams = serde_json::from_value(req.params).unwrap_or_default();
-            let g = app.lock().await;
-            let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+            let g = app.read().await;
+            let snap = filter_snapshot(g.store.latest(), params.provider);
             Response::result(req.id, StatusResult { snapshot: snap })
         }
         METHOD_PACE => {
             let params: PaceParams = serde_json::from_value(req.params).unwrap_or_default();
-            let g = app.lock().await;
-            let history = g.store.history();
+            let g = app.read().await;
             let latest = g.snapshot_or_empty();
             let mut reports = Vec::new();
             for p in latest
@@ -344,7 +556,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                reports.push(pace_for(&history, p));
+                reports.push(pace_for(g.store.history_ref(), p));
             }
             Response::result(req.id, PaceResult { reports })
         }
@@ -355,8 +567,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("can_start: {e}"));
                 }
             };
-            let g = app.lock().await;
-            let history = g.store.history();
+            let g = app.read().await;
             let latest = g.snapshot_or_empty();
             let now = now_unix();
             let mut answers = Vec::new();
@@ -365,7 +576,13 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                answers.push(can_start(p, &history, params.tokens, params.deadline, now));
+                answers.push(can_start(
+                    p,
+                    g.store.history_ref(),
+                    params.tokens,
+                    params.deadline,
+                    now,
+                ));
             }
             let available: Vec<_> = answers
                 .iter()
@@ -377,12 +594,12 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
         METHOD_REFRESH => {
             let params: RefreshParams = serde_json::from_value(req.params).unwrap_or_default();
             refresh(app.clone()).await;
-            let g = app.lock().await;
-            let snap = filter_snapshot(g.snapshot_or_empty(), params.provider);
+            let g = app.read().await;
+            let snap = filter_snapshot(g.store.latest(), params.provider);
             Response::result(req.id, StatusResult { snapshot: snap })
         }
         METHOD_ACCOUNTS_LIST => {
-            let g = app.lock().await;
+            let g = app.read().await;
             Response::result(req.id, g.accounts.list())
         }
         METHOD_ACCOUNTS_ADD => {
@@ -390,7 +607,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::err(req.id, "bad_params", format!("accounts.add: {e}")),
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.add(params) {
                 Ok(account) => {
                     let active_id = g.accounts.list().active_id;
@@ -406,7 +623,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("accounts.remove: {e}"));
                 }
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.remove(&params.id) {
                 Ok(true) => Response::result(req.id, g.accounts.list()),
                 Ok(false) => {
@@ -422,7 +639,7 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("accounts.select: {e}"));
                 }
             };
-            let mut g = app.lock().await;
+            let mut g = app.write().await;
             match g.accounts.select(params.id) {
                 Ok(_) => Response::result(req.id, g.accounts.list()),
                 Err(e) => Response::err(req.id, "accounts", e),
@@ -440,12 +657,19 @@ async fn dispatch(app: &Arc<Mutex<App>>, req: Request) -> Response {
     }
 }
 
-fn filter_snapshot(mut snap: Snapshot, filter: ProviderFilter) -> Snapshot {
-    if filter == ProviderFilter::All {
-        return snap;
+fn filter_snapshot(snap: Option<&Snapshot>, filter: ProviderFilter) -> Snapshot {
+    match snap {
+        Some(s) if filter == ProviderFilter::All => s.clone(),
+        Some(s) => Snapshot::new(
+            s.fetched_at,
+            s.providers
+                .iter()
+                .filter(|p| filter.matches(p.provider))
+                .cloned()
+                .collect(),
+        ),
+        None => Snapshot::new(now_unix(), Vec::new()),
     }
-    snap.providers.retain(|p| filter.matches(p.provider));
-    snap
 }
 
 async fn read_frame_async(stream: &mut UnixStream) -> Result<Vec<u8>, FrameError> {
@@ -514,7 +738,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ping_and_version() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let ping = dispatch(&app, Request::new(1, METHOD_PING)).await;
         assert!(ping.ok);
         let ver = dispatch(&app, Request::new(2, METHOD_VERSION)).await;
@@ -525,7 +749,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn status_filters_provider() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let req = Request::with_params(
             3,
             METHOD_STATUS,
@@ -540,7 +764,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unknown_method() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let resp = dispatch(&app, Request::new(9, "explode")).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, "unknown_method");
@@ -555,7 +779,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn accounts_add_list_remove() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let add = Request::with_params(
             10,
             METHOD_ACCOUNTS_ADD,
@@ -591,5 +815,90 @@ mod tests {
         let book: quota_core::AccountsListResult =
             serde_json::from_value(listed.result.unwrap()).unwrap();
         assert!(book.accounts.is_empty());
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-lock-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let first = acquire_instance_lock(&sock).unwrap();
+        let err = acquire_instance_lock(&sock).unwrap_err();
+        assert!(err.to_string().contains("already running"));
+        drop(first);
+        let second = acquire_instance_lock(&sock).unwrap();
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_socket_refuses_symlink() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-sym-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.sock");
+        let link = dir.join("quota.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = prepare_socket(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_socket_refuses_live_instance() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-live-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = prepare_socket(&sock).unwrap_err();
+        assert!(err.to_string().contains("already running"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_socket_unlinks_stale() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-stale-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        prepare_socket(&sock).unwrap();
+        assert!(!sock.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_is_owner_only() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-sock-mode-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("quota.sock");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt.block_on(async { bind_private_socket(&sock).unwrap() });
+        let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

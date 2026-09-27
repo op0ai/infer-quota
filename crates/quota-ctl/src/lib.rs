@@ -73,6 +73,22 @@ pub fn secret_ref(backend: Option<String>, path: Option<String>) -> Option<Secre
     }
 }
 
+/// Line printed by `secret get`. The secret bytes are not an argument, so
+/// they cannot appear in the output.
+pub fn format_secret_presence(backend: &str, path: &str) -> String {
+    format!("backend={backend} path={path} present=true")
+}
+
+/// `secret put` material must be non-empty. Callers read it from the
+/// environment, never from argv.
+pub fn require_secret_material(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        Err("refusing to store an empty secret")
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +98,15 @@ mod tests {
         let p = secret_ref(Some("openbao".into()), Some("codex/work".into())).unwrap();
         assert_eq!(p.backend, "openbao");
         assert!(secret_ref(Some("openbao".into()), None).is_none());
+    }
+
+    #[test]
+    fn presence_line_omits_material() {
+        let material = "sk-test-material-not-printed";
+        let line = format_secret_presence("openbao", "codex/work");
+        assert_eq!(line, "backend=openbao path=codex/work present=true");
+        assert!(!line.contains(material));
+        assert!(require_secret_material("").is_err());
+        assert!(require_secret_material(material).is_ok());
     }
 }

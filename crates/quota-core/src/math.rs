@@ -69,8 +69,11 @@ fn binding_window(snap: &ProviderSnapshot) -> Option<&UsageWindow> {
     snap.windows.first()
 }
 
-fn samples_for(history: &[Snapshot], provider: ProviderId, kind: &WindowKind) -> Vec<(i64, f64)> {
-    let mut out = Vec::with_capacity(history.len());
+fn samples_for<'a, I>(history: I, provider: ProviderId, kind: &WindowKind) -> Vec<(i64, f64)>
+where
+    I: IntoIterator<Item = &'a Snapshot>,
+{
+    let mut out = Vec::new();
     for snap in history {
         if let Some(p) = snap.by_id(provider) {
             if let Some(w) = p.window(kind) {
@@ -83,7 +86,10 @@ fn samples_for(history: &[Snapshot], provider: ProviderId, kind: &WindowKind) ->
     out
 }
 
-pub fn pace_for(history: &[Snapshot], latest: &ProviderSnapshot) -> PaceReport {
+pub fn pace_for<'a, I>(history: I, latest: &ProviderSnapshot) -> PaceReport
+where
+    I: IntoIterator<Item = &'a Snapshot>,
+{
     if latest.status != Availability::Ok {
         let msg = latest
             .error
@@ -161,13 +167,16 @@ pub fn pace_for(history: &[Snapshot], latest: &ProviderSnapshot) -> PaceReport {
 
 /// Decide whether a job of `tokens` can finish before `deadline` (default:
 /// window reset). We never convert percent→tokens.
-pub fn can_start(
+pub fn can_start<'a, I>(
     latest: &ProviderSnapshot,
-    history: &[Snapshot],
+    history: I,
     tokens: u64,
     deadline: Option<i64>,
     now: i64,
-) -> CanStartAnswer {
+) -> CanStartAnswer
+where
+    I: IntoIterator<Item = &'a Snapshot>,
+{
     if latest.status != Availability::Ok {
         let msg = latest
             .error

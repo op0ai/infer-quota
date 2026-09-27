@@ -25,7 +25,7 @@ The default config file is `$XDG_CONFIG_HOME/quota/config.json` when `XDG_CONFIG
 
 A socket set only inside a non-default config file is visible to `quotad --config PATH`. Clients do not read that file. Pass the same path with `--socket`, or put `socket` in the default config file.
 
-The socket file is mode `0600`. The parent directory is created if needed and its mode is set to `0700`. Use a private directory (`$XDG_RUNTIME_DIR/quota`), because that mode is applied to the parent.
+The socket file is mode `0600`. The parent directory is created if needed and its mode is set to `0700`. Use a private directory (`$XDG_RUNTIME_DIR/quota`), because that mode is applied to the parent. `quotad` refuses a symlink socket path, a live socket that is already listening, and a path that exists and is not a socket. A stale socket (connect fails) is removed.
 
 ## Framing
 
