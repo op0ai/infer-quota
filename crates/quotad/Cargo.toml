@@ -12,7 +12,8 @@ clap.workspace = true
 quota-adapters.workspace = true
 quota-core.workspace = true
 # Safe `umask` so the socket inode is created 0600, not chmod-after-bind.
-rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs", "process"] }
+# `net` is Linux `SO_PEERCRED` only (same crate, no new dependency).
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs", "process", "net"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

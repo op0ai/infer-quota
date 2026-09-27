@@ -27,7 +27,7 @@ socket is the control plane for the user session, not a multi-tenant API.
 | OpenBao | Feature `openbao` (enabled by `quota-ctl`, not by `quotad`). `https://` is rustls 0.21; optional `QUOTA_OPENBAO_CA_FILE` PEM. Plain HTTP is **exact** loopback (`127.0.0.1`, `localhost`, `::1`) unless `QUOTA_OPENBAO_ALLOW_PLAINTEXT=1`. Nested prefixes (`quota/prod`) are allowed; `..` is not. `put` values capped at 32 KiB. Response bodies capped. Token and secret bytes are redacted from `Debug`. `secret get` prints `present=true` only. `secret put` requires `--from-env` (never argv). File backend is read-only. |
 | State files | Accounts / optional history dirs we create are `0700`. Files are opened `0600` with `O_NOFOLLOW` and refused when the inode is group- or other-readable, before any bytes are written. |
 | Instance lock | `mkdir` mode `0700` on `{socket}.lock`. The pid is written and re-read before the lock is claimed. A missing pid is stolen only after it stays missing (a live starter is not unlinked mid-write). |
-| Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watchers cannot exhaust `status`/`refresh`. |
+| Client flood | 16 RPC + 48 watch slots. First-frame idle timeout 15s. Watch write timeout 15s. Watch idle 600s since last snapshot or client frame (`QUOTA_WATCH_IDLE_SECS`). Linux `SO_PEERCRED` same-euid. Watchers cannot exhaust `status`/`refresh`. |
 | Window kinds | Unknown slot + no duration → `extra`/`unknown`, not invented `weekly`. |
 
 ## Residual gaps (explicit)
@@ -39,8 +39,11 @@ socket is the control plane for the user session, not a multi-tenant API.
    daemon is vault-only. Wiring that up would pull `quota-secrets` into
    `quotad` — out of scope for this pass.
 
-2. **No `SO_PEERCRED` check.** `0600` already limits the socket to the
-   owner. A compromised same-user process is inside the trust boundary.
+2. **macOS has no `SO_PEERCRED` equivalent in this tree.** Linux accept
+   path calls `getsockopt(SO_PEERCRED)` and drops the connection when the
+   peer uid is not the daemon euid (fail closed on sockopt error). `0600`
+   still applies everywhere. A compromised same-user process is inside
+   the trust boundary on every OS.
 
 3. **OpenBao plain HTTP is dev-only.** `https://` is rustls in `quota-ctl`.
    `docker-compose.dev.yml` stays HTTP on loopback with the documented
@@ -79,9 +82,11 @@ socket is the control plane for the user session, not a multi-tenant API.
    is not implemented. TLS is always linked when Codex/Claude HTTPS
    probes are compiled in.
 
-9. **Watch connections have no per-idle timeout after subscribe.** The
-   first-frame timeout applies to handshake and RPC reads. A same-UID
-   peer can hold a watch slot until disconnect.
+9. **Watch idle timeout is 600s since last snapshot or client frame**
+   (override `QUOTA_WATCH_IDLE_SECS`, minimum 1). Snapshot writes use a
+   15s timeout so a non-reading peer cannot pin a slot. A same-UID
+   watcher on a live daemon (refresh ≤ 300s) is not dropped. A wedged
+   refresh plus a silent client is.
 
 ## What must never be committed
 

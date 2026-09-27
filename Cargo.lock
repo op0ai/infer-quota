@@ -810,9 +810,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "quota-core",
- "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -852,9 +850,7 @@ dependencies = [
  "clap",
  "quota-core",
  "quota-secrets",
- "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
