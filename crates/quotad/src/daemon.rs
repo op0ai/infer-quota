@@ -904,7 +904,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn can_start_unavailable_is_honest() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let req = Request::with_params(
             20,
             METHOD_CAN_START,
@@ -929,7 +929,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn accounts_add_does_not_echo_stuffed_secrets() {
-        let app = Arc::new(Mutex::new(test_app()));
+        let app = Arc::new(RwLock::new(test_app()));
         let raw = serde_json::json!({
             "id": 30,
             "method": METHOD_ACCOUNTS_ADD,

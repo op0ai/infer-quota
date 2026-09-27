@@ -24,6 +24,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test (offline)
         run: cargo test --locked --workspace
+      - name: test secrets without OpenBao (feature gate)
+        run: cargo test --locked -p quota-secrets
+      - name: test OpenBao feature (offline mocks)
+        run: cargo test --locked -p quota-secrets --features openbao
       - name: release build
         run: cargo build --locked --workspace --release
       - name: fixture redaction

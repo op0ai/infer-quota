@@ -12,7 +12,7 @@ members = [
 # Targeted (lean) builds — no extra feature flags. quotad/quota never link
 # quota-secrets or quota-ctl. Drop the control plane when unwanted:
 #   cargo build --release -p quotad -p quota
-# quota-ctl pulls quota-secrets (OpenBao HTTP + keychain stub). quota-bench
+# quota-ctl pulls quota-secrets (OpenBao via feature `openbao`, OS keychain). quota-bench
 # is a local harness, not installed. See install.sh --minimal.
 
 [workspace.package]

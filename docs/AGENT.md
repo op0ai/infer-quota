@@ -26,7 +26,10 @@ cargo build --release -p quotad -p quota
 ```
 
 `quota-ctl` is optional. It mutates account *metadata* and can store *new*
-material in OpenBao. It is not a collector.
+material in OpenBao (crate feature `openbao`, rustls). The OS keychain is
+real (Linux secret-service / macOS Security.framework) and returns
+`Unavailable` when the session bus is down — it is not a stub. It is not a
+collector. `quotad` does not link `quota-secrets`.
 
 ## 2. Start the daemon
 
@@ -39,8 +42,10 @@ quotad run --socket "$QUOTA_SOCKET" &
 quota --socket "$QUOTA_SOCKET" ping
 ```
 
-`--socket` / `QUOTA_SOCKET` win over `config.json`. Directory mode `0700`,
-socket mode `0600`. Prefer `$XDG_RUNTIME_DIR` over `/tmp`.
+`--socket` wins. Then `config.json` `"socket"`. Then `QUOTA_SOCKET`. Then
+`$XDG_RUNTIME_DIR/quota/quota.sock` or `~/.local/share/quota/quota.sock`.
+The commands above pass `--socket`. Directory mode `0700`, socket mode
+`0600`. Prefer `$XDG_RUNTIME_DIR` over `/tmp`.
 
 ## 3. Read numbers
 
@@ -70,6 +75,7 @@ Protocol: 4-byte little-endian length + compact JSON, max 256 KiB. Schema:
 | Invent Gemini / OpenRouter / … | v0 adapters are Codex + Claude only. |
 | Commit fixtures with live keys | Use `fixtures/codexbar/*.redacted.*` only. |
 | Put secrets on argv | `quota-ctl secret put` is `--from-env` only. |
+| Print secret bytes | `quota-ctl secret get` prints `present=true` only. |
 
 Offline tests and benches use `fixtures/codexbar/` and HTTP mocks. They do
 not measure live provider latency.
