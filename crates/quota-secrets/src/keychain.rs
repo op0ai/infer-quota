@@ -237,6 +237,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_session_bus_is_unavailable_not_a_panic() {
+        // Linux CI has no secret-service bus. The backend must return
+        // Unavailable so the chain can skip to read-only files.
+        let k = KeychainBackend;
+        match k.get("quota/no-bus-unit") {
+            Ok(_) => {}
+            Err(SecretsError::Unavailable(msg)) => {
+                assert!(
+                    msg.contains("secret-service")
+                        || msg.contains("unavailable")
+                        || msg.contains("platform"),
+                    "{msg}"
+                );
+            }
+            Err(other) => panic!("expected Unavailable, got {other}"),
+        }
+    }
+
+    #[test]
     fn roundtrip_or_skip_without_session() {
         let k = KeychainBackend;
         let path = format!("quota/unit-{}", std::process::id());

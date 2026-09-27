@@ -270,6 +270,36 @@ mod tests {
     }
 
     #[test]
+    fn refresh_token_is_dropped_after_parse() {
+        let json = br#"{
+            "tokens": {
+                "access_token":"tok-keep",
+                "refresh_token":"rt-drop-immediately",
+                "account_id":"acct-1"
+            }
+        }"#;
+        let c = parse_codex_auth(Path::new("/tmp/auth.json"), json).unwrap();
+        let dumped = format!("{c:?}");
+        assert!(dumped.contains("tok-keep"));
+        assert!(!dumped.contains("rt-drop-immediately"));
+        assert!(!dumped.contains("refresh_token"));
+    }
+
+    #[test]
+    fn oversized_cred_file_is_refused() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-creds-huge-{stamp}"));
+        let oversized = vec![b'a'; MAX_CRED_BYTES + 8];
+        std::fs::write(&path, oversized).unwrap();
+        let err = read_capped(&path).unwrap_err();
+        assert_eq!(err, CredsError::TooLarge);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn read_capped_refuses_symlink() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

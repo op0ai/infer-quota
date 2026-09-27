@@ -69,6 +69,19 @@ Rust core: adapters, a snapshot, the math, a socket.
 - Claiming calibrated accuracy beyond what the source published
 - Converting `--tokens N` into a percent-only window
 
+## Install / point an agent at it
+
+```bash
+./install.sh                 # ~/.local/bin/{quotad,quota,quota-ctl}
+./install.sh --minimal       # quotad + quota only (no ctl / OpenBao client)
+```
+
+Then start `quotad` and read `quota status --json`. Full agent handoff
+(socket env, what never to scrape): [docs/AGENT.md](docs/AGENT.md).
+
+Lean cargo (same as `--minimal`): `cargo build --release -p quotad -p quota`.
+`quota-ctl` is optional. `quota-bench` is a local harness, not installed.
+
 ## Build / run
 
 Requires Rust 1.83+ (stable).

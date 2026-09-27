@@ -478,4 +478,68 @@ mod tests {
             unit: Some("credits".into()),
         };
     }
+
+    #[test]
+    fn can_start_percent_only_stays_false_with_plenty_left() {
+        let p = ok_provider(1.0); // 99% remaining, still no token budget
+        let a = can_start(&p, &[], 1, None, 1_000);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::PercentOnly);
+        assert!(a.remaining_tokens.is_none());
+        assert!(a.explanation.contains("Cannot map"));
+        assert!(!a.explanation.contains("fits before"));
+    }
+
+    #[test]
+    fn can_start_percent_only_notes_burn_before_deadline() {
+        let p1 = ok_provider(10.0);
+        let p2 = ok_provider(90.0);
+        let history = vec![
+            Snapshot::new(1_000, vec![p1]),
+            Snapshot::new(1_100, vec![p2.clone()]),
+        ];
+        let a = can_start(&p2, &history, 50_000, Some(10_000), 1_100);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::PercentOnly);
+        assert!(a.explanation.contains("Current burn would empty"));
+    }
+
+    #[test]
+    fn can_start_no_windows_is_unavailable() {
+        let mut p = ok_provider(20.0);
+        p.windows.clear();
+        let a = can_start(&p, &[], 1, None, 1);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+        assert!(a.explanation.contains("no usage windows"));
+    }
+
+    #[test]
+    fn binding_window_prefers_session_over_weekly() {
+        let mut p = ok_provider(20.0);
+        p.windows.push(UsageWindow::from_percent(
+            WindowKind::Weekly,
+            "weekly",
+            5.0,
+            Some(9_000),
+            Some(604_800),
+        ));
+        let report = pace_for(&[Snapshot::new(1_000, vec![p.clone()])], &p);
+        assert_eq!(report.window_kind, Some(WindowKind::Session));
+    }
+
+    #[test]
+    fn can_start_credits_unit_is_token_budget() {
+        let mut p = ok_provider(20.0);
+        p.windows[0].remaining = Some(12.0);
+        p.windows[0].limit = Some(20.0);
+        p.windows[0].unit = Some("credits".into());
+        p.windows[0].used_percent = None;
+        p.windows[0].remaining_percent = None;
+        let a = can_start(&p, &[], 10, None, 1_000);
+        assert!(a.ok);
+        assert_eq!(a.basis, CanStartBasis::TokenBudget);
+        let b = can_start(&p, &[], 13, None, 1_000);
+        assert!(!b.ok);
+    }
 }

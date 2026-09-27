@@ -287,4 +287,36 @@ mod tests {
         let p: CanStartParams = serde_json::from_value(back.params).unwrap();
         assert_eq!(p.tokens, 50_000);
     }
+
+    #[test]
+    fn accounts_add_ignores_token_fields() {
+        let raw = serde_json::json!({
+            "provider": "codex",
+            "email": "openai@ctx.op0.dev",
+            "access_token": "sk-must-not-deserialize",
+            "refresh_token": "rt-must-not-deserialize",
+            "password": "hunter2",
+            "secret_ref": { "backend": "openbao", "path": "quota/codex/work" },
+            "select": true
+        });
+        let p: AccountsAddParams = serde_json::from_value(raw).unwrap();
+        let encoded = serde_json::to_string(&p).unwrap();
+        assert!(encoded.contains("quota/codex/work"));
+        assert!(!encoded.contains("sk-must-not-deserialize"));
+        assert!(!encoded.contains("rt-must-not-deserialize"));
+        assert!(!encoded.contains("hunter2"));
+        assert!(!encoded.contains("access_token"));
+        assert!(!encoded.contains("refresh_token"));
+        assert!(!encoded.contains("password"));
+    }
+
+    #[test]
+    fn provider_filter_rejects_unknown() {
+        assert!(ProviderFilter::from_str_loose("gemini").is_none());
+        assert!(ProviderFilter::from_str_loose("openai").is_none());
+        assert_eq!(
+            ProviderFilter::from_str_loose("codex"),
+            Some(ProviderFilter::Codex)
+        );
+    }
 }

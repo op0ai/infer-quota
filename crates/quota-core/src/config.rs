@@ -165,4 +165,30 @@ mod tests {
         assert_eq!(c.ring_capacity, 32);
         assert!(c.enable_codex);
     }
+
+    #[test]
+    fn socket_path_prefers_config_over_env() {
+        let with_cfg: Config =
+            serde_json::from_str(r#"{"socket":"/tmp/from-config.sock"}"#).unwrap();
+        assert_eq!(
+            with_cfg.socket_path(),
+            PathBuf::from("/tmp/from-config.sock")
+        );
+
+        let prev = std::env::var("QUOTA_SOCKET").ok();
+        std::env::set_var("QUOTA_SOCKET", "/tmp/from-env.sock");
+        assert_eq!(
+            Config::default().socket_path(),
+            PathBuf::from("/tmp/from-env.sock")
+        );
+        assert_eq!(
+            with_cfg.socket_path(),
+            PathBuf::from("/tmp/from-config.sock"),
+            "config.json socket must beat QUOTA_SOCKET"
+        );
+        match prev {
+            Some(v) => std::env::set_var("QUOTA_SOCKET", v),
+            None => std::env::remove_var("QUOTA_SOCKET"),
+        }
+    }
 }

@@ -18,3 +18,6 @@ these with live Mac files.
 - raw `authFingerprint`, managed home paths, or any bearer token
 
 Live Mac probes stay on the laptop. CI uses these files only.
+
+In-repo files are the source of truth. A redacted dump from a laptop must
+match these shapes; do not replace them with live Mac files.

@@ -117,5 +117,22 @@ mod tests {
         let names = chain.backend_names();
         assert!(names.contains(&"file"));
         assert!(names.contains(&"keychain"));
+        #[cfg(not(feature = "openbao"))]
+        assert!(
+            !names.contains(&"openbao"),
+            "openbao must stay feature-gated out of default tests"
+        );
+    }
+
+    #[test]
+    fn secret_record_debug_never_prints_value() {
+        let rec = SecretRecord {
+            backend: "memory",
+            path: "codex/work".into(),
+            value: "sk-must-not-appear-in-debug".into(),
+        };
+        let dumped = format!("{rec:?}");
+        assert!(dumped.contains("<redacted>"));
+        assert!(!dumped.contains("sk-must-not-appear-in-debug"));
     }
 }

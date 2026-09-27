@@ -478,4 +478,38 @@ mod tests {
         assert_eq!(snap.windows[0].label, "weekly");
         assert_eq!(snap.windows[0].used_percent, Some(59.0));
     }
+
+    #[test]
+    fn http_error_body_is_not_copied() {
+        let body = br#"{"error":"bearer sk-secret-must-not-leak","token":"eyJhbGciOi"}"#;
+        let snap = parse_usage_http(500, body, Path::new("/tmp/auth.json"));
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.error.as_ref().unwrap().code, "http");
+        let msg = &snap.error.as_ref().unwrap().message;
+        assert!(msg.contains("HTTP 500"));
+        assert!(!msg.contains("sk-secret"));
+        assert!(!msg.contains("eyJ"));
+        let encoded = serde_json::to_string(&snap).unwrap();
+        assert!(!encoded.contains("sk-secret-must-not-leak"));
+    }
+
+    #[test]
+    fn mock_does_not_invent_live_latency() {
+        // Offline mock: no wall-clock HTTPS. Presence of a body is enough.
+        let t = MockTransport::ok_json(200, FIXTURE);
+        let creds = CodexCreds {
+            access_token: "tok".into(),
+            account_id: None,
+            path: PathBuf::from("/tmp/auth.json"),
+        };
+        let snap = fetch_usage(&t, &creds, None);
+        assert_eq!(snap.status, Availability::Ok);
+        assert!(t
+            .last_url
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("wham"));
+    }
 }

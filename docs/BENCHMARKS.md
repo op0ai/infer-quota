@@ -33,11 +33,159 @@ unchanged.
 
 ---
 
-## 2026-09-27 hardening pass (VERIFIED)
+## 2026-09-27 13:16 UTC re-measure (VERIFIED)
 
-Same VM class as the earlier 2026-09-27 tables below (`uname` / `rustc` /
-4× Xeon @ 2400 MHz / 15 GiB). Measured after the socket/creds/JSONL
-hardening commit on this branch. Nothing here is an estimate.
+Same VM class (`uname` / `rustc` 1.83.0 / 4× Xeon @ 2400 MHz / 15 GiB, 0
+swap; `free -h` at 13:14 UTC: ~8.9 GiB used, ~6.8 GiB available). Tree is
+PR #1 tip `8b4f132` plus this PR’s tests, `install.sh`, and `docs/AGENT.md`.
+Nothing here is an estimate. **Not a size-optimization pass.**
+
+`x86_64-unknown-linux-musl` is **not installed** (`rustup target list
+--installed` is only `x86_64-unknown-linux-gnu`). Musl sizes stay
+**UNVERIFIED**. Do not invent them. `/proc/sys/vm/drop_caches` is
+Permission denied.
+
+### 1. Release binaries (VERIFIED)
+
+`ls -lh --full-time` / `stat` after `cargo build --locked --workspace --release`
+(2026-09-27 13:13 UTC):
+
+| path | bytes | `ls -lh` | mtime (UTC) |
+|------|------:|----------|-------------|
+| `target/release/quota` | 1 061 216 | 1.1M | 2026-09-27 13:13:44 |
+| `target/release/quotad` | 2 416 032 | 2.4M | 2026-09-27 13:13:43 |
+| `target/release/quota-ctl` | 4 096 608 | 4.0M | 2026-09-27 13:13:48 |
+
+`quota-ctl` is large because PR #1 links the real OS keychain
+(`secret-service` / zbus) and the rustls OpenBao client. Earlier 1.16 MiB
+tables in this file are **pre-keychain**. `quotad` / `quota` still do not
+link `quota-secrets`. `--minimal` install skips `quota-ctl`.
+
+`file`: ELF 64-bit LSB pie, x86-64, dynamically linked, **not stripped**.
+`readelf -S`: no `.debug*`; all three have `.symtab`. Matches
+`strip = "debuginfo"`.
+
+`sha256sum`:
+
+```
+93bdd844c9fe2e83864fae421acafdba81748254df37a4a7b23306ccbcc205fd  target/release/quota
+382c8938eab59121c55f1ad018181266f2a09fbec4a6ecaafccdf5e03a8d98fd  target/release/quotad
+92b8d847bd2ff313066c40f71889639d5b4d88b69773d36b8c37b7b6349d01f9  target/release/quota-ctl
+```
+
+`ldd` (quotad): `linux-vdso`, `libgcc_s.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2`.
+
+Harness `target/release/quota-bench`: 742 968 bytes (not a product binary).
+
+### 1b. Optional `dist` size pass (VERIFIED)
+
+`cargo build --locked --workspace --profile dist --bins` (41.8 s compile).
+`file` says **stripped** (no `.symtab`).
+
+| path | bytes | vs default release |
+|------|------:|--------------------|
+| `target/dist/quota` | 780 712 | −280 504 (−26%) |
+| `target/dist/quotad` | 1 792 592 | −623 440 (−26%) |
+| `target/dist/quota-ctl` | 2 779 904 | −1 316 704 (−32%) |
+
+### 2. Fixture pace / serialize / JSONL (VERIFIED)
+
+```
+./target/release/quota-bench pace --iters 200
+./target/release/quota-bench serialize --iters 200 --ring 128
+./target/release/quota-bench jsonl --iters 50 --ring 128
+```
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `pace` (1912-row fixture) | 200 | 6.5 µs | 1.0 µs | 6.2 µs | 19.8 µs | 6.4 µs | 6.8 µs | 6.9 µs |
+| `status_serialize` | 200 | 0.9 µs | 0.6 µs | 0.9 µs | 9.3 µs | 0.9 µs | 1.0 µs | 1.8 µs |
+| `ring_replay_1912` | 200 | 209.9 µs | 13.8 µs | 201.0 µs | 289.6 µs | 205.1 µs | 244.5 µs | 260.9 µs |
+| `jsonl_full_1912` | 50 | 960.7 µs | 43.1 µs | 934.3 µs | 1174.9 µs | 944.8 µs | 1039.5 µs | 1174.9 µs |
+| `jsonl_tail_128` | 50 | 943.9 µs | 40.3 µs | 914.6 µs | 1073.5 µs | 928.8 µs | 1059.3 µs | 1073.5 µs |
+
+`pace` burn 12.9865 %/h; 153 134 / s; first call 21 166 ns. Percent-only
+window. `can_start --tokens 50000` stays `basis: percent_only`.
+
+**JSONL tail is not a parse-only win on this tree.** After
+`0af8adf` the tail keeps the last 128 **parsed** rows so a partial or
+over-long line cannot evict a valid sample. Both paths still read the
+whole file through `O_NOFOLLOW` + a 64 KiB line cap. Mean delta
+**−16.8 µs (−1.7%)**. The 12:21 UTC −74% table below measured the older
+“keep last 128 strings, then parse those” implementation. Do not quote
+that −74% for this commit.
+
+### 3. Socket RTT / many clients / start (VERIFIED)
+
+`quotad run --socket /tmp/quota-bench-rebase.sock`. Isolated `$HOME` (no
+CLI creds). First probe is local FS misses only.
+
+```
+./target/release/quota-bench --socket … --warmup 100 --iters 1000
+./target/release/quota-bench watch --socket … --clients 8 --iters 200
+./target/release/quota-bench start --quotad ./target/release/quotad --socket /tmp/quota-start-rebase.sock --runs 8
+```
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| socket `ping` | 1000 | 10.2 µs | 1.9 µs | 8.1 µs | 36.3 µs | 9.6 µs | 12.8 µs | 15.1 µs |
+| socket `status` | 1000 | 21.5 µs | 2.2 µs | 20.2 µs | 51.8 µs | 20.9 µs | 24.2 µs | 32.0 µs |
+| `status_clients_8` | 1600 | 70.3 µs | 15.2 µs | 21.1 µs | 514.2 µs | 68.9 µs | 80.7 µs | 94.6 µs |
+| `daemon_start_to_ping` | 8 | 5460 µs | 141 µs | 5316 µs | 5777 µs | 5460 µs | 5777 µs | 5777 µs |
+| `daemon_start_to_ping` + `QUOTA_CODEXBAR_DIR=fixtures/codexbar` | 8 | 5322 µs | 133 µs | 5160 µs | 5526 µs | 5373 µs | 5526 µs | 5526 µs |
+| `daemon_warm_ping` | 8 | 184 µs | 152 µs | 34 µs | 407 µs | 219 µs | 407 µs | 407 µs |
+
+`watch` first frame 645 bytes, `ok`. Deltas vs the 12:21 UTC row are
+noisy µs on a shared VM — **not** claimed as wins or regressions.
+
+### 4. RSS (VERIFIED)
+
+Idle `quotad` after first `quota ping` (both providers `unavailable`):
+
+| metric | value | source |
+|--------|------:|--------|
+| VmRSS | 3428 kB | `/proc/<pid>/status` |
+| RssAnon | 272 kB | same |
+| RssFile | 3156 kB | same |
+| Threads | 2 | same |
+| PSS | 1676 kB | `/proc/<pid>/smaps_rollup` |
+| USS (`Private_Clean` + `Private_Dirty`) | 1604 kB | 1332 + 272 |
+
+`ps -o rss` agreed: **3428**.
+
+CLI one-shot VmHWM, tight `/proc` poll, samples with HWM below 1000 kB
+dropped (process exited before a useful read):
+
+| command | observed VmHWM (kB) |
+|---------|---------------------|
+| `quota version` | 1292–2564 (first five: 2008, 2348, 2364, 2132, 1292) |
+| `quota status` | 1892–2556 (n=17) |
+| `quota-ctl ping` | 1340–3048 (first five: 2972, 1528, 1340, 2252, 2188) |
+
+### 5. CLI spawn (VERIFIED)
+
+Python `time.perf_counter` around `subprocess.run` (no shell), warmup 5,
+page cache warm. `quotad` already up.
+
+| command | n | mean ± std | min | max | p50 | p95 | p99 |
+|---------|--:|------------|-----|-----|-----|-----|-----|
+| `quota --socket … version` | 80 | 665.0 ± 148.7 µs | 539.6 µs | 1268.7 µs | 607.4 µs | 1060.6 µs | 1156.5 µs |
+| `quota --socket … ping` | 80 | 635.0 ± 109.4 µs | 529.7 µs | 938.5 µs | 590.0 µs | 906.0 µs | 929.6 µs |
+| `quota-ctl --socket … ping` | 40 | 705.0 ± 114.3 µs | 590.9 µs | 970.1 µs | 672.9 µs | 922.6 µs | 970.1 µs |
+
+**Not measured:** live HTTPS usage-fetch, musl, cold-page-fault
+distribution.
+
+---
+
+## 2026-09-27 hardening pass (VERIFIED, historical)
+
+Same VM class as the tables below (`uname` / `rustc` / 4× Xeon @ 2400 MHz /
+15 GiB). Measured after the socket/creds/JSONL hardening commit, **before**
+the parsed-row tail change and the real keychain. Kept so the original
+JSONL −74% write-up is not deleted. For this PR’s tree use the 13:16 UTC
+section above.
 
 **Claimed win (only this one):** CodexBar JSONL seed now streams a 128-line
 tail and parses those rows only.
