@@ -1,7 +1,8 @@
 # Benchmarks
 
-Numbers below were measured on one machine on **2026-09-26**. They are not
-SLOs and are not portable. Nothing here is an estimate.
+Numbers below were measured on this VM. They are not SLOs and are not
+portable. Nothing here is an estimate. Rows marked **VERIFIED** were
+stopwatch-timed or read from `/proc` / `stat` in this session.
 
 **Not measured:** live Codex/Claude HTTPS usage-fetch latency. This host had
 no `~/.codex/auth.json` and no `~/.claude/.credentials.json`. Adapter probes
@@ -17,184 +18,280 @@ Anthropic.”
 | `rustc -vV` | `rustc 1.83.0 (90b35a623 2024-11-26)`, host `x86_64-unknown-linux-gnu`, LLVM 19.1.1 |
 | `cargo -V` | `cargo 1.83.0 (5ffbef321 2024-10-29)` |
 | CPU | 4× `Intel(R) Xeon(R) Processor` @ 2400 MHz (`siblings=4`, `cpu cores=4`) |
-| RAM | 15 GiB, **0** swap (`free -h` at measure time: ~9.0 GiB used, ~6.7 GiB available) |
-| Tools | `hyperfine 1.18.0`, GNU `time 1.9` |
+| RAM | 15 GiB, **0** swap (`free -h` at 2026-09-27 12:00 UTC: ~8.9 GiB used, ~6.8 GiB available) |
+| Tools | Python 3 `time.perf_counter` (hyperfine and GNU `time` **not installed**; `apt-get` lock not writable). `quota-bench` for socket / pace / serialize / start. |
 
-Release profile used (`Cargo.toml`): `lto = "thin"`, `codegen-units = 1`,
+Default release profile (`Cargo.toml`): `lto = "thin"`, `codegen-units = 1`,
 `strip = "debuginfo"`, `panic = "abort"`, `opt-level = "s"`.
 
-Command that produced the binaries: `cargo build --workspace --release`.
+Command that produced the product binaries: `cargo build --workspace --release`.
 
-## 1. Release binaries
+Optional size profile (not default): `[profile.dist]` inherits release with
+`lto = "fat"` and `strip = "symbols"`. Tradeoff: smaller on-disk binaries,
+longer compile, **no `.symtab`** (harder field debug). Default `release` is
+unchanged.
 
-`ls -lh --full-time` and `stat` after that build:
+---
+
+## 2026-09-27 re-measure (VERIFIED)
+
+Same class of host as the 2026-09-26 session (see historical tables below).
+Binaries include `quota-ctl` and the accounts/refresh protocol.
+
+### 1. Release binaries (VERIFIED)
+
+`ls -lh --full-time` / `stat` after `cargo build --workspace --release`
+(2026-09-27 11:59 UTC):
+
+| path | bytes | `ls -lh` | mtime (UTC) |
+|------|------:|----------|-------------|
+| `target/release/quota` | 1 052 112 | 1.1M | 2026-09-27 11:59:05 |
+| `target/release/quotad` | 2 258 448 | 2.2M | 2026-09-27 11:59:07 |
+| `target/release/quota-ctl` | 1 158 704 | 1.2M | 2026-09-27 11:59:06 |
+
+`file`: ELF 64-bit LSB pie, x86-64, dynamically linked, **not stripped**
+(`file` wording). `readelf -S`: **no** `.debug*` sections; **all three have
+`.symtab`**. Matches `strip = "debuginfo"`.
+
+`sha256sum`:
+
+```
+1321131a66fcea925e997083dbd0b235938f0f7bb2858df813d27b9391d0263a  target/release/quota
+1bf54fd5b1a623ee2ecd6def1da2967baf2f63c7455d6278c8b27691e053eba5  target/release/quotad
+459b3a1741ad8556585f9ebcfbc4834edef417a5cb31a0adfdaaff1b43d5f176  target/release/quota-ctl
+```
+
+`ldd` (quota and quotad): `linux-vdso`, `libgcc_s.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2`. rustls/ring statically linked.
+
+Harness `target/release/quota-bench`: 737 432 bytes (not a product binary).
+
+### 1b. Optional `dist` size pass (VERIFIED)
+
+`cargo build --workspace --profile dist --bins` (19.17 s compile on this
+host). `file` says **stripped** (no `.symtab`).
+
+| path | bytes | vs default release |
+|------|------:|--------------------|
+| `target/dist/quota` | 776 616 | −275 496 (−26%) |
+| `target/dist/quotad` | 1 686 096 | −572 352 (−25%) |
+| `target/dist/quota-ctl` | 780 712 | −377 992 (−33%) |
+
+**Not measured:** `x86_64-unknown-linux-musl` (target not installed). Do not
+invent a musl size.
+
+### 2. Startup (`quota` / `quota-ctl` process spawn + one RPC) (VERIFIED)
+
+`quotad` already running on `/tmp/quota-bench.sock`. Each sample is a new
+process: exec, connect, one framed RPC, print, exit.
+
+No hyperfine. Python `time.perf_counter` around `subprocess.run` (no shell),
+warmup 5, **80** runs (40 for `quota-ctl`). Page cache **warm**.
+
+| command | n | mean ± std | min | max | p50 | p95 | p99 |
+|---------|--:|------------|-----|-----|-----|-----|-----|
+| `quota --socket … version` | 80 | 628.5 ± 137.3 µs | 488.8 µs | 1063.2 µs | 579.8 µs | 907.5 µs | 1038.1 µs |
+| `quota --socket … ping` | 80 | 576.2 ± 114.6 µs | 476.1 µs | 821.9 µs | 513.8 µs | 762.7 µs | 777.1 µs |
+| `quota-ctl --socket … ping` | 40 | 618.5 ± 113.5 µs | 499.3 µs | 807.7 µs | 553.7 µs | 788.2 µs | 807.7 µs |
+
+Percentiles: nearest-rank on the sorted `perf_counter` samples.
+
+`/proc/sys/vm/drop_caches` is **Permission denied** on this VM. No new
+cold-page-fault distribution.
+
+### 3. Socket RTT (persistent connection) (VERIFIED)
+
+```
+./target/release/quota-bench --socket /tmp/quota-bench.sock --warmup 100 --iters 1000
+```
+
+| method | n | mean | stddev | min | max | p50 | p95 | p99 |
+|--------|--:|------|--------|-----|-----|-----|-----|-----|
+| `ping` | 1000 | 9.6 µs | 1.9 µs | 7.5 µs | 36.4 µs | 9.1 µs | 11.8 µs | 14.7 µs |
+| `status` | 1000 | 20.9 µs | 6.9 µs | 17.6 µs | 233.2 µs | 20.6 µs | 20.9 µs | 23.1 µs |
+
+`status` payload: two `unavailable` providers. This is **not** CLI spawn
+time (that is §2).
+
+### 4. RSS (VERIFIED)
+
+`quotad run --socket /tmp/quota-bench.sock`. First probe completed (both
+providers `unavailable`). After a successful `quota ping`:
+
+| metric | value | source |
+|--------|------:|--------|
+| VmRSS | 3224 kB | `/proc/<pid>/status` |
+| RssAnon | 260 kB | same |
+| RssFile | 2964 kB | same |
+| Threads | 2 | same |
+| PSS | 1530 kB | `/proc/<pid>/smaps_rollup` |
+| USS (`Private_Clean` + `Private_Dirty`) | 1456 kB | 0 + 1456 kB |
+
+`ps -o rss` agreed: **3224**. Unchanged after `quota-ctl ping` /
+`accounts list` / `refresh` (still 3224 / 260 / 2964 / 2 threads).
+
+#### CLI one-shot RSS (VERIFIED, `/proc` poll)
+
+GNU `time -v` is not installed. Polled `/proc/<pid>/status` `VmHWM` while
+the child ran (20 samples, warm cache):
+
+| command | observed VmHWM (kB) |
+|---------|---------------------|
+| `quota version` | 2532–2664 (first five: 2664, 2656, 2592, 2656, 2564) |
+| `quota status` | 2472–2620 (first five: 2620, 2492, 2544, 2596, 2472) |
+| `quota-ctl ping` | 2516–2664 (first five: 2652, 2664, 2664, 2516, 2616) |
+
+`os.wait4` `ru_maxrss` on the same children reported ~13824 kB — **not**
+used here; it does not match `/proc` VmHWM / the 2026-09-26 GNU `time`
+method.
+
+### 5. Fixture-driven pace math (VERIFIED)
+
+Offline. No HTTP. 1912-row `fixtures/codexbar/usage-history.redacted.jsonl`.
+
+```
+./target/release/quota-bench pace --iters 200
+```
+
+| | |
+|--|--|
+| rows | 1912 |
+| first `pace_for` | 26 378 ns |
+| last-row burn | 12.9865 %/h |
+| history samples used | 1912 |
+| 200-iter mean | 5.9 µs (std 1.1, min 5.8, max 20.9, p50 5.8, p95 5.9, p99 6.1) |
+| throughput | 169 091 `pace_for` / s |
+
+Honest result: percent-only window. `can_start --tokens 50000` stays
+`basis: percent_only` (see adapter tests). This is **not** a token budget.
+
+### 6. Ring-buffer / status serialization (VERIFIED)
+
+```
+./target/release/quota-bench serialize --iters 200 --ring 128
+```
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `status_serialize` (JSON + length prefix of latest snapshot) | 200 | 0.8 µs | 0.7 µs | 0.7 µs | 10.1 µs | 0.7 µs | 0.8 µs | 1.3 µs |
+| `ring_replay_1912` (push 1912 snaps through a 128-cap `Vec`) | 200 | 199.4 µs | 4.7 µs | 196.0 µs | 232.0 µs | 198.3 µs | 206.4 µs | 224.8 µs |
+
+### 7. Many watch/status clients (VERIFIED)
+
+Daemon up. Eight threads, each 200 `status` RPCs on its own `UnixStream`,
+plus one `watch` subscribe (first frame 601 bytes, `ok`).
+
+```
+./target/release/quota-bench watch --socket /tmp/quota-bench.sock --clients 8 --iters 200
+```
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `status_clients_8` | 1600 | 59.3 µs | 19.8 µs | 20.1 µs | 519.4 µs | 58.3 µs | 61.7 µs | 72.2 µs |
+
+Tokio `current_thread` serializes accept/RPC; eight concurrent clients
+raise per-RPC latency vs the single-connection §3 `status` (~21 µs).
+
+### 8. Cold process start vs warm ping (VERIFIED)
+
+```
+./target/release/quota-bench start --quotad ./target/release/quotad --socket /tmp/quota-start.sock --runs 8
+```
+
+Each run: spawn `quotad`, time until `ping` succeeds, then one extra ping
+on the live daemon, then kill. Binaries already in page cache after the
+release build. First probe is local FS misses only.
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `daemon_start_to_ping` (process + bind + first probe + ping) | 8 | 5346 µs | 110 µs | 5173 µs | 5518 µs | 5372 µs | 5518 µs | 5518 µs |
+| `daemon_warm_ping` (daemon already up, new connect) | 8 | 131 µs | 118 µs | 34 µs | 285 µs | 44 µs | 285 µs | 285 µs |
+
+No disk-cache drop (permission denied). These are **warm-binary, cold-process**
+starts, not a machine-cold boot.
+
+### 9. Adaptive refresh (from code, not timed)
+
+Unchanged defaults (`quota-core`):
+
+| knob | default | clamp |
+|------|--------:|-------|
+| `refresh_min_secs` | 30 | 5 … 3600 |
+| `refresh_max_secs` | 300 | ≥ min … 86400 |
+| `http_timeout_secs` | 10 | (HTTPS timeout; **not exercised** here) |
+| ring capacity | 128 | 8 … 4096 |
+
+On this host both adapters were unavailable, so after the first refresh the
+code would set `30 * 2 = 60` seconds. That backoff was **not** stopwatch-timed.
+
+---
+
+## Historical: 2026-09-26 (kept)
+
+The tables that shipped with the first BENCHMARKS pass. Same machine class.
+Product binaries then: `quota` 1 051 768 B, `quotad` 2 195 312 B (no
+`quota-ctl`). Replaced for day-to-day numbers by the 2026-09-27 section;
+kept so the original CLI-spawn / RTT / RSS write-up is not deleted.
+
+### Release binaries (2026-09-26)
 
 | path | bytes | `ls -lh` | mtime (UTC) |
 |------|------:|----------|-------------|
 | `target/release/quota` | 1 051 768 | 1.1M | 2026-09-26 17:20:26 |
 | `target/release/quotad` | 2 195 312 | 2.1M | 2026-09-26 17:20:48 |
 
-`file`:
+`sha256sum` then:
+`061470e92c531d355c248b703328090ca34381df01c0ae8e2de5c6ccb4899273` (`quota`),
+`a49420c32c8d5b31d8e1a6c25e72405c89e1028c544bda44a0cf35209e19912c` (`quotad`).
 
-```
-target/release/quota:  ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=5719bb99959518301990bd459f28d8390045a478, for GNU/Linux 3.2.0, not stripped
-target/release/quotad: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=79d476263fbba6dbbbe492302160ee6c5a741a09, for GNU/Linux 3.2.0, not stripped
-```
-
-Strip status (matches `strip = "debuginfo"`):
-
-- `readelf -S`: **no** `.debug*` sections on either binary
-- `readelf -S`: **both have `.symtab`** — `file` therefore says `not stripped`
-- this is **not** a full `strip` (`strip = true` / `strip -s`)
-
-`sha256sum`:
-
-```
-061470e92c531d355c248b703328090ca34381df01c0ae8e2de5c6ccb4899273  target/release/quota
-a49420c32c8d5b31d8e1a6c25e72405c89e1028c544bda44a0cf35209e19912c  target/release/quotad
-```
-
-`ldd` (both): `linux-vdso`, `libgcc_s.so.1`, `libc.so.6`, `ld-linux-x86-64.so.2`.
-No extra TLS/HTTP shared libs — rustls and ring are statically linked.
-
-The RTT harness `target/release/quota-bench` is **not** a product binary
-(546 816 bytes, also `not stripped` / no `.debug*`). It lives in
-`crates/quota-bench`.
-
-## 2. Startup (`quota` process spawn + one RPC)
-
-`quotad` was already running on `/tmp/quota-bench.sock` (see §4). Each sample
-is a new `quota` process: exec, connect, one framed RPC, print, exit.
-
-`hyperfine` warned that sub-5 ms commands are noisy if the shell is included.
-Primary numbers use **`hyperfine -N` (`--shell=none`)**, warmup 5, **80** runs.
+### CLI spawn via hyperfine `-N` (2026-09-26)
 
 | command | n | mean ± std | min | max | p50 | p95 | p99 |
 |---------|--:|------------|-----|-----|-----|-----|-----|
 | `quota --socket … version` | 80 | 613.5 ± 123.8 µs | 490.9 µs | 931.2 µs | 545.2 µs | 835.8 µs | 905.1 µs |
 | `quota --socket … ping` | 80 | 635.3 ± 132.6 µs | 483.4 µs | 954.0 µs | 584.6 µs | 878.2 µs | 948.5 µs |
 
-Percentiles are nearest-rank on hyperfine’s `times` array.
+One `drop_caches` sample then: `major_faults=6`, Python wall 0.003913 s.
+Not repeatable here (no drop_caches permission).
 
-Page cache was **warm** for those 80-run series (`Major page faults: 0` on a
-follow-up `/usr/bin/time -v` of `quota version`).
-
-### One page-cache-drop sample (not a distribution)
-
-`sync` + `echo 3 > /proc/sys/vm/drop_caches`, then one `quota version`:
-
-| source | what |
-|--------|------|
-| `/usr/bin/time -f` | `elapsed_sec=0.00` (centisecond resolution), `major_faults=6`, `minor_faults=110`, `max_rss_kb=2500` |
-| `time.perf_counter` around `subprocess.run` (a second drop) | `wall_sec=0.003913`, child `majflt=6` |
-
-That is **one** cold-ish exec, not a mean.
-
-## 3. Socket RTT (persistent connection)
-
-Harness: `crates/quota-bench` — one `UnixStream`, length-prefixed JSON, same
-decode path as the CLI (`write_frame` / `read_frame` / `serde_json`). Timer is
-`std::time::Instant` around write + read + JSON parse of the response.
-**100 warmup + 1000 measured** RPCs per method. Percentiles: nearest-rank on
-sorted nanosecond samples, printed as microseconds.
-
-```
-./target/release/quota-bench --socket /tmp/quota-bench.sock --warmup 100 --iters 1000
-```
+### Socket RTT (2026-09-26)
 
 | method | n | mean | stddev | p50 | p95 | p99 |
 |--------|--:|------|--------|-----|-----|-----|
 | `ping` | 1000 | 11.7 µs | 5.7 µs | 11.9 µs | 15.5 µs | 16.2 µs |
 | `status` | 1000 | 20.9 µs | 1.1 µs | 20.6 µs | 24.1 µs | 25.0 µs |
 
-`status` is larger because the payload includes the current snapshot (two
-`unavailable` providers on this host). This is **not** CLI process-spawn time
-(that is §2).
+### RSS (2026-09-26)
 
-## 4. RSS
+Idle after first ping: VmRSS **3156** kB, RssAnon 240, RssFile 2916,
+Threads 2, PSS 1452, USS 1384. After RTT harness: VmRSS 3360 kB.
+GNU `time -v`: `quota version` 2576 kB, `quota status` 2660 kB.
 
-`quotad run --socket /tmp/quota-bench.sock`. First probe completed (both
-providers `unavailable`). Process `S (sleeping)`.
+---
 
-**Idle, ~0.5 s after first successful `quota ping`:**
-
-| metric | value | source |
-|--------|------:|--------|
-| VmRSS | 3156 kB | `/proc/<pid>/status` |
-| RssAnon | 240 kB | same |
-| RssFile | 2916 kB | same |
-| Threads | 2 | same (Tokio current-thread + a leftover blocking-pool thread after the first `spawn_blocking` probe) |
-| PSS | 1452 kB | `/proc/<pid>/smaps_rollup` |
-| USS (`Private_Clean` + `Private_Dirty`) | 1384 kB | 1144 + 240 kB |
-
-`ps -o rss` agreed: **3156**.
-
-**After the RTT harness (still idle, no extra providers):**
-
-| metric | value |
-|--------|------:|
-| VmRSS | 3360 kB |
-| RssAnon | 252 kB |
-| RssFile | 3108 kB |
-| Threads | 1 |
-| PSS | 1475 kB |
-| USS | 1396 kB (1144 + 252) |
-
-### `quota` one-shot (GNU `time -v`, warm cache)
-
-| command | Maximum resident set size |
-|---------|---------------------------|
-| `quota version` | 2576 kB |
-| `quota status` | 2660 kB |
-
-`Elapsed (wall clock)` printed `0:00.00` — timer quantum is too coarse for
-sub-10 ms; use §2 for client latency.
-
-## 5. Adaptive refresh (from code, not timed)
-
-Defaults in `quota-core` (`DEFAULT_REFRESH_MIN_SECS` / `DEFAULT_REFRESH_MAX_SECS`
-and `Config::refresh_*` clamps):
-
-| knob | default | clamp |
-|------|--------:|-------|
-| `refresh_min_secs` | 30 | 5 … 3600 |
-| `refresh_max_secs` | 300 | ≥ min … 86400 |
-| `http_timeout_secs` | 10 | (used as the HTTPS client timeout; **not exercised** here) |
-| ring capacity | 128 | 8 … 4096 |
-
-Daemon behavior (`quotad/src/daemon.rs`, `refresh`):
-
-- starts at `refresh_min_secs()` (**30 s**)
-- HTTP **429** (`error.code == "rate_limited"`) → jump to **max** (300 s)
-- no provider `ok` → `interval * 2`, clamped to [min, max]
-- usage **changed** → back to **min** (30 s)
-- usage **stable** → `interval * 3/2`, clamped to [min, max]
-
-On this host both adapters were unavailable, so after the first refresh the
-code would set `30 * 2 = 60` seconds. That backoff was **not** stopwatch-timed.
-
-Probe work here was local filesystem misses only. **No** live adapter RTT.
-
-## 6. How to reproduce
+## How to reproduce
 
 ```bash
 cargo build --workspace --release
-file target/release/quota target/release/quotad
-ls -lh target/release/quota target/release/quotad
+file target/release/quota target/release/quotad target/release/quota-ctl
+ls -lh target/release/quota target/release/quotad target/release/quota-ctl
+
+./target/release/quota-bench pace --iters 200
+./target/release/quota-bench serialize --iters 200 --ring 128
 
 SOCK=/tmp/quota-bench.sock
 ./target/release/quotad run --socket "$SOCK" &
 # wait until `quota --socket "$SOCK" ping` succeeds
 
-hyperfine -N --warmup 5 --runs 80 -- \
-  "./target/release/quota --socket $SOCK version"
-hyperfine -N --warmup 5 --runs 80 -- \
-  "./target/release/quota --socket $SOCK ping"
-
 ./target/release/quota-bench --socket "$SOCK" --warmup 100 --iters 1000
+./target/release/quota-bench watch --socket "$SOCK" --clients 8 --iters 200
+./target/release/quota-bench start --quotad ./target/release/quotad --socket /tmp/quota-start.sock --runs 8
+
+# optional size pass (does not change default release)
+cargo build --workspace --profile dist --bins
 
 # RSS
-PID=$(pidof quotad)   # or the background PID
+PID=$(pidof quotad)
 grep -E '^(VmRSS|RssAnon|RssFile|Threads)' /proc/$PID/status
 cat /proc/$PID/smaps_rollup
 ```
