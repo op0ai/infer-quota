@@ -788,6 +788,7 @@ mod tests {
             ] {
                 assert!(!text.contains(needle), "{name} must not contain {needle}");
             }
+            // Keys may exist if the value is an explicit redaction marker.
             for (key, ok) in [
                 ("\"authFingerprint\"", "<redacted"),
                 ("\"managedHomePath\"", "<redacted"),
