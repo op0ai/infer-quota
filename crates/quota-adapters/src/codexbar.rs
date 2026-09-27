@@ -769,8 +769,33 @@ mod tests {
         assert!(encoded.contains("\"used_percent\":59"));
     }
 
+    fn assert_sensitive_values_redacted(v: &serde_json::Value, name: &str) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    if matches!(k.as_str(), "authFingerprint" | "managedHomePath") {
+                        let s = child.as_str().unwrap_or("");
+                        assert!(
+                            s.contains("<redacted") || s.to_ascii_lowercase().starts_with("sha256"),
+                            "{name} {k}={s:?} must be a redaction/hash, not a live value"
+                        );
+                    }
+                    assert_sensitive_values_redacted(child, name);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_sensitive_values_redacted(item, name);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
     fn fixture_pack_has_no_live_credentials() {
+        // Field *names* such as authFingerprint may appear in redacted
+        // fixtures and notes. Only live-looking *values* fail the test.
         for name in [
             "CURRENT-SNAPSHOT.expect.json",
             "codex-account-snapshots.redacted.json",
@@ -788,17 +813,18 @@ mod tests {
             ] {
                 assert!(!text.contains(needle), "{name} must not contain {needle}");
             }
-            // Keys may exist if the value is an explicit redaction marker.
-            for (key, ok) in [
-                ("\"authFingerprint\"", "<redacted"),
-                ("\"managedHomePath\"", "<redacted"),
-            ] {
-                if text.contains(key) {
-                    assert!(
-                        text.contains(ok),
-                        "{name} has {key} without a redaction marker"
-                    );
+            if name.ends_with(".jsonl") {
+                for (i, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let v: serde_json::Value =
+                        serde_json::from_str(line).unwrap_or_else(|e| panic!("{name}:{i}: {e}"));
+                    assert_sensitive_values_redacted(&v, name);
                 }
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_sensitive_values_redacted(&v, name);
             }
         }
     }

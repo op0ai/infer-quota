@@ -11,7 +11,7 @@ From the repo root (Rust 1.83+):
 ```bash
 ./install.sh                 # ~/.local/bin/{quotad,quota,quota-ctl}
 # or lean (no control plane / OpenBao client):
-./install.sh --minimal
+./install.sh --minimal       # also removes leftover quota-ctl from the prefix
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

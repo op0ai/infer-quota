@@ -3,7 +3,7 @@
 #
 # Smallest honest path:
 #   ./install.sh                 # cargo build --release, copy into ~/.local/bin
-#   ./install.sh --minimal       # quotad + quota only (no OpenBao / ctl)
+#   ./install.sh --minimal       # quotad + quota only; removes leftover quota-ctl
 #   ./install.sh --prefix DIR    # install into DIR/bin
 #   ./install.sh --from-release  # fetch a GitHub release if one exists; else build
 #
@@ -147,7 +147,8 @@ fi
 copy_bins
 
 if [ "$MINIMAL" -eq 1 ] && [ -e "${BINDIR}/quota-ctl" ]; then
-  echo "install.sh: --minimal left an existing ${BINDIR}/quota-ctl in place" >&2
+  rm -f "${BINDIR}/quota-ctl"
+  echo "install.sh: removed leftover ${BINDIR}/quota-ctl (--minimal)"
 fi
 
 echo
