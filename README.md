@@ -16,6 +16,11 @@ should speak the same Unix socket — not scrape providers again.
 | Origin (working forge) | https://origin.cursor.com/op0/infer-quota |
 | GitHub (public mirror) | https://github.com/op0ai/infer-quota |
 
+Share page: [docs/site/index.html](docs/site/index.html). GitHub Pages from
+`main` and the `/docs` folder publishes
+<https://op0ai.github.io/infer-quota/site/>. Place the social image at
+`docs/site/assets/og.png`.
+
 This is **not** [CodexBar](https://github.com/steipete/CodexBar). CodexBar is a
 full menu-bar product with many providers, cookies, widgets, and UI.
 `quota` is the small rust-native core: reuse sessions, publish numbers, do the

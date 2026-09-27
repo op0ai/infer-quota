@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>infer-quota</title>
+  <meta name="description" content="A tiny Rust daemon and CLI that tracks Codex and Claude Code inference quota from existing logins, over a Unix socket.">
+  <meta name="theme-color" content="#16181c">
+  <link rel="canonical" href="https://op0ai.github.io/infer-quota/site/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2316181c'/%3E%3Crect x='8' y='15' width='16' height='2' fill='%238fd6ea'/%3E%3C/svg%3E">
+  <!--
+    Social image, when chosen: docs/site/assets/og.png
+    Tags below already point at that file on GitHub Pages
+    (main branch, /docs folder): https://op0ai.github.io/infer-quota/site/assets/og.png
+  -->
+  <meta property="og:title" content="infer-quota">
+  <meta property="og:description" content="A tiny Rust daemon and CLI that tracks Codex and Claude Code inference quota from existing logins, over a Unix socket.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://op0ai.github.io/infer-quota/site/">
+  <meta property="og:image" content="https://op0ai.github.io/infer-quota/site/assets/og.png">
+  <meta property="og:image:alt" content="infer-quota. A tiny Rust daemon and CLI for Codex and Claude Code quota, over a Unix socket.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="infer-quota">
+  <meta name="twitter:description" content="A tiny Rust daemon and CLI that tracks Codex and Claude Code inference quota from existing logins, over a Unix socket.">
+  <meta name="twitter:image" content="https://op0ai.github.io/infer-quota/site/assets/og.png">
+  <meta name="twitter:image:alt" content="infer-quota. A tiny Rust daemon and CLI for Codex and Claude Code quota, over a Unix socket.">
+  <style>
+    :root {
+      --bg: #16181c;
+      --fg: #f4f7f8;
+      --muted: #9fb0b6;
+      --line: color-mix(in srgb, #9fb0b6 28%, transparent);
+      --accent: #8fd6ea;
+      --measure: 38rem;
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      color-scheme: dark;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: "Source Sans 3", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 1.0625rem;
+      line-height: 1.55;
+      text-rendering: optimizeLegibility;
+    }
+
+    main {
+      width: min(var(--measure), 100%);
+      margin-inline: auto;
+      padding: clamp(3.5rem, 12vh, 7rem) clamp(1.25rem, 5vw, 2rem) clamp(2.75rem, 8vh, 4.5rem);
+    }
+
+    h1,
+    h2,
+    p,
+    dl,
+    dt,
+    dd {
+      margin: 0;
+    }
+
+    h1 {
+      max-width: 100%;
+      font-size: clamp(2.35rem, 8vw, 3.35rem);
+      font-weight: 500;
+      letter-spacing: -0.035em;
+      line-height: 1.02;
+    }
+
+    h1::after {
+      content: "";
+      display: block;
+      width: 2.25rem;
+      height: 2px;
+      margin-top: 1.15rem;
+      background: var(--accent);
+    }
+
+    .lede {
+      margin-top: 1.5rem;
+      max-width: 34rem;
+      font-size: 1.175rem;
+      line-height: 1.45;
+    }
+
+    section {
+      margin-top: clamp(2.5rem, 6vh, 3.5rem);
+    }
+
+    h2 {
+      margin-bottom: 0.9rem;
+      color: var(--muted);
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+
+    .pieces {
+      display: grid;
+      gap: 1.15rem;
+    }
+
+    .piece {
+      display: grid;
+      gap: 0.15rem;
+    }
+
+    dt {
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    dd {
+      color: var(--muted);
+    }
+
+    footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem 1.35rem;
+      margin-top: clamp(2.75rem, 7vh, 4rem);
+      padding-top: 1.15rem;
+      border-top: 1px solid var(--line);
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration-thickness: 1px;
+      text-decoration-color: color-mix(in srgb, var(--accent) 50%, transparent);
+      text-underline-offset: 0.18em;
+    }
+
+    a:hover {
+      color: var(--fg);
+      text-decoration-color: var(--fg);
+    }
+
+    a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: 2px;
+    }
+
+    footer a {
+      padding-block: 0.35rem;
+    }
+
+    ::selection {
+      background: var(--accent);
+      color: var(--bg);
+    }
+
+    @media (min-width: 40rem) {
+      .piece {
+        grid-template-columns: 8.5rem 1fr;
+        column-gap: 1.25rem;
+        align-items: baseline;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>infer-quota</h1>
+    <p class="lede">A tiny Rust daemon and CLI that tracks Codex and Claude Code inference quota from existing logins, over a Unix socket.</p>
+
+    <section aria-labelledby="pieces">
+      <h2 id="pieces">Pieces</h2>
+      <dl class="pieces">
+        <div class="piece">
+          <dt>quotad</dt>
+          <dd>Collector.</dd>
+        </div>
+        <div class="piece">
+          <dt>quota</dt>
+          <dd>Read CLI.</dd>
+        </div>
+        <div class="piece">
+          <dt>quota-ctl</dt>
+          <dd>Accounts and refresh. It does not collect usage.</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section aria-labelledby="why">
+      <h2 id="why">Why</h2>
+      <p>A composable counterpart to <a href="https://github.com/steipete/CodexBar">CodexBar</a>. No menu bar is required. Other tools can use the same socket.</p>
+    </section>
+
+    <section aria-labelledby="honesty">
+      <h2 id="honesty">Honesty</h2>
+      <p>It would rather say unavailable than invent remaining tokens. It reuses existing Codex and Claude Code logins, and it never writes credential files.</p>
+    </section>
+
+    <footer>
+      <a href="https://github.com/op0ai/infer-quota">GitHub</a>
+      <a href="https://github.com/op0ai/infer-quota/blob/main/LICENSE">MIT</a>
+      <a href="https://github.com/op0ai/infer-quota#build--run">Install and build</a>
+    </footer>
+  </main>
+</body>
+</html>
