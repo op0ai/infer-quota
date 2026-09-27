@@ -49,8 +49,8 @@ quota-ctl secret put codex/work --from-env QUOTA_PUT
 
 These commands use the `quota-secrets` chain in-process. They are not socket methods.
 
-- `secret backends` prints chain names. `keychain` and `file` are always listed. `openbao` is listed when `QUOTA_OPENBAO_ADDR` is set. Values are not printed.
-- `secret get PATH` prints `backend=`, `path=`, and `present=true`. Exit `2` when the path is missing.
+- `secret backends` prints chain names. `keychain` and `file` are always listed. `openbao` is included only when both `QUOTA_OPENBAO_ADDR` and `QUOTA_OPENBAO_TOKEN` are set and non-empty. Address alone, or an empty token, is a config error: the command exits `1` and does not print a partial list. Values are not printed.
+- `secret get PATH` prints `backend=`, `path=`, and `present=true` on a hit (exit `0`). A miss prints `secret not found` and exits `2`. An OpenBao HTTP status other than 404 or 2xx is `Unavailable`: the chain continues, and if no later backend has the path the command still exits `2`. A TCP connect failure is `Io` and exits `1` before later backends run.
 - `secret put PATH --from-env VAR` reads `VAR`. Empty and unset values are refused. The stored value is not printed.
 
-Exit `1` is a transport, RPC, or local error. Exit `0` is success.
+Exit `1` is also a transport or RPC error on the socket commands, and a local error that the secrets chain returns (config, I/O, parse). Exit `0` is success.

@@ -74,22 +74,25 @@ Requires Rust 1.83+ (stable).
 
 ```bash
 cargo build --release
-# binaries: target/release/quotad  target/release/quota  target/release/quota-ctl
+# fresh checkout, not on PATH:
+#   ./target/release/quotad
+#   ./target/release/quota
+#   ./target/release/quota-ctl
 
-quotad run                          # foreground; optional --socket PATH
-quota status
-quota status --json --provider codex
-quota pace --provider claude
-quota can-start --tokens 50000
-quota watch
-quota ping
-quota version
+./target/release/quotad run         # foreground; optional --socket PATH
+./target/release/quota status
+./target/release/quota status --json --provider codex
+./target/release/quota pace --provider claude
+./target/release/quota can-start --tokens 50000
+./target/release/quota watch
+./target/release/quota ping
+./target/release/quota version
 
-quota-ctl ping
-quota-ctl accounts add --provider codex --email you@example.com --select
-quota-ctl accounts list
-quota-ctl refresh
-quota-ctl accounts remove --id acct_you_example_com
+./target/release/quota-ctl ping
+./target/release/quota-ctl accounts add --provider codex --email you@example.com --select
+./target/release/quota-ctl accounts list
+./target/release/quota-ctl refresh
+./target/release/quota-ctl accounts remove --id acct_you_example_com
 ```
 
 `cargo test --workspace` is offline: adapters use in-memory HTTP mocks;
@@ -101,15 +104,19 @@ CodexBar tests read `fixtures/codexbar/` only. OpenBao is not required.
 docker compose -f docker-compose.dev.yml up -d
 export QUOTA_OPENBAO_ADDR=http://127.0.0.1:8200
 export QUOTA_OPENBAO_TOKEN=dev-only-not-for-prod
-quota-ctl secret backends
+./target/release/quota-ctl secret backends
 ```
+
+Both variables are required. Address without a non-empty token is a config error, not a chain that omits OpenBao.
 
 Dev-only. Not a production vault. Details: [docs/SECRETS.md](docs/SECRETS.md).
 
 ### Socket path
 
+`--socket` is on `quotad`, `quota`, and `quota-ctl`. `--config` is on `quotad` only.
+
 1. `--socket`
-2. `socket` in the config file (`--config`, else `$XDG_CONFIG_HOME/quota/config.json`, else `~/.config/quota/config.json`)
+2. `socket` in the config file `quotad` loaded (`--config PATH`, else the default file). Clients read only the default file: `$XDG_CONFIG_HOME/quota/config.json`, else `~/.config/quota/config.json`
 3. `QUOTA_SOCKET`
 4. `$XDG_RUNTIME_DIR/quota/quota.sock`
 5. `~/.local/share/quota/quota.sock`
@@ -131,8 +138,10 @@ Protocol: **4-byte little-endian length + compact JSON**. Methods: `status`,
 | `quota-ctl refresh` | Immediate probe |
 | `quota-ctl secret backends\|get\|put` | Local secrets chain |
 
-Exit codes: `0` ok; `1` transport/RPC error; `2` `can-start` overall `no`
-(or secret not found).
+Exit codes: `0` ok; `1` transport, RPC, or secrets-chain error (OpenBao
+connect failure, or address set without a token); `2` `can-start` overall
+`no`, or `secret get` when nothing is found. An OpenBao HTTP status other
+than 404 or 2xx is treated as a miss when no later backend has the path.
 
 `can-start` cannot honestly convert `--tokens` to a percent-only window
 (Codex `/wham/usage` and Claude `/api/oauth/usage` typically publish

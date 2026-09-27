@@ -36,6 +36,10 @@ quota-ctl secret put codex/work --from-env QUOTA_PUT
 quota-ctl secret get codex/work    # prints backend= and present=true only
 ```
 
+OpenBao joins the chain only when `QUOTA_OPENBAO_ADDR` and
+`QUOTA_OPENBAO_TOKEN` are both set and non-empty. Address without a token
+is a config error on `secret backends`, `secret get`, and `secret put`.
+
 The compose file starts **dev** OpenBao with a well-known root token. That
 token is not a secret; do not reuse it anywhere else. The HTTP client in
 `quota-secrets` is **plain HTTP** (no rustls). For TLS, put a proxy in front

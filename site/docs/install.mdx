@@ -13,35 +13,37 @@ cd infer-quota
 cargo build --release
 ```
 
-Binaries:
+`cargo build --release` writes the binaries next to the workspace. Their names come from the crate packages (`quotad`, `quota`) and the `quota-ctl` `[[bin]]` name. A fresh checkout does not put them on `PATH`.
 
 ```text
-target/release/quotad
-target/release/quota
-target/release/quota-ctl
+./target/release/quotad
+./target/release/quota
+./target/release/quota-ctl
 ```
 
 ## Quickstart
 
+Run these from the repository root, after the release build.
+
 In one terminal:
 
 ```bash
-quotad run
+./target/release/quotad run
 ```
 
-`quotad` with no subcommand does the same thing. In another:
+`./target/release/quotad` with no subcommand does the same thing. In another:
 
 ```bash
-quota ping
-quota status
-quota status --json --provider codex
-quota pace --provider claude
-quota can-start --tokens 50000
-quota watch
-quota version
+./target/release/quota ping
+./target/release/quota status
+./target/release/quota status --json --provider codex
+./target/release/quota pace --provider claude
+./target/release/quota can-start --tokens 50000
+./target/release/quota watch
+./target/release/quota version
 ```
 
-`quota ping` prints `pong` when the daemon is listening. If the client cannot connect, it prints the socket path and `quotad run --socket …`.
+`quota ping` prints `pong` when the daemon is listening. If the client cannot connect, it prints the socket path and the hint `quotad run --socket …` (that text uses the bare name). On this checkout the daemon binary is `./target/release/quotad`.
 
 `cargo test --workspace` stays offline. Adapter tests use in-memory HTTP mocks and `fixtures/codexbar/`. OpenBao is optional and is not started by the test suite.
 
