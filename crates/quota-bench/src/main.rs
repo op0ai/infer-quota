@@ -16,7 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use quota_adapters::codexbar::{history_to_snapshots, load_history_jsonl, workspace_fixtures_dir};
+use quota_adapters::codexbar::{
+    history_to_snapshots, load_history_jsonl, load_history_jsonl_tail, workspace_fixtures_dir,
+};
 use quota_core::framing::{encode_frame, read_frame, write_frame};
 use quota_core::math::pace_for;
 use quota_core::protocol::{
@@ -314,6 +316,23 @@ fn stop_child(mut child: Child) {
     let _ = child.wait();
 }
 
+fn bench_jsonl(history: &Path, iters: usize, cap: usize) {
+    let mut full = Vec::with_capacity(iters);
+    let mut tail = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let rows = load_history_jsonl(history).expect("full jsonl");
+        assert_eq!(rows.len(), 1912);
+        full.push(t0.elapsed().as_nanos() as u64);
+        let t1 = Instant::now();
+        let rows = load_history_jsonl_tail(history, cap).expect("tail jsonl");
+        assert_eq!(rows.len(), cap);
+        tail.push(t1.elapsed().as_nanos() as u64);
+    }
+    print_row("jsonl_full_1912", full);
+    print_row(&format!("jsonl_tail_{cap}"), tail);
+}
+
 fn bench_start(quotad: &Path, socket: &Path, runs: usize) {
     let mut cold = Vec::new();
     let mut warm = Vec::new();
@@ -347,7 +366,8 @@ fn usage() -> ! {
          quota-bench pace [--history PATH] [--iters N]\n\
          quota-bench serialize [--history PATH] [--iters N] [--ring N]\n\
          quota-bench watch --socket PATH [--clients N] [--iters N]\n\
-         quota-bench start --quotad PATH --socket PATH [--runs N]"
+         quota-bench start --quotad PATH --socket PATH [--runs N]\n\
+         quota-bench jsonl [--history PATH] [--iters N] [--ring N]"
     );
     std::process::exit(2);
 }
@@ -376,6 +396,13 @@ fn main() {
             let clients = parse_usize(&mut args, "--clients", 8);
             let iters = parse_usize(&mut args, "--iters", 200);
             bench_watch(&socket, clients, iters);
+        }
+        "jsonl" => {
+            args.next();
+            let history = parse_path(&mut args, "--history").unwrap_or_else(default_history);
+            let iters = parse_usize(&mut args, "--iters", 50);
+            let cap = parse_usize(&mut args, "--ring", 128);
+            bench_jsonl(&history, iters, cap);
         }
         "start" => {
             args.next();
