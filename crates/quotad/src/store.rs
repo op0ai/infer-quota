@@ -30,6 +30,11 @@ impl Store {
         if let Some(path) = &self.history_path {
             let _ = append_jsonl(path, &snap);
         }
+        self.push_memory(snap);
+    }
+
+    /// In-memory only (CodexBar history seed — do not copy into our JSONL).
+    pub fn push_memory(&mut self, snap: Snapshot) {
         if self.ring.len() == self.cap {
             self.ring.pop_front();
         }

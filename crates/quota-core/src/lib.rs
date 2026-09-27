@@ -16,13 +16,15 @@ pub mod protocol;
 pub mod rpc;
 pub mod timeutil;
 pub mod types;
+pub mod windows;
 
 pub use accounts::{AccountBook, AccountRecord, SecretRef};
 pub use config::Config;
 pub use framing::{decode_len, encode_frame, FrameError, MAX_FRAME_BYTES};
 pub use math::{burn_percent_per_sec, can_start, eta_empty_secs, select_samples};
 pub use paths::{
-    claude_config_dirs, codex_home, default_config_path, default_data_dir, default_socket_path,
+    claude_config_dirs, codex_home, codexbar_history_candidates, codexbar_snapshot_candidates,
+    default_codexbar_dir, default_config_path, default_data_dir, default_socket_path,
     default_state_dir, home_dir,
 };
 pub use protocol::{
@@ -35,4 +37,7 @@ pub use protocol::{
 pub use types::{
     AdapterError, Availability, CanStartAnswer, CanStartBasis, Credits, PaceReport, ProviderId,
     ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind, PACKAGE_VERSION,
+};
+pub use windows::{
+    classify_codex_window, FIVE_HOUR_MINUTES, FIVE_HOUR_SECS, WEEK_MINUTES, WEEK_SECS,
 };

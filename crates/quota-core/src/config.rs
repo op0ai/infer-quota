@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{default_config_path, default_socket_path, default_state_dir};
+use crate::paths::{
+    default_codexbar_dir, default_config_path, default_socket_path, default_state_dir,
+};
 
 /// Default in-memory snapshot ring size. 128 * ~1 KiB snapshots is a few hundred KiB.
 pub const DEFAULT_RING_CAPACITY: usize = 128;
@@ -40,6 +42,12 @@ pub struct Config {
     /// Override path for the account-metadata book (no secrets).
     #[serde(default)]
     pub accounts_path: Option<PathBuf>,
+    /// Read CodexBar on-disk snapshots/history when present (macOS path).
+    #[serde(default = "default_true")]
+    pub enable_codexbar_files: bool,
+    /// Override CodexBar support dir (`QUOTA_CODEXBAR_DIR` also works).
+    #[serde(default)]
+    pub codexbar_dir: Option<PathBuf>,
 }
 
 fn default_ring() -> usize {
@@ -71,6 +79,8 @@ impl Default for Config {
             enable_codex: true,
             enable_claude: true,
             accounts_path: None,
+            enable_codexbar_files: true,
+            codexbar_dir: None,
         }
     }
 }
@@ -132,6 +142,13 @@ impl Config {
         self.accounts_path
             .clone()
             .unwrap_or_else(|| default_state_dir().join("accounts.json"))
+    }
+
+    pub fn codexbar_dir(&self) -> PathBuf {
+        if let Some(p) = &self.codexbar_dir {
+            return p.clone();
+        }
+        default_codexbar_dir()
     }
 }
 

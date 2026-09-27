@@ -15,19 +15,32 @@ use std::path::{Path, PathBuf};
 
 use quota_core::types::{
     AdapterError, Availability, Credits, ProviderId, ProviderSnapshot, Source, UsageWindow,
-    WindowKind,
 };
 
+use crate::codexbar;
 use crate::creds::{load_codex_creds, parse_chatgpt_base_url, CodexCreds, CredsError};
 use crate::http::Transport;
 use crate::provider::{ProbeCtx, Provider};
 
 const DEFAULT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
-#[derive(Default)]
 pub struct CodexAdapter {
     /// When set, only this home is consulted (`CODEX_HOME` isolation).
     pub home: Option<PathBuf>,
+    /// CodexBar support dir. `None` → [`quota_core::default_codexbar_dir`].
+    pub codexbar_dir: Option<PathBuf>,
+    /// Read local CodexBar snapshot/history when the API is unavailable.
+    pub enable_codexbar_files: bool,
+}
+
+impl Default for CodexAdapter {
+    fn default() -> Self {
+        Self {
+            home: None,
+            codexbar_dir: None,
+            enable_codexbar_files: true,
+        }
+    }
 }
 
 impl Provider for CodexAdapter {
@@ -36,7 +49,7 @@ impl Provider for CodexAdapter {
     }
 
     fn probe(&self, ctx: &ProbeCtx<'_>) -> ProviderSnapshot {
-        match load_codex_creds(self.home.as_deref()) {
+        let api = match load_codex_creds(self.home.as_deref()) {
             Ok(creds) => fetch_usage(ctx.transport, &creds, self.home.as_deref()),
             Err(e) => {
                 let mut snap = ProviderSnapshot::unavailable(
@@ -47,7 +60,28 @@ impl Provider for CodexAdapter {
                 snap.credential_path = cred_path(&e);
                 snap
             }
+        };
+        if api.status == Availability::Ok || !self.enable_codexbar_files {
+            return api;
         }
+        match self.try_codexbar_file() {
+            Some(file) => file,
+            None => api,
+        }
+    }
+}
+
+impl CodexAdapter {
+    fn try_codexbar_file(&self) -> Option<ProviderSnapshot> {
+        let dir = self
+            .codexbar_dir
+            .clone()
+            .unwrap_or_else(quota_core::default_codexbar_dir);
+        let (snap, path) = codexbar::load_snapshot_from_dir(&dir)?;
+        let mut snap = snap;
+        snap.source = Some(Source::File);
+        snap.credential_path = Some(path.display().to_string());
+        Some(snap)
     }
 }
 
@@ -180,12 +214,10 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
     let rate = v.get("rate_limit");
     let mut windows = Vec::new();
     if let Some(rate) = rate {
-        if let Some(w) = map_codex_window(rate.get("primary_window"), WindowKind::Session, "5h") {
+        if let Some(w) = map_codex_window(rate.get("primary_window"), "primary") {
             windows.push(w);
         }
-        if let Some(w) =
-            map_codex_window(rate.get("secondary_window"), WindowKind::Weekly, "weekly")
-        {
+        if let Some(w) = map_codex_window(rate.get("secondary_window"), "secondary") {
             windows.push(w);
         }
         if let Some(extra) = rate
@@ -199,7 +231,8 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
                     .and_then(|x| x.as_str())
                     .unwrap_or("extra")
                     .to_string();
-                if let Some(w) = map_codex_window(Some(item), WindowKind::Extra, &label) {
+                if let Some(mut w) = map_codex_window(Some(item), "tertiary") {
+                    w.label = label;
                     windows.push(w);
                 }
             }
@@ -238,11 +271,7 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
     }
 }
 
-fn map_codex_window(
-    node: Option<&serde_json::Value>,
-    kind: WindowKind,
-    label: &str,
-) -> Option<UsageWindow> {
+fn map_codex_window(node: Option<&serde_json::Value>, slot: &str) -> Option<UsageWindow> {
     let node = node?;
     if node.is_null() {
         return None;
@@ -252,6 +281,9 @@ fn map_codex_window(
         .get("reset_at")
         .and_then(quota_core::timeutil::parse_reset_at);
     let limit_window_seconds = node.get("limit_window_seconds").and_then(|x| x.as_i64());
+    let minutes = node.get("window_minutes").and_then(|x| x.as_i64());
+    let (kind, label) =
+        quota_core::classify_codex_window(Some(slot), limit_window_seconds, minutes);
     Some(UsageWindow::from_percent(
         kind,
         label,
@@ -288,6 +320,7 @@ mod tests {
     use super::*;
     use crate::http::MockTransport;
     use crate::provider::ProbeCtx;
+    use quota_core::types::WindowKind;
     use std::path::Path;
 
     const FIXTURE: &str = r#"{
@@ -316,6 +349,10 @@ mod tests {
         assert_eq!(snap.windows.len(), 2);
         assert_eq!(snap.windows[0].used_percent, Some(27.0));
         assert_eq!(snap.windows[0].remaining_percent, Some(73.0));
+        assert_eq!(snap.windows[0].kind, WindowKind::Session);
+        assert_eq!(snap.windows[0].label, "5h");
+        assert_eq!(snap.windows[1].kind, WindowKind::Weekly);
+        assert_eq!(snap.windows[1].label, "weekly");
         assert_eq!(snap.windows[0].reset_at, Some(1_782_770_922));
         assert_eq!(snap.plan.as_deref(), Some("plus"));
         assert_eq!(snap.credits.as_ref().and_then(|c| c.balance), Some(0.0));
@@ -376,6 +413,8 @@ mod tests {
         let t = MockTransport::ok_json(200, FIXTURE);
         let adapter = CodexAdapter {
             home: Some(PathBuf::from("/no/such/codex-home-quota-test")),
+            enable_codexbar_files: false,
+            ..CodexAdapter::default()
         };
         let ctx = ProbeCtx {
             transport: &t,
@@ -384,5 +423,52 @@ mod tests {
         let snap = adapter.probe(&ctx);
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "no_credentials");
+    }
+
+    /// Live dogfood 2026-09-27: 7d window arrived in `primary_window`.
+    #[test]
+    fn weekly_primary_window_is_not_labeled_5h() {
+        let json = r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 59,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1759510689
+                },
+                "secondary_window": null
+            }
+        }"#;
+        let snap = parse_usage_http(200, json.as_bytes(), Path::new("/tmp/auth.json"));
+        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.plan.as_deref(), Some("pro"));
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(snap.windows[0].kind, WindowKind::Weekly);
+        assert_eq!(snap.windows[0].label, "weekly");
+        assert_eq!(snap.windows[0].used_percent, Some(59.0));
+        assert_eq!(snap.windows[0].remaining_percent, Some(41.0));
+        assert_eq!(snap.windows[0].limit_window_seconds, Some(604_800));
+        assert_ne!(snap.windows[0].kind, WindowKind::Session);
+        assert_ne!(snap.windows[0].label, "5h");
+    }
+
+    #[test]
+    fn file_fallback_when_api_unavailable() {
+        let t = MockTransport::ok_json(200, FIXTURE);
+        let adapter = CodexAdapter {
+            home: Some(PathBuf::from("/no/such/codex-home-quota-test")),
+            codexbar_dir: Some(crate::codexbar::workspace_fixtures_dir()),
+            enable_codexbar_files: true,
+        };
+        let ctx = ProbeCtx {
+            transport: &t,
+            now: 1,
+        };
+        let snap = adapter.probe(&ctx);
+        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.source, Some(Source::File));
+        assert_eq!(snap.windows[0].kind, WindowKind::Weekly);
+        assert_eq!(snap.windows[0].label, "weekly");
+        assert_eq!(snap.windows[0].used_percent, Some(59.0));
     }
 }

@@ -82,6 +82,34 @@ pub fn claude_config_dirs() -> Vec<PathBuf> {
     vec![home_dir().join(".claude")]
 }
 
+/// CodexBar support dir (macOS live path). Override with `QUOTA_CODEXBAR_DIR`.
+///
+/// We only read `codex-account-snapshots.json` and `usage-history.jsonl`.
+/// Never `cursor-session.json`.
+pub fn default_codexbar_dir() -> PathBuf {
+    if let Ok(dir) = env::var("QUOTA_CODEXBAR_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    home_dir().join("Library/Application Support/CodexBar")
+}
+
+pub fn codexbar_snapshot_candidates(dir: &Path) -> Vec<PathBuf> {
+    vec![
+        dir.join("codex-account-snapshots.json"),
+        dir.join("codex-account-snapshots.redacted.json"),
+    ]
+}
+
+pub fn codexbar_history_candidates(dir: &Path) -> Vec<PathBuf> {
+    vec![
+        dir.join("usage-history.jsonl"),
+        dir.join("usage-history.redacted.jsonl"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

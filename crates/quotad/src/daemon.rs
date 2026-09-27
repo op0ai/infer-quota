@@ -76,9 +76,11 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
 
     let (watch_tx, _) = broadcast::channel(16);
     let accounts = AccountStore::load(cfg.accounts_file());
+    let mut store = Store::new(&cfg);
+    seed_codexbar_history(&mut store, &cfg);
     let app = Arc::new(Mutex::new(App {
         interval_secs: cfg.refresh_min_secs(),
-        store: Store::new(&cfg),
+        store,
         accounts,
         cfg,
         watch_tx,
@@ -121,6 +123,19 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     Ok(())
 }
 
+fn seed_codexbar_history(store: &mut Store, cfg: &Config) {
+    if !cfg.enable_codexbar_files {
+        return;
+    }
+    let snaps = quota_adapters::codexbar::load_history_snapshots_from_dir(
+        &cfg.codexbar_dir(),
+        cfg.ring_capacity(),
+    );
+    for snap in snaps {
+        store.push_memory(snap);
+    }
+}
+
 fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| DaemonError::Io(e.to_string()))?;
@@ -133,7 +148,16 @@ fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
 }
 
 async fn refresh(app: Arc<Mutex<App>>) {
-    let (timeout, enable_codex, enable_claude, min_s, max_s, codex_home) = {
+    let (
+        timeout,
+        enable_codex,
+        enable_claude,
+        min_s,
+        max_s,
+        codex_home,
+        codexbar_dir,
+        enable_codexbar_files,
+    ) = {
         let g = app.lock().await;
         let home = g
             .accounts
@@ -148,12 +172,18 @@ async fn refresh(app: Arc<Mutex<App>>) {
             g.cfg.refresh_min_secs(),
             g.cfg.refresh_max_secs(),
             home,
+            g.cfg.codexbar_dir(),
+            g.cfg.enable_codexbar_files,
         )
     };
 
     let snap = tokio::task::spawn_blocking(move || {
         let transport = TlsTransport::new(Duration::from_secs(timeout));
-        let codex = CodexAdapter { home: codex_home };
+        let codex = CodexAdapter {
+            home: codex_home,
+            codexbar_dir: Some(codexbar_dir),
+            enable_codexbar_files,
+        };
         let claude = ClaudeAdapter;
         let mut providers: Vec<&dyn Provider> = Vec::new();
         if enable_codex {

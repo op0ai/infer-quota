@@ -44,6 +44,10 @@ math.
 - Math: burn rate from a bounded snapshot ring, ETA to empty, `can_start`.
 - Providers: **Codex** and **Claude** only.
 - Offline CodexBar fixture parser + 1912-row history replay in tests.
+- Optional read of CodexBar's macOS snapshot/history files when the live
+  API is down (never `cursor-session.json`).
+- Window kind follows published length: 604800s / 10080 min is **weekly**,
+  even if the API stuffed it in `primary_window`.
 
 ## What v0 does not do
 

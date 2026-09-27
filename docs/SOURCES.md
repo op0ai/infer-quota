@@ -46,8 +46,18 @@ If `~/.codex/config.toml` sets `chatgpt_base_url`:
 
 `credits.balance` / `has_credits` / `unlimited` when present.
 
-`primary_window` is mapped to `kind: session` (CodexBar's "session" lane).
-`secondary_window` → `weekly`.
+**Duration wins over slot name.** `limit_window_seconds` (or CodexBar
+`windowMinutes`) classifies the window:
+
+- ~18000 s / 300 min → `kind: session`, label `5h`
+- ~604800 s / 10080 min → `kind: weekly`, label `weekly` (CodexBar `secondary`)
+
+`primary_window` is only a hint. Live dogfood on 2026-09-27 (Arth Mac, file
+OAuth) published a **7-day** window (`used_percent` 59, `limit_window_seconds`
+604800, plan `pro`, reset ~2026-10-03T16:58:09Z) inside `primary_window`.
+Labeling that `session` / `5h` is a bug; we map it to weekly/secondary.
+
+`secondary_window` with a real 5h duration would similarly be remapped.
 
 ### CodexBar local snapshot files (fixture parser, not a probe)
 
@@ -61,8 +71,21 @@ Lanes `primary` / `secondary` / `tertiary` use `usedPercent`,
 false` maps to `credits.has_credits=false` — we do not invent a balance.
 
 Usage-history JSONL rows carry `source=live|backfill`. That is sample
-provenance, not a credential `Source`. Replay tests keep the distinction;
-the daemon never reads CodexBar's live files.
+provenance, not a credential `Source`.
+
+### CodexBar file ingest (optional, supplemental)
+
+When `enable_codexbar_files` is true (default), `quotad` may read — never
+write — these names under `$QUOTA_CODEXBAR_DIR` or
+`~/Library/Application Support/CodexBar/`:
+
+| file | use |
+|------|-----|
+| `codex-account-snapshots.json` | Fallback snapshot if `/wham/usage` is down or creds missing |
+| `usage-history.jsonl` | Seed the in-memory pace ring (newest `ring_capacity` rows) |
+
+Redacted copies of the same shapes are in `fixtures/codexbar/` (`.redacted`
+suffix). We **never** open `cursor-session.json` (WorkOS JWT).
 
 **Hypothesis:** CodexBar's in-app snapshot is derived from the same
 undocumented `/wham/usage` family. We do not claim the on-disk shape is a
@@ -100,6 +123,9 @@ Headers: `Authorization: Bearer <accessToken>`,
 
 Undocumented; same family of data Claude Code `/usage` shows. Often
 rate-limited (HTTP 429). The daemon backs off to `refresh_max_secs`.
+
+Live dogfood 2026-09-27: HTTP **401** (expired OAuth) → `status:
+unavailable`, `code: unauthorized`. We do **not** invent Claude windows.
 
 ### Response fields we accept (hypothesis)
 

@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quota_core::timeutil::{parse_reset_at, parse_reset_at_str};
 use quota_core::types::{
@@ -59,14 +59,15 @@ impl HistoryRow {
     }
 
     pub fn quota_window_kind(&self) -> WindowKind {
-        map_codexbar_window_kind(&self.window_kind)
+        classify_lane(&self.window_kind, self.window_minutes).0
     }
 
     pub fn to_snapshot(&self) -> Snapshot {
         let fetched = self.fetched_at().unwrap_or(0);
+        let (kind, label) = classify_lane(&self.window_kind, self.window_minutes);
         let window = UsageWindow::from_percent(
-            self.quota_window_kind(),
-            window_label(&self.window_kind, self.window_minutes),
+            kind,
+            label,
             self.used_percent,
             self.reset_at(),
             Some(self.window_minutes.saturating_mul(60)),
@@ -85,29 +86,14 @@ impl HistoryRow {
     }
 }
 
-/// CodexBar lane → quota-core window kind (see docs/SOURCES.md).
+/// CodexBar lane → quota-core window kind. Duration wins over slot name.
 pub fn map_codexbar_window_kind(kind: &str) -> WindowKind {
-    match kind {
-        "primary" => WindowKind::Session,
-        "secondary" => WindowKind::Weekly,
-        "tertiary" => WindowKind::Extra,
-        other => match other {
-            "session" | "five_hour" => WindowKind::Session,
-            "weekly" => WindowKind::Weekly,
-            "monthly" => WindowKind::Monthly,
-            _ => WindowKind::Weekly,
-        },
-    }
+    classify_lane(kind, 0).0
 }
 
-fn window_label(kind: &str, minutes: i64) -> String {
-    match kind {
-        "primary" => "5h".into(),
-        "secondary" if minutes == 10_080 => "weekly".into(),
-        "secondary" => format!("secondary {minutes}m"),
-        "tertiary" => "extra".into(),
-        other => other.to_string(),
-    }
+fn classify_lane(kind: &str, minutes: i64) -> (WindowKind, String) {
+    let mins = if minutes > 0 { Some(minutes) } else { None };
+    quota_core::classify_codex_window(Some(kind), None, mins)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,9 +200,10 @@ fn lane_to_window(kind: &str, lane: Option<&Lane>) -> Option<UsageWindow> {
     let used = lane.used_percent?;
     let minutes = lane.window_minutes.unwrap_or(0);
     let reset = lane.resets_at.as_ref().and_then(parse_reset_at);
+    let (wk, label) = classify_lane(kind, minutes);
     Some(UsageWindow::from_percent(
-        map_codexbar_window_kind(kind),
-        window_label(kind, minutes),
+        wk,
+        label,
         used,
         reset,
         if minutes > 0 {
@@ -371,6 +358,57 @@ pub fn workspace_fixtures_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codexbar")
 }
 
+const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
+const MAX_HISTORY_ROWS: usize = 4096;
+
+/// First readable snapshot in a CodexBar support dir. Skips `cursor-session.json`.
+pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)> {
+    for path in quota_core::codexbar_snapshot_candidates(dir) {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name == "cursor-session.json" {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if let Ok(snaps) = parse_account_snapshots(&bytes) {
+            if let Some(snap) = snaps.into_iter().next() {
+                return Some((snap, path));
+            }
+        }
+        if let Ok(snap) = parse_expect_snapshot(&bytes) {
+            if snap.status == Availability::Ok {
+                return Some((snap, path));
+            }
+        }
+    }
+    None
+}
+
+/// Newest `cap` history rows as snapshots (oldest first). Missing file → empty.
+pub fn load_history_snapshots_from_dir(dir: &Path, cap: usize) -> Vec<Snapshot> {
+    let cap = cap.clamp(1, MAX_HISTORY_ROWS);
+    for path in quota_core::codexbar_history_candidates(dir) {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name == "cursor-session.json" {
+            continue;
+        }
+        let Ok(rows) = load_history_jsonl(&path) else {
+            continue;
+        };
+        let n = rows.len();
+        let start = n.saturating_sub(cap.min(MAX_HISTORY_ROWS));
+        return history_to_snapshots(&rows[start..]);
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +557,54 @@ mod tests {
             window_minutes: Some(100),
         };
         assert!(lane_to_window("primary", Some(&empty)).is_none());
+    }
+
+    #[test]
+    fn primary_lane_with_weekly_minutes_is_weekly() {
+        let lane = Lane {
+            reset_description: None,
+            resets_at: None,
+            used_percent: Some(59.0),
+            window_minutes: Some(10_080),
+        };
+        let w = lane_to_window("primary", Some(&lane)).unwrap();
+        assert_eq!(w.kind, WindowKind::Weekly);
+        assert_eq!(w.label, "weekly");
+    }
+
+    #[test]
+    fn load_snapshot_from_fixture_dir() {
+        let (snap, path) = load_snapshot_from_dir(&fixtures()).expect("fixture snapshot");
+        assert!(path.ends_with("codex-account-snapshots.redacted.json"));
+        assert_eq!(snap.windows[0].kind, WindowKind::Weekly);
+        assert_eq!(snap.windows[0].used_percent, Some(59.0));
+        let hist = load_history_snapshots_from_dir(&fixtures(), 16);
+        assert_eq!(hist.len(), 16);
+        assert_eq!(
+            hist.last()
+                .unwrap()
+                .by_id(ProviderId::Codex)
+                .unwrap()
+                .windows[0]
+                .kind,
+            WindowKind::Weekly
+        );
+    }
+
+    #[test]
+    fn ignores_cursor_session_json() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-codexbar-skip-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("cursor-session.json"),
+            r#"{"WorkosCursorSessionToken":"eyJhbGciOi.not-a-real-token"}"#,
+        )
+        .unwrap();
+        assert!(load_snapshot_from_dir(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
