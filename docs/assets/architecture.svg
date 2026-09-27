@@ -30,22 +30,22 @@
 
   <rect x="220" y="68" width="196" height="84" rx="8" class="card"/>
   <text x="318" y="104" text-anchor="middle" class="title">quotad</text>
-  <text x="318" y="124" text-anchor="middle" class="sub">snapshot · pool math · socket</text>
+  <text x="318" y="124" text-anchor="middle" class="sub">snapshot / pool math / socket</text>
 
   <path d="M416 110 H456" class="edge" marker-end="url(#arr)"/>
   <text x="436" y="100" text-anchor="middle" class="label">0600</text>
 
   <rect x="466" y="24" width="270" height="52" rx="8" class="card"/>
   <text x="601" y="47" text-anchor="middle" class="title">quota</text>
-  <text x="601" y="65" text-anchor="middle" class="sub">read CLI · no credentials</text>
+  <text x="601" y="65" text-anchor="middle" class="sub">read CLI / no credentials</text>
 
   <rect x="466" y="84" width="270" height="52" rx="8" class="card"/>
   <text x="601" y="107" text-anchor="middle" class="title">quota-ctl</text>
-  <text x="601" y="125" text-anchor="middle" class="sub">accounts · refresh · secrets</text>
+  <text x="601" y="125" text-anchor="middle" class="sub">accounts / refresh / secrets</text>
 
   <rect x="466" y="144" width="270" height="52" rx="8" class="card"/>
   <text x="601" y="167" text-anchor="middle" class="title">other surfaces</text>
-  <text x="601" y="185" text-anchor="middle" class="sub">statusline · tmux · menu bar</text>
+  <text x="601" y="185" text-anchor="middle" class="sub">statusline / tmux / menu bar</text>
 
   <path d="M456 110 V50 H466" class="edge" marker-end="url(#arr)"/>
   <path d="M456 110 H466" class="edge" marker-end="url(#arr)"/>

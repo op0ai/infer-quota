@@ -16,7 +16,7 @@
   <circle cx="22" cy="20" r="5" fill="#3a3530"/>
   <circle cx="40" cy="20" r="5" fill="#3a3530"/>
   <circle cx="58" cy="20" r="5" fill="#3a3530"/>
-  <text x="380" y="24" text-anchor="middle" class="chrome">quota status · first run · no tokens</text>
+  <text x="380" y="24" text-anchor="middle" class="chrome">quota status / first run / no tokens</text>
 
   <text x="24" y="56" class="prompt">$</text>
   <text x="40" y="56" class="cmd">./install.sh --minimal</text>
