@@ -78,7 +78,8 @@ Default port for `https://` with no port is 443.
 
 `cargo test --workspace` does **not** start Docker and does **not** dial
 `:8200`. OpenBao tests use an in-process TCP listener (plain HTTP) and an
-in-process rustls listener with an rcgen certificate. Keychain tests skip
+in-process rustls listener with a throwaway CA and leaf embedded in the
+test. Keychain tests skip
 cleanly when the session bus (or macOS keychain) is unavailable.
 
 `quotad` does not call this crate. `secret_ref` on an account is metadata
@@ -103,8 +104,9 @@ Account metadata on the Unix socket (`accounts.add`) may include a
 - Plain-HTTP loopback fence, nested prefix, 32 KiB put cap, empty-secret
   refusal, credential-in-URL refusal.
 - In-process mock HTTP get/put/delete.
-- In-process rustls handshake to `localhost`. The test mints a CA and a
-  leaf with `rcgen` at runtime. No certificate or key is committed.
+- In-process rustls handshake to `localhost`. The throwaway CA, leaf, and
+  leaf key are string constants in the unit test (not a credential file,
+  not an operator key). The CA private key is not in the tree.
 - `Debug` redacts the OpenBao token and `SecretRecord.value`.
 - `secret get` presence line does not contain the material.
 - File backend `put` returns `ReadOnly`.

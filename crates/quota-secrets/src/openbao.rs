@@ -722,26 +722,61 @@ mod tests {
         backend.delete("codex/work").unwrap();
     }
 
+    /// Throwaway CA for the in-process listener. Not a public root.
+    const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBhjCCASugAwIBAgIULYfPHIAG4+/j2M7qG9FDnMMsOn4wCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcXVvdGEtdGVzdC1jYTAeFw0yNjA5MjcxMzA2NDdaFw0zNjA5
+MjQxMzA2NDdaMBgxFjAUBgNVBAMMDXF1b3RhLXRlc3QtY2EwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAARuZOZSihFZFqQWmWYPtjvAEgk6nnD70Ef0U3Hy9HmLx+oN
+0bhUaC5LcLdZ4uYpIUAscTnTCM85FDXe+85dLIsyo1MwUTAdBgNVHQ4EFgQU/c8m
+qN4F35+IraXAdymk7G6FTJgwHwYDVR0jBBgwFoAU/c8mqN4F35+IraXAdymk7G6F
+TJgwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAlxTny5BuFwWY
+jLQiLuaIvkpob3KjFaJpMyPRIaEBgvgCIQDf583jAZQaE2mVhjwO9tWZTKtEQQcB
+kgrJwTu7OAMKqw==
+-----END CERTIFICATE-----
+";
+
+    /// Leaf for `localhost`, signed by `TEST_CA_PEM`. Not CA:TRUE.
+    const TEST_LEAF_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBhjCCASygAwIBAgIUa0vyCEDbAxD70hNHsX6sp7OU6r0wCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcXVvdGEtdGVzdC1jYTAeFw0yNjA5MjcxMzA2NDdaFw0zNjA5
+MjQxMzA2NDdaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABD3JJPGXYG199Sx5QjWbIFvzG9DPcprgSTrEQC4RyK+rAw7EwbVT
+gEE78otHNzsK58JXq6zHzRRU9THC4GrJDyejWDBWMBQGA1UdEQQNMAuCCWxvY2Fs
+aG9zdDAdBgNVHQ4EFgQUJw+o/qdGQNpRMY03cTLUupQHTuQwHwYDVR0jBBgwFoAU
+/c8mqN4F35+IraXAdymk7G6FTJgwCgYIKoZIzj0EAwIDSAAwRQIhAKLUMwq/2gEP
+scBCyursxcxEsmyJU4xmZaPaDWHJQgGMAiAkexZtPV1RLEMVbK9XdYy8Z7jbzePA
+ytL+V/a58h+2jg==
+-----END CERTIFICATE-----
+";
+
+    /// PKCS#8 P-256 key matching `TEST_LEAF_PEM`. In-process test server only.
+    const TEST_LEAF_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxus3NZACwzx8ejNe
+G+6g5ie+uy0wtVulCljjfzkOKpShRANCAAQ9ySTxl2BtffUseUI1myBb8xvQz3Ka
+4Ek6xEAuEcivqwMOxMG1U4BBO/KLRzc7CufCV6usx80UVPUxwuBqyQ8n
+-----END PRIVATE KEY-----
+";
+
     #[test]
     fn rustls_localhost_roundtrip() {
-        let mut ca_params = rcgen::CertificateParams::new(vec!["quota-test-ca".into()]);
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = rcgen::Certificate::from_params(ca_params).unwrap();
-        let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".into()]);
-        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
-        let leaf = rcgen::Certificate::from_params(leaf_params).unwrap();
-        let ca_pem = ca.serialize_pem().unwrap();
-        let cert_pem = leaf.serialize_pem_with_signer(&ca).unwrap();
-        let key_der = leaf.serialize_private_key_der();
-
         let mut roots = RootCertStore::empty();
-        add_pem_certs(&mut roots, ca_pem.as_bytes()).unwrap();
-        let mut cert_reader = std::io::Cursor::new(cert_pem.as_bytes());
+        add_pem_certs(&mut roots, TEST_CA_PEM.as_bytes()).unwrap();
+        let mut cert_reader = std::io::Cursor::new(TEST_LEAF_PEM.as_bytes());
         let cert_der = rustls_pemfile::certs(&mut cert_reader)
             .unwrap()
             .into_iter()
             .next()
             .expect("cert");
+        let mut key_reader = std::io::Cursor::new(TEST_LEAF_KEY_PEM.as_bytes());
+        let key_der = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("key");
         let client_cfg = Arc::new(
             ClientConfig::builder()
                 .with_safe_defaults()

@@ -45,7 +45,8 @@ socket is the control plane for the user session, not a multi-tenant API.
 3. **OpenBao plain HTTP is dev-only.** `https://` is rustls in `quota-ctl`.
    `docker-compose.dev.yml` stays HTTP on loopback with the documented
    dummy token. A live OpenBao TLS deployment was not exercised here
-   (an in-process handshake against a CA minted in the test is covered).
+   (an in-process handshake against a throwaway CA embedded in the unit
+   test is covered). The test leaf key is not an operator credential.
 
 4. **Keychain runtime is platform-dependent.** Linux links secret-service
    and returns `Unavailable` when the session bus is down (the chain then
@@ -66,7 +67,10 @@ socket is the control plane for the user session, not a multi-tenant API.
    `rustls 0.21.12` for MSRV 1.83 without pulling `url`/`icu`. CI
    `cargo audit` **ignores** `RUSTSEC-2026-0098`, `RUSTSEC-2026-0104`,
    and `RUSTSEC-2026-0099`. Those are patched only in `rustls-webpki`
-   0.103+ / `rustls` 0.23+. No `cargo deny` / license policy yet.
+   0.103+ / `rustls` 0.23+. `rustls-pemfile` 1.0.4 (`RUSTSEC-2025-0134`,
+   unmaintained) is an allowed `cargo audit` warning: the 1.0 parser is
+   what `rustls` 0.21 expects, and 2.x is not required to keep the build
+   green. No `cargo deny` / license policy yet.
 
 7. **Optional `history: true` JSONL** persists snapshots (including
    `credential_path` and error codes) on disk. Off by default.

@@ -30,12 +30,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 webpki-roots = { workspace = true, optional = true }
 
-[dev-dependencies]
-# In-process TLS fixture. Pins keep `time`/`time-core` off edition2024 (Rust 1.88).
-rcgen = "=0.12.1"
-time = "=0.3.36"
-time-core = "=0.1.2"
-
 [target.'cfg(target_os = "linux")'.dependencies]
 # 4.0.0: zbus 4 + RustCrypto `cbc` (not the unmaintained `block-modes` crate).
 # async-io runtime so quota-ctl does not pull a second Tokio. No libdbus.
