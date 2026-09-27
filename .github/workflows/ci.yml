@@ -18,6 +18,8 @@ jobs:
           components: rustfmt, clippy
       - name: rustfmt
         run: cargo fmt --all -- --check
+      - name: install.sh syntax
+        run: sh -n install.sh
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test (offline)

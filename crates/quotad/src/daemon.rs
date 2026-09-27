@@ -901,4 +901,58 @@ mod tests {
         drop(listener);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn can_start_unavailable_is_honest() {
+        let app = Arc::new(Mutex::new(test_app()));
+        let req = Request::with_params(
+            20,
+            METHOD_CAN_START,
+            quota_core::CanStartParams {
+                tokens: 50_000,
+                deadline: None,
+                provider: ProviderFilter::All,
+            },
+        );
+        let resp = dispatch(&app, req).await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.answers.len(), 1);
+        assert_eq!(
+            result.answers[0].basis,
+            quota_core::types::CanStartBasis::Unavailable
+        );
+        let raw = serde_json::to_string(&result).unwrap();
+        assert!(!raw.contains("eyJ"));
+        assert!(!raw.contains("access_token"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accounts_add_does_not_echo_stuffed_secrets() {
+        let app = Arc::new(Mutex::new(test_app()));
+        let raw = serde_json::json!({
+            "id": 30,
+            "method": METHOD_ACCOUNTS_ADD,
+            "params": {
+                "id": "acct_leak",
+                "provider": "codex",
+                "email": "openai@ctx.op0.dev",
+                "access_token": "sk-ant-secret-must-not-echo",
+                "refresh_token": "rt-secret",
+                "password": "hunter2",
+                "secret_ref": { "backend": "openbao", "path": "quota/codex/work" },
+                "select": true
+            }
+        });
+        let req: Request = serde_json::from_value(raw).unwrap();
+        let resp = dispatch(&app, req).await;
+        assert!(resp.ok);
+        let listed = dispatch(&app, Request::new(31, METHOD_ACCOUNTS_LIST)).await;
+        let blob = serde_json::to_string(&listed).unwrap();
+        assert!(blob.contains("quota/codex/work"));
+        assert!(!blob.contains("sk-ant-secret-must-not-echo"));
+        assert!(!blob.contains("rt-secret"));
+        assert!(!blob.contains("hunter2"));
+        assert!(!blob.contains("access_token"));
+    }
 }

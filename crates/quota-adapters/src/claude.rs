@@ -362,4 +362,16 @@ mod tests {
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "network");
     }
+
+    #[test]
+    fn http_error_does_not_echo_body() {
+        let snap = parse_usage_http(
+            502,
+            br#"{"access_token":"sk-ant-oat01-leaked"}"#,
+            Path::new("/tmp/.credentials.json"),
+        );
+        let msg = &snap.error.as_ref().unwrap().message;
+        assert!(msg.contains("HTTP 502"));
+        assert!(!msg.contains("sk-ant"));
+    }
 }

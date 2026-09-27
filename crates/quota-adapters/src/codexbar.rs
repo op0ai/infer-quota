@@ -764,5 +764,41 @@ mod tests {
         let bytes = fs::read(fixtures().join("CURRENT-SNAPSHOT.expect.json")).unwrap();
         let snap = parse_expect_snapshot(&bytes).unwrap();
         assert!(snap.credential_path.is_none());
+        let encoded = serde_json::to_string(&snap).unwrap();
+        assert!(!encoded.contains("credential_path"));
+        assert!(encoded.contains("\"used_percent\":59"));
+    }
+
+    #[test]
+    fn fixture_pack_has_no_live_credentials() {
+        for name in [
+            "CURRENT-SNAPSHOT.expect.json",
+            "codex-account-snapshots.redacted.json",
+            "managed-codex-accounts.redacted.json",
+            "usage-history.redacted.jsonl",
+        ] {
+            let text = fs::read_to_string(fixtures().join(name)).unwrap();
+            for needle in [
+                "WorkosCursorSessionToken",
+                "access_token",
+                "refresh_token",
+                "sk-ant-",
+                "sk-proj-",
+                "eyJhbGci",
+            ] {
+                assert!(!text.contains(needle), "{name} must not contain {needle}");
+            }
+            for (key, ok) in [
+                ("\"authFingerprint\"", "<redacted"),
+                ("\"managedHomePath\"", "<redacted"),
+            ] {
+                if text.contains(key) {
+                    assert!(
+                        text.contains(ok),
+                        "{name} has {key} without a redaction marker"
+                    );
+                }
+            }
+        }
     }
 }

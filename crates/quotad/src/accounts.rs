@@ -228,4 +228,43 @@ mod tests {
         assert!(rec.home_path.is_none());
         let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn persisted_book_is_metadata_only() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quota-accounts-meta-{stamp}.json"));
+        let mut store = AccountStore::load(path.clone());
+        store
+            .add(AccountsAddParams {
+                id: Some("acct_meta".into()),
+                provider: ProviderId::Claude,
+                email: Some("human@example.com".into()),
+                workspace_label: None,
+                login_method: None,
+                workspace_account_id: None,
+                secret_ref: Some(quota_core::SecretRef {
+                    backend: "file".into(),
+                    path: "/tmp/not-a-token".into(),
+                }),
+                home_path: Some("/tmp/isolated-home".into()),
+                select: false,
+            })
+            .unwrap();
+        let on_disk = fs::read_to_string(&path).unwrap();
+        for needle in [
+            "access_token",
+            "refresh_token",
+            "password",
+            "eyJhbGci",
+            "Bearer ",
+        ] {
+            assert!(!on_disk.contains(needle), "book leaked {needle}");
+        }
+        assert!(on_disk.contains("secret_ref"));
+        assert!(on_disk.contains("/tmp/not-a-token"));
+        let _ = fs::remove_file(&path);
+    }
 }

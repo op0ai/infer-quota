@@ -102,4 +102,51 @@ mod tests {
         let giant = vec![0u8; MAX_FRAME_BYTES + 1];
         assert_eq!(encode_frame(&giant).unwrap_err(), FrameError::TooLarge);
     }
+
+    #[test]
+    fn exact_max_frame_roundtrips() {
+        let payload = vec![b'x'; MAX_FRAME_BYTES];
+        let mut cur = Cursor::new(encode_frame(&payload).unwrap());
+        assert_eq!(read_frame(&mut cur).unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_len_rejects_oversize_prefix() {
+        assert_eq!(
+            decode_len(((MAX_FRAME_BYTES as u32) + 1).to_le_bytes()),
+            Err(FrameError::TooLarge)
+        );
+        assert_eq!(decode_len(0u32.to_le_bytes()).unwrap(), 0);
+        assert_eq!(
+            decode_len((MAX_FRAME_BYTES as u32).to_le_bytes()).unwrap(),
+            MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn zero_length_payload() {
+        let mut cur = Cursor::new(encode_frame(b"").unwrap());
+        assert_eq!(read_frame(&mut cur).unwrap(), b"");
+    }
+
+    #[test]
+    fn truncated_length_prefix() {
+        for n in 0..4 {
+            let header = [1u8, 0, 0, 0];
+            let mut cur = Cursor::new(&header[..n]);
+            assert_eq!(
+                read_frame(&mut cur).unwrap_err(),
+                FrameError::UnexpectedEof,
+                "header of {n} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_body_after_valid_prefix() {
+        let mut buf = 8u32.to_le_bytes().to_vec();
+        buf.extend_from_slice(b"abcd"); // 4 of 8 claimed bytes
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_frame(&mut cur).unwrap_err(), FrameError::UnexpectedEof);
+    }
 }
