@@ -59,6 +59,13 @@ if [ -z "$PREFIX" ]; then
   PREFIX="${HOME}/.local"
 fi
 
+# Absolutize before we cd into the repo. A relative --prefix must keep
+# pointing at the caller's original directory, not $root/PREFIX.
+mkdir -p "$PREFIX"
+PREFIX=$(CDPATH= cd -- "$PREFIX" && pwd) || {
+  echo "install.sh: cannot resolve prefix" >&2
+  exit 1
+}
 BINDIR="${PREFIX}/bin"
 mkdir -p "${BINDIR}"
 
@@ -106,7 +113,12 @@ fetch_release() {
     rm -rf "$tmp"
     return 1
   fi
-  tar -C "$tmp" -xzf "$tmp/pack.tgz"
+  # Called from `if fetch_release`, so set -e does not apply. A tar that
+  # extracted named bins and then failed would otherwise look successful.
+  if ! tar -C "$tmp" -xzf "$tmp/pack.tgz"; then
+    rm -rf "$tmp"
+    return 1
+  fi
   mkdir -p "${RELEASE_DIR}"
   for b in $BINS; do
     found=$(find "$tmp" -type f -name "$b" | head -n 1)
