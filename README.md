@@ -192,7 +192,7 @@ A menu bar can sit on this daemon the same way `quota watch` does.
 
 ## Docs
 
-Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: fetch, observe, and compose inference quota. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/).
+Public pages live in [`site/`](site/) ([Blume](https://useblume.dev), static HTML). The site title is **fetchquota**: fetch, observe, and compose inference quota. Crate and binary names stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. Engineering notes stay in [`docs/`](docs/). Runnable composition examples will live in [`examples/`](examples/) and on the docs Examples page; none are shipped yet.
 
 ```bash
 cd site

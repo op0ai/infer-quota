@@ -3,7 +3,7 @@ title: Compose
 description: How the quota block stays one socket while menu bars, status lines, and orchestrators sit beside it.
 ---
 
-infer-quota does one job: session reuse, a snapshot, the math, and a Unix socket. The public name fetchquota is that block. Crate names stay put so a larger system can depend on a small surface.
+infer-quota does one job: session reuse, a snapshot, the math, and a Unix socket. The public name fetchquota is that block — the quota and pool-math piece to reach for, small enough to drop into a larger workflow. [Examples](/examples) will document real composition patterns (web app, local process, a thread across pools, widget or menu bar, and other hosts) as they ship. Coming soon; `examples/` has no programs yet. Crate names stay put so a larger system can depend on a small surface.
 
 Anything that needs the numbers — a menu bar, a tmux or Herdr status line, an MCP tool, a fleet orchestrator — should call [`quotad`](/quotad). It should not open Codex or Claude usage URLs on its own, and it should not become a second writer of `auth.json`.
 

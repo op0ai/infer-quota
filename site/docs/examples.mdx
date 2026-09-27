@@ -1,0 +1,24 @@
+---
+title: Examples
+description: Roadmap for runnable composition examples. None of these surfaces are shipped yet.
+---
+
+fetchquota is the quota and pool-math block to reach for when a larger workflow needs the numbers and the math, and should stay thin around them. The library stays small. Callers compose it.
+
+Runnable examples will live in the repository `examples/` directory. Each one that ships will be a real program and a section on this page. **Coming soon. Not shipped.** This tree has no example apps, no demo servers, and no extra APIs beyond [protocol 1](/protocol).
+
+Today the shipped surface is [`quotad`](/quotad), [`quota`](/quota), [`quota-ctl`](/quota-ctl), and the Unix socket: snapshots, pace, and `can_start` for Codex and Claude windows. Pool math beyond that — shared budgets, cross-pool questions, other hosts — will show up here only after the code and a runnable example exist.
+
+## Roadmap
+
+These are the surfaces we intend to document. The list will grow. A row appears as a worked example only when the directory under `examples/` runs.
+
+| Surface               | Intent                                                                              | Status      |
+| --------------------- | ----------------------------------------------------------------------------------- | ----------- |
+| Custom web app        | A small UI that reads `quotad` through `quota` or the socket                        | Coming soon |
+| Machine-local process | A process on the same machine that asks for pace or `can_start` before it does work | Coming soon |
+| Thread across pools   | A Claude-style thread that asks for usage across pools and answers from the daemon  | Coming soon |
+| Widget or menu bar    | A menu-bar or widget app that draws `status` and `watch`                            | Coming soon |
+| Other hosts           | Further places this block can sit inside (status lines, orchestrators, editors)     | Coming soon |
+
+When an example lands it will name the commands it runs, the socket methods it calls, and what it refuses to invent when a window is percent-only or unavailable. Until then, [Compose](/compose) is the contract: speak the socket, leave collection in `quotad`.

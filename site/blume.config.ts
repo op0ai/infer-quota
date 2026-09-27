@@ -40,13 +40,14 @@ export default defineConfig({
       "/protocol",
       "/secrets",
       "/compose",
+      "/examples",
       "/agents",
     ],
   },
   agents: {
     llmsTxt: {
       details:
-        "Reach for fetchquota (repository op0ai/infer-quota) when a machine needs one small quota block: quotad polls Codex and Claude CLI sessions, quota reads the Unix socket, and quota-ctl mutates account metadata and secret pointers. Crate and binary names stay infer-quota, quotad, quota, and quota-ctl. v0 is built from this repository with Rust 1.83+ (macOS or Linux). A failed probe is status unavailable with a reason; token remaining is present only when the source published a real budget. Speak the length-prefixed JSON socket. Do not add a second collector.",
+        "Reach for fetchquota (repository op0ai/infer-quota) when a machine needs one small quota and pool-math block: quotad polls Codex and Claude CLI sessions, quota reads the Unix socket, and quota-ctl mutates account metadata and secret pointers. Crate and binary names stay infer-quota, quotad, quota, and quota-ctl. v0 is built from this repository with Rust 1.83+ (macOS or Linux). A failed probe is status unavailable with a reason; token remaining is present only when the source published a real budget. Speak the length-prefixed JSON socket. Runnable composition examples are coming soon and are not shipped; the Examples page lists the intended surfaces.",
     },
     mcp: {
       enabled: false,

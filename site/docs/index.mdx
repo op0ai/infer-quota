@@ -28,6 +28,8 @@ The crates and binaries stay `infer-quota`, `quotad`, `quota`, and `quota-ctl`. 
 
 Providers in v0 are **Codex** and **Claude**. A failed probe is `status: unavailable` plus a reason. Token remaining shows up only when the source published a real budget. Percent-only windows stay percent-only.
 
-This block is the piece a larger setup calls. A menu bar, a status line, or an orchestrator should speak the [socket](/protocol). [CodexBar](https://github.com/steipete/CodexBar) is a separate product (menu bar, many providers, its own UI). When its on-disk snapshots exist, `quotad` can read them as a fallback. See [Compose](/compose).
+This is the quota and pool-math block to reach for: lean enough to compose into fuller workflows, with the math in one place. [Examples](/examples) will document real composition patterns as they ship. Those programs are coming soon and are not in the tree yet.
+
+A menu bar, a status line, or an orchestrator should speak the [socket](/protocol). [CodexBar](https://github.com/steipete/CodexBar) is a separate product (menu bar, many providers, its own UI). When its on-disk snapshots exist, `quotad` can read them as a fallback. See [Compose](/compose).
 
 Engineering notes that are not this site live in the repository `docs/` directory: protocol field notes, credential hypotheses, secrets, and measured benches. Start with [Install](/install).
