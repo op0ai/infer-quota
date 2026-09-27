@@ -2,12 +2,13 @@
 //!
 //! We never write `~/.codex/auth.json` or `~/.claude/.credentials.json`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+
+use quota_core::fsutil::{read_file_capped, CapReadError};
 
 use crate::types::{SecretRecord, SecretsBackend, SecretsError};
 
-const MAX_CRED_BYTES: u64 = 64 * 1024;
+const MAX_CRED_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileOauthBackend {
@@ -23,17 +24,16 @@ impl FileOauthBackend {
 }
 
 fn read_capped(path: &Path) -> Result<Vec<u8>, SecretsError> {
-    let meta = fs::metadata(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            SecretsError::NotFound(path.display().to_string())
-        } else {
-            SecretsError::Io(e.to_string())
+    match read_file_capped(path, MAX_CRED_BYTES) {
+        Ok(b) => Ok(b),
+        Err(CapReadError::NotFound(p)) => Err(SecretsError::NotFound(p)),
+        Err(CapReadError::TooLarge(_)) => Err(SecretsError::Io("credential file too large".into())),
+        Err(CapReadError::Symlink(p)) => Err(SecretsError::Io(format!("refusing symlink {p}"))),
+        Err(CapReadError::NotRegular(p)) => {
+            Err(SecretsError::Io(format!("not a regular file: {p}")))
         }
-    })?;
-    if meta.len() > MAX_CRED_BYTES {
-        return Err(SecretsError::Io("credential file too large".into()));
+        Err(CapReadError::Io(e)) => Err(SecretsError::Io(e)),
     }
-    fs::read(path).map_err(|e| SecretsError::Io(e.to_string()))
 }
 
 fn codex_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
@@ -46,7 +46,9 @@ fn codex_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
             return vec![PathBuf::from(dir).join("auth.json")];
         }
     }
-    let home = quota_core::home_dir();
+    let Some(home) = quota_core::home_dir() else {
+        return Vec::new();
+    };
     vec![
         home.join(".codex/auth.json"),
         home.join(".config/codex/auth.json"),

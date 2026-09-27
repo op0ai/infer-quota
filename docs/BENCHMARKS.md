@@ -33,7 +33,82 @@ unchanged.
 
 ---
 
-## 2026-09-27 re-measure (VERIFIED)
+## 2026-09-27 hardening pass (VERIFIED)
+
+Same VM class as the earlier 2026-09-27 tables below (`uname` / `rustc` /
+4× Xeon @ 2400 MHz / 15 GiB). Measured after the socket/creds/JSONL
+hardening commit on this branch. Nothing here is an estimate.
+
+**Claimed win (only this one):** CodexBar JSONL seed now streams a 128-line
+tail and parses those rows only.
+
+```
+./target/release/quota-bench jsonl --iters 50 --ring 128
+```
+
+| name | n | mean | std | min | max | p50 | p95 | p99 |
+|------|--:|------|-----|-----|-----|-----|-----|-----|
+| `jsonl_full_1912` (parse every line) | 50 | 839.5 µs | 51.8 µs | 813.8 µs | 1123.1 µs | 822.2 µs | 933.5 µs | 1123.1 µs |
+| `jsonl_tail_128` (keep last 128 lines, parse those) | 50 | 218.2 µs | 10.8 µs | 210.1 µs | 265.4 µs | 215.3 µs | 251.8 µs | 265.4 µs |
+
+Delta: **−621.3 µs mean (−74%)**. Same fixture, same binary, alternating
+full vs tail in one process. This is the daemon seed path
+(`load_history_snapshots_from_dir`).
+
+**Not a size win.** Default `release` binaries are slightly larger than
+the pre-hardening 2026-09-27 build (more socket/path checks). Do not
+read this as a regression of `[profile.dist]`.
+
+`ls -lh --full-time` / `stat` after `cargo build --workspace --release`
+(2026-09-27 12:21 UTC):
+
+| path | bytes | vs pre-hardening release |
+|------|------:|--------------------------|
+| `target/release/quota` | 1 060 528 | +8 416 |
+| `target/release/quotad` | 2 348 360 | +89 912 |
+| `target/release/quota-ctl` | 1 163 184 | +4 480 |
+
+`file`: ELF 64-bit LSB pie, x86-64, dynamically linked, **not stripped**.
+`ldd` (quotad): `linux-vdso`, `libgcc_s.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2`.
+
+`sha256sum`:
+
+```
+fd18cc1c793f73394e65091816a981d63ef9279cd5b20bdad4a52931b8563b61  target/release/quota
+8c41cf1535353bdf383f37d90cd05f51a56398087b9098bbf80670e377f23114  target/release/quotad
+f1b496a94e255d36fda4d3a9033cad64bc069834eee88a538a694c1ad5760660  target/release/quota-ctl
+```
+
+### Same-band re-measure (VERIFIED, not claimed as wins)
+
+`pace` / serialize / socket RTT / 8-client status / start-to-ping stay in
+the same band as the earlier 2026-09-27 session. `pace` mean 6.5 µs vs
+5.9 µs; `status` socket 24.2 µs vs 20.9 µs; start-to-ping 5361 µs vs
+5346 µs. Those deltas are **not** treated as regressions or improvements
+(noisy µs on a shared VM). `history_ref` removes clones on the daemon
+`pace` RPC path; this offline `pace_for` bench still owns a `Vec` of
+1912 snapshots and does not isolate that change.
+
+| name | n | mean | notes |
+|------|--:|------|-------|
+| `pace` (1912-row fixture) | 200 | 6.5 µs | burn 12.9865 %/h; 153 071 / s |
+| `status_serialize` | 200 | 0.8 µs | same as prior |
+| `ring_replay_1912` | 200 | 204.0 µs | bench `Vec::remove(0)`, not `Store` |
+| socket `ping` | 1000 | 9.5 µs | prior 9.6 µs |
+| socket `status` | 1000 | 24.2 µs | prior 20.9 µs |
+| `status_clients_8` | 1600 | 60.6 µs | prior 59.3 µs |
+| `daemon_start_to_ping` | 8 | 5361 µs | no CodexBar dir |
+| `daemon_start_to_ping` + `QUOTA_CODEXBAR_DIR=fixtures/codexbar` | 8 | 5422 µs | seeds 128 history snaps |
+| idle `quotad` VmRSS | — | 3276 kB | prior 3224 kB; USS 1496 kB; 2 threads |
+
+**Not measured:** live HTTPS usage-fetch, musl, `profile.dist` on this
+exact commit (prior dist −25% still applies to the *profile*, not these
+byte counts).
+
+---
+
+## 2026-09-27 re-measure (VERIFIED, pre-hardening)
 
 Same class of host as the 2026-09-26 session (see historical tables below).
 Binaries include `quota-ctl` and the accounts/refresh protocol.
@@ -278,6 +353,7 @@ ls -lh target/release/quota target/release/quotad target/release/quota-ctl
 
 ./target/release/quota-bench pace --iters 200
 ./target/release/quota-bench serialize --iters 200 --ring 128
+./target/release/quota-bench jsonl --iters 50 --ring 128
 
 SOCK=/tmp/quota-bench.sock
 ./target/release/quotad run --socket "$SOCK" &

@@ -1,11 +1,11 @@
 //! Optional JSON config (`~/.config/quota/config.json`). Missing file = defaults.
 //! Unknown keys are ignored for forward compatibility.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fsutil::read_file_capped;
 use crate::paths::{
     default_codexbar_dir, default_config_path, default_socket_path, default_state_dir,
 };
@@ -91,13 +91,9 @@ impl Config {
     }
 
     pub fn load_path(path: &Path) -> Self {
-        let Ok(bytes) = fs::read(path) else {
+        let Ok(bytes) = read_file_capped(path, 64 * 1024) else {
             return Self::default();
         };
-        // Cap: config is tiny. Refuse multi-megabyte junk.
-        if bytes.len() > 64 * 1024 {
-            return Self::default();
-        }
         serde_json::from_slice(&bytes).unwrap_or_default()
     }
 

@@ -4,3 +4,16 @@
 .vscode/
 *.swp
 .DS_Store
+
+# Credential / session files (never commit live material)
+auth.json
+.credentials.json
+cursor-session.json
+**/auth.json
+**/.credentials.json
+**/cursor-session.json
+*.pem
+*.key
+.env
+.env.*
+!.env.example

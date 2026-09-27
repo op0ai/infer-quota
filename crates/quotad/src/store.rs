@@ -4,9 +4,8 @@
 //! trail and is never read back in v0 (avoids loading unbounded files).
 
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use quota_core::types::Snapshot;
 use quota_core::Config;
@@ -45,18 +44,20 @@ impl Store {
         self.ring.back()
     }
 
-    pub fn history(&self) -> Vec<Snapshot> {
-        self.ring.iter().cloned().collect()
+    /// Borrow the ring (no `Snapshot` clones) for `pace` / `can_start`.
+    pub fn history_ref(&self) -> &VecDeque<Snapshot> {
+        &self.ring
     }
 }
 
-fn append_jsonl(path: &PathBuf, snap: &Snapshot) -> std::io::Result<()> {
+fn append_jsonl(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        quota_core::ensure_private_dir(dir)?;
     }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = quota_core::open_private_append(path)?;
     serde_json::to_writer(&mut f, snap).map_err(std::io::Error::other)?;
     f.write_all(b"\n")?;
+    quota_core::chmod_private_file(path)?;
     Ok(())
 }
 
@@ -96,7 +97,7 @@ mod tests {
                 AdapterError::new("z", "z"),
             )],
         ));
-        assert_eq!(s.history().len(), 2);
+        assert_eq!(s.history_ref().len(), 2);
         assert_eq!(s.latest().unwrap().fetched_at, 3);
     }
 }

@@ -16,7 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use quota_adapters::codexbar::{history_to_snapshots, load_history_jsonl, workspace_fixtures_dir};
+use quota_adapters::codexbar::{
+    history_to_snapshots, load_history_jsonl, load_history_jsonl_tail, workspace_fixtures_dir,
+};
 use quota_core::framing::{encode_frame, read_frame, write_frame};
 use quota_core::math::pace_for;
 use quota_core::protocol::{
@@ -158,7 +160,7 @@ fn bench_rtt(socket: &Path, warmup: usize, iters: usize) {
 fn bench_pace(history: &Path, iters: usize) {
     let rows = load_history_jsonl(history).expect("load history");
     let snaps = history_to_snapshots(&rows);
-    assert_eq!(rows.len(), 1912, "fixture row count changed");
+    assert!(!rows.is_empty(), "history has no usable rows");
     let latest = snaps
         .last()
         .and_then(|s| s.by_id(ProviderId::Codex).cloned())
@@ -221,7 +223,7 @@ fn bench_serialize(history: &Path, iters: usize, ring: usize) {
         }
         ring_push.push(t0.elapsed().as_nanos() as u64);
     }
-    print_row("ring_replay_1912", ring_push);
+    print_row(&format!("ring_replay_{}", snaps.len()), ring_push);
 }
 
 fn bench_watch(socket: &Path, clients: usize, iters: usize) {
@@ -314,6 +316,25 @@ fn stop_child(mut child: Child) {
     let _ = child.wait();
 }
 
+fn bench_jsonl(history: &Path, iters: usize, cap: usize) {
+    let expected_full = load_history_jsonl(history).expect("full jsonl").len();
+    let expected_tail = expected_full.min(cap.max(1));
+    let mut full = Vec::with_capacity(iters);
+    let mut tail = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let rows = load_history_jsonl(history).expect("full jsonl");
+        assert_eq!(rows.len(), expected_full);
+        full.push(t0.elapsed().as_nanos() as u64);
+        let t1 = Instant::now();
+        let rows = load_history_jsonl_tail(history, cap).expect("tail jsonl");
+        assert_eq!(rows.len(), expected_tail);
+        tail.push(t1.elapsed().as_nanos() as u64);
+    }
+    print_row(&format!("jsonl_full_{expected_full}"), full);
+    print_row(&format!("jsonl_tail_{expected_tail}"), tail);
+}
+
 fn bench_start(quotad: &Path, socket: &Path, runs: usize) {
     let mut cold = Vec::new();
     let mut warm = Vec::new();
@@ -347,7 +368,8 @@ fn usage() -> ! {
          quota-bench pace [--history PATH] [--iters N]\n\
          quota-bench serialize [--history PATH] [--iters N] [--ring N]\n\
          quota-bench watch --socket PATH [--clients N] [--iters N]\n\
-         quota-bench start --quotad PATH --socket PATH [--runs N]"
+         quota-bench start --quotad PATH --socket PATH [--runs N]\n\
+         quota-bench jsonl [--history PATH] [--iters N] [--ring N]"
     );
     std::process::exit(2);
 }
@@ -376,6 +398,13 @@ fn main() {
             let clients = parse_usize(&mut args, "--clients", 8);
             let iters = parse_usize(&mut args, "--iters", 200);
             bench_watch(&socket, clients, iters);
+        }
+        "jsonl" => {
+            args.next();
+            let history = parse_path(&mut args, "--history").unwrap_or_else(default_history);
+            let iters = parse_usize(&mut args, "--iters", 50);
+            let cap = parse_usize(&mut args, "--ring", 128);
+            bench_jsonl(&history, iters, cap);
         }
         "start" => {
             args.next();
