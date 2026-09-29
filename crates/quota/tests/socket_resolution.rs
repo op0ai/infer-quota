@@ -3,21 +3,23 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::process::Command;
+
+use tempfile::TempDir;
 
 use quota_core::framing::{decode_len, encode_frame};
 use quota_core::protocol::{Pong, Request, Response};
 
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("qsr-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("cfg/quota")).unwrap();
+fn scratch_dir() -> TempDir {
+    let dir = tempfile::Builder::new().prefix("qsr-").tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("cfg/quota")).unwrap();
     dir
 }
 
 #[test]
 fn greptile_5_quota_ping_reaches_quota_socket_despite_malformed_config() {
-    let dir = scratch_dir();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     std::fs::write(dir.join("cfg/quota/config.json"), b"{ malformed").unwrap();
     let socket = dir.join("d.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -36,7 +38,7 @@ fn greptile_5_quota_ping_reaches_quota_socket_despite_malformed_config() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_quota"))
         .arg("ping")
-        .env("HOME", &dir)
+        .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join("cfg"))
         .env_remove("XDG_RUNTIME_DIR")
         .env("QUOTA_SOCKET", &socket)
@@ -53,7 +55,7 @@ fn greptile_5_quota_ping_reaches_quota_socket_despite_malformed_config() {
 
     let without_env = Command::new(env!("CARGO_BIN_EXE_quota"))
         .arg("ping")
-        .env("HOME", &dir)
+        .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join("cfg"))
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("QUOTA_SOCKET")
@@ -61,5 +63,4 @@ fn greptile_5_quota_ping_reaches_quota_socket_despite_malformed_config() {
         .unwrap();
     assert!(!without_env.status.success());
     assert!(String::from_utf8_lossy(&without_env.stderr).contains("malformed config"));
-    let _ = std::fs::remove_dir_all(dir);
 }

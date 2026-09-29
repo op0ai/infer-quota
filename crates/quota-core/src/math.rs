@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 
 use crate::types::{
-    Availability, CanStartAnswer, CanStartBasis, PaceReport, ProviderSnapshot, Snapshot,
-    UsageWindow, WindowKind, WindowState,
+    Availability, CanStartAnswer, CanStartBasis, Freshness, PaceReport, ProviderId,
+    ProviderSnapshot, Snapshot, UsageWindow, WindowKind, WindowState,
 };
 
 /// Drop samples that look like a window reset (used_percent fell by more than
@@ -95,6 +95,21 @@ fn availability_message(snapshot: &ProviderSnapshot) -> String {
         .as_ref()
         .map(|e| e.message.clone())
         .unwrap_or_else(|| "provider unavailable".to_string())
+}
+
+fn unavailable_answer(provider: ProviderId, explanation: String) -> CanStartAnswer {
+    CanStartAnswer {
+        provider,
+        ok: false,
+        basis: CanStartBasis::Unavailable,
+        explanation,
+        window_kind: None,
+        remaining_percent: None,
+        remaining_tokens: None,
+        reset_at: None,
+        eta_empty_secs: None,
+        burn_percent_per_hour: None,
+    }
 }
 
 /// Samples of `kind` from readings of the same provider account as `latest`.
@@ -237,6 +252,15 @@ where
             burn_percent_per_hour: None,
         };
     }
+    if latest.status == Availability::Stale || latest.freshness == Freshness::Stale {
+        return unavailable_answer(latest.provider, availability_message(latest));
+    }
+    if latest.permission == crate::types::ProviderPermission::LimitReached {
+        return unavailable_answer(
+            latest.provider,
+            "provider permission is limit_reached".to_string(),
+        );
+    }
     let unknown: Vec<&UsageWindow> = latest
         .windows
         .iter()
@@ -261,34 +285,8 @@ where
             burn_percent_per_hour: None,
         };
     }
-    if latest.permission == crate::types::ProviderPermission::LimitReached {
-        return CanStartAnswer {
-            provider: latest.provider,
-            ok: false,
-            basis: CanStartBasis::Unavailable,
-            explanation: "provider permission is limit_reached".to_string(),
-            window_kind: None,
-            remaining_percent: None,
-            remaining_tokens: None,
-            reset_at: None,
-            eta_empty_secs: None,
-            burn_percent_per_hour: None,
-        };
-    }
     if latest.status != Availability::Ok {
-        let msg = availability_message(latest);
-        return CanStartAnswer {
-            provider: latest.provider,
-            ok: false,
-            basis: CanStartBasis::Unavailable,
-            explanation: msg,
-            window_kind: None,
-            remaining_percent: None,
-            remaining_tokens: None,
-            reset_at: None,
-            eta_empty_secs: None,
-            burn_percent_per_hour: None,
-        };
+        return unavailable_answer(latest.provider, availability_message(latest));
     }
     let Some(window) = binding_window(latest) else {
         return CanStartAnswer {
@@ -892,5 +890,95 @@ mod tests {
             assert_eq!(a.window_kind, Some(WindowKind::Session));
             assert!(a.explanation.contains("5h, weekly"), "{}", a.explanation);
         }
+    }
+
+    fn unreadable_window(now: i64, observed_at: i64) -> UsageWindow {
+        UsageWindow::unreadable(
+            WindowKind::Session,
+            "5h",
+            Some(now + 3_600),
+            None,
+            Some(observed_at),
+            crate::types::DEFAULT_READING_MAX_AGE_SECS,
+        )
+    }
+
+    fn observed_with(
+        window: UsageWindow,
+        observed_at: i64,
+        permission: crate::types::ProviderPermission,
+    ) -> ProviderSnapshot {
+        ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![window],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(observed_at),
+            max_age_secs: crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            permission,
+        })
+    }
+
+    #[test]
+    fn greptile_7_a_stale_reading_with_an_unreadable_window_is_unavailable_not_a_veto() {
+        let now = crate::timeutil::now_unix();
+        let long_ago = now - 10 * crate::types::DEFAULT_READING_MAX_AGE_SECS as i64;
+        let mut mixed = provider_at(ProviderId::Codex, 10.0, long_ago);
+        mixed.windows[0] = unreadable_window(now, long_ago);
+        mixed.refresh_freshness(now);
+        assert_eq!(mixed.status, Availability::Stale);
+
+        let mut all_unreadable = observed_with(
+            unreadable_window(now, long_ago),
+            long_ago,
+            crate::types::ProviderPermission::Unknown,
+        );
+        all_unreadable.refresh_freshness(now);
+        assert_eq!(all_unreadable.status, Availability::Unavailable);
+        assert_eq!(all_unreadable.freshness, Freshness::Stale);
+
+        for stale in [&mixed, &all_unreadable] {
+            for tokens in [0, 1_000] {
+                let a = can_start(stale, &[], tokens, None, now);
+                assert!(!a.ok);
+                assert_eq!(a.basis, CanStartBasis::Unavailable, "{}", a.explanation);
+            }
+        }
+    }
+
+    #[test]
+    fn greptile_7_a_current_unreadable_window_still_answers_unknown_window() {
+        let now = crate::timeutil::now_unix();
+        let mixed = observed_with(
+            unreadable_window(now, now),
+            now,
+            crate::types::ProviderPermission::Allowed,
+        );
+        let a = can_start(&mixed, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::UnknownWindow);
+    }
+
+    #[test]
+    fn greptile_7_an_explicit_refusal_is_named_even_beside_an_unreadable_window() {
+        let now = crate::timeutil::now_unix();
+        let refused = observed_with(
+            unreadable_window(now, now),
+            now,
+            crate::types::ProviderPermission::LimitReached,
+        );
+        let a = can_start(&refused, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+        assert!(a.explanation.contains("limit_reached"), "{}", a.explanation);
+
+        let mut low_usage = provider_at(ProviderId::Codex, 1.0, now);
+        low_usage.permission = crate::types::ProviderPermission::LimitReached;
+        let a = can_start(&low_usage, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+        assert!(a.explanation.contains("limit_reached"), "{}", a.explanation);
     }
 }

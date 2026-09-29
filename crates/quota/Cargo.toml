@@ -11,3 +11,7 @@ readme = false
 clap.workspace = true
 quota-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Already present in Cargo.lock; a unique directory per run cleans itself up.
+tempfile = "3.27.0"

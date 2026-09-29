@@ -157,6 +157,9 @@ impl CodexAdapter {
             None if snaps.len() == 1 => snaps.into_iter().next()?,
             None => return None,
         };
+        if snap.status == Availability::Unavailable {
+            return None;
+        }
         snap.source = Some(Source::File);
         snap.credential_path = Some(path.display().to_string());
         Some(snap)
@@ -872,6 +875,76 @@ mod tests {
         assert_eq!(single.source, Some(Source::File));
         assert_eq!(single.permission, ProviderPermission::Unknown);
         for dir in [home, two, one] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    fn codexbar_record_without_lanes(account_id: &str) -> String {
+        format!(
+            r#"{{"accountIdentity":{{"workspaceAccountID":"{account_id}"}},
+                "snapshot":{{"updatedAt":812150779.9}},
+                "sourceLabel":"oauth"}}"#
+        )
+    }
+
+    #[test]
+    fn coderabbit_an_unusable_codexbar_record_does_not_replace_the_api_error() {
+        let unusable = codexbar_dir_with(&[codexbar_record_without_lanes(FIXTURE_ACCOUNT)]);
+        let (records, _) = codexbar::load_account_snapshots_from_dir(&unusable).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Availability::Unavailable);
+
+        let named = home_with_account(Some(FIXTURE_ACCOUNT));
+        let unnamed = home_with_account(None);
+        for home in [&named, &unnamed] {
+            let snapshot = probe_with(home, unusable.clone(), &MockTransport::ok_json(401, "{}"));
+
+            assert_eq!(snapshot.source, Some(Source::Oauth));
+            assert_eq!(snapshot.error.as_ref().unwrap().code, "unauthorized");
+            assert!(snapshot
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("codex login"));
+        }
+        for dir in [named, unnamed, unusable] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn coderabbit_an_unusable_record_still_counts_as_a_known_codexbar_account() {
+        let home = home_with_account(None);
+        let dir = codexbar_dir_with(&[
+            codexbar_record_without_lanes("aaaaaaaa-0000-0000-0000-000000000000"),
+            codexbar_record(FIXTURE_ACCOUNT, 70.0),
+        ]);
+        let adapter = CodexAdapter {
+            home: Some(home.clone()),
+            codexbar_dir: Some(dir.clone()),
+            enable_codexbar_files: true,
+        };
+
+        assert!(!adapter.answers_for_active_account(None));
+        for dir in [home, dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn coderabbit_a_usable_record_beside_an_unusable_one_is_still_the_fallback() {
+        let dir = codexbar_dir_with(&[
+            codexbar_record_without_lanes("aaaaaaaa-0000-0000-0000-000000000000"),
+            codexbar_record(FIXTURE_ACCOUNT, 70.0),
+        ]);
+        let home = home_with_account(Some(FIXTURE_ACCOUNT));
+
+        let snapshot = probe_with(&home, dir.clone(), &MockTransport::ok_json(503, "{}"));
+
+        assert_eq!(snapshot.source, Some(Source::File));
+        assert_eq!(snapshot.windows[0].used_percent, Some(70.0));
+        for dir in [home, dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

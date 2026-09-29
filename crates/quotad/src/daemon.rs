@@ -975,12 +975,31 @@ where
     })
 }
 
+/// How long a finished provider waits for the rest of its cycle before it is
+/// published alone. Providers that finish close together still share one
+/// history entry and one watch update; a stalled one cannot withhold the rest.
+const PUBLISH_GRACE: Duration = Duration::from_secs(2);
+
 /// Probe every enabled provider concurrently and publish them together.
 /// Every gate is observed before any is waited on, so a cycle already in
 /// flight answers this request for all of its providers. Gates are claimed in
 /// a fixed order so concurrent cycles cannot deadlock.
 async fn refresh_providers<F, Fut>(app: Arc<RwLock<App>>, providers: &[ProviderId], probe: F)
 where
+    F: Fn(Arc<RwLock<App>>, ProviderId, ProbeMode) -> Fut,
+    Fut: std::future::Future<Output = Option<ProviderSnapshot>>,
+{
+    refresh_providers_within(app, providers, PUBLISH_GRACE, probe).await;
+}
+
+/// [`refresh_providers`] with the grace a finished provider waits for the
+/// others. A provider still probing after it publishes on its own when done.
+async fn refresh_providers_within<F, Fut>(
+    app: Arc<RwLock<App>>,
+    providers: &[ProviderId],
+    grace: Duration,
+    probe: F,
+) where
     F: Fn(Arc<RwLock<App>>, ProviderId, ProbeMode) -> Fut,
     Fut: std::future::Future<Output = Option<ProviderSnapshot>>,
 {
@@ -997,21 +1016,39 @@ where
             claims.push(claim);
         }
     }
-    let mut claims = claims.into_iter();
-    let run = |claim: Option<Claim>| {
-        let app = &app;
-        let probe = &probe;
-        async move {
-            let claim = claim?;
-            let provider = claim.provider;
-            probe_claimed(app, claim, |app, mode| probe(app, provider, mode)).await
+    let (finished, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let probing = async {
+        let probe_one = |claim: Option<Claim>| {
+            let app = &app;
+            let probe = &probe;
+            let finished = &finished;
+            async move {
+                let Some(claim) = claim else {
+                    return;
+                };
+                let provider = claim.provider;
+                let probed =
+                    probe_claimed(app, claim, |app, mode| probe(app, provider, mode)).await;
+                if let Some(probed) = probed {
+                    let _ = finished.send(probed);
+                }
+            }
+        };
+        let mut claims = claims.into_iter();
+        tokio::join!(probe_one(claims.next()), probe_one(claims.next()));
+        drop(finished);
+    };
+    let publishing = async {
+        while let Some(first) = arrivals.recv().await {
+            let mut batch = vec![first];
+            let deadline = tokio::time::Instant::now() + grace;
+            while let Ok(Some(next)) = tokio::time::timeout_at(deadline, arrivals.recv()).await {
+                batch.push(next);
+            }
+            publish(&app, batch).await;
         }
     };
-    let (first, second) = tokio::join!(run(claims.next()), run(claims.next()));
-    let probed: Vec<Probed> = first.into_iter().chain(second).collect();
-    if !probed.is_empty() {
-        publish(&app, probed).await;
-    }
+    tokio::join!(probing, publishing);
 }
 
 async fn refresh(app: Arc<RwLock<App>>) {
@@ -2558,6 +2595,286 @@ mod tests {
         .await;
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(latest_codex_used(&*app.read().await), Some(7.0));
+    }
+
+    fn unreadable_codex_reading(
+        observed_at: i64,
+        permission: quota_core::types::ProviderPermission,
+    ) -> ProviderSnapshot {
+        ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(quota_core::types::Source::Oauth),
+            windows: vec![quota_core::types::UsageWindow::unreadable(
+                quota_core::types::WindowKind::Session,
+                "5h",
+                None,
+                None,
+                Some(observed_at),
+                300,
+            )],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(observed_at),
+            max_age_secs: 300,
+            permission,
+        })
+    }
+
+    async fn all_can_start(app: &Arc<RwLock<App>>) -> CanStartResult {
+        let req = Request::with_params(
+            54,
+            METHOD_CAN_START,
+            CanStartParams {
+                tokens: 0,
+                deadline: None,
+                provider: ProviderFilter::All,
+            },
+        );
+        serde_json::from_value(dispatch(app, req).await.result.unwrap()).unwrap()
+    }
+
+    async fn app_with_current_claude_reading() -> (Arc<RwLock<App>>, PathBuf) {
+        let dir = unique_test_dir("quota-test-acct");
+        write_claude_credentials(&dir);
+        write_unnamed_codex_credentials(&dir);
+        let app = Arc::new(RwLock::new(test_app_in(&dir)));
+        apply_provider_snapshot(&app, observed_reading(ProviderId::Claude, 10.0)).await;
+        (app, dir)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_stale_unreadable_provider_does_not_veto_a_current_approval() {
+        use quota_core::types::CanStartBasis;
+
+        let (app, dir) = app_with_current_claude_reading().await;
+        let long_ago = now_unix() - 10_000;
+        apply_provider_snapshot(
+            &app,
+            unreadable_codex_reading(long_ago, quota_core::types::ProviderPermission::Unknown),
+        )
+        .await;
+
+        let all = all_can_start(&app).await;
+
+        let codex = all.answers.iter().find(|a| a.provider == ProviderId::Codex);
+        assert_eq!(codex.unwrap().basis, CanStartBasis::Unavailable);
+        assert!(!codex.unwrap().ok);
+        assert!(all
+            .answers
+            .iter()
+            .any(|a| a.provider == ProviderId::Claude && a.ok));
+        assert!(all.ok, "{all:?}");
+        assert!(!codex_can_start(&app, 0).await.ok);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_current_unreadable_provider_still_vetoes_the_all_provider_answer() {
+        use quota_core::types::CanStartBasis;
+
+        let (app, dir) = app_with_current_claude_reading().await;
+        apply_provider_snapshot(
+            &app,
+            unreadable_codex_reading(now_unix(), quota_core::types::ProviderPermission::Unknown),
+        )
+        .await;
+
+        let all = all_can_start(&app).await;
+
+        let codex = all.answers.iter().find(|a| a.provider == ProviderId::Codex);
+        assert_eq!(codex.unwrap().basis, CanStartBasis::UnknownWindow);
+        assert!(!all.ok, "{all:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_an_explicit_refusal_reads_as_a_refusal_beside_an_unreadable_window() {
+        use quota_core::types::CanStartBasis;
+
+        let (app, dir) = app_with_current_claude_reading().await;
+        apply_provider_snapshot(
+            &app,
+            unreadable_codex_reading(
+                now_unix(),
+                quota_core::types::ProviderPermission::LimitReached,
+            ),
+        )
+        .await;
+
+        let codex = codex_can_start(&app, 0).await.answers.remove(0);
+
+        assert!(!codex.ok);
+        assert_eq!(codex.basis, CanStartBasis::Unavailable);
+        assert!(codex.explanation.contains("limit_reached"), "{codex:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_stalled_provider_does_not_withhold_the_finished_one() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let mut watch = app.read().await.watch_tx.subscribe();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+
+        let cycle = refresh_providers_within(
+            app.clone(),
+            &[ProviderId::Codex, ProviderId::Claude],
+            Duration::from_millis(20),
+            move |_, provider, _| {
+                let release = release.clone();
+                async move {
+                    if provider == ProviderId::Codex {
+                        let held = release.lock().unwrap().take();
+                        if let Some(held) = held {
+                            let _ = held.await;
+                        }
+                        return Some(observed_reading(provider, 20.0));
+                    }
+                    Some(observed_reading(provider, 10.0))
+                }
+            },
+        );
+        let observer = async {
+            let early = tokio::time::timeout(Duration::from_secs(5), watch.recv())
+                .await
+                .expect("the finished provider is published while the other stalls")
+                .unwrap();
+            let claude = early.by_id(ProviderId::Claude).unwrap();
+            assert_eq!(claude.windows[0].used_percent, Some(10.0));
+            assert!(early.by_id(ProviderId::Codex).unwrap().windows.is_empty());
+            assert_eq!(
+                latest_codex_used(&*app.read().await),
+                None,
+                "the stalled provider has published nothing yet"
+            );
+            release_tx.send(()).unwrap();
+            let late = tokio::time::timeout(Duration::from_secs(5), watch.recv())
+                .await
+                .expect("the stalled provider publishes when it finishes")
+                .unwrap();
+            assert_eq!(
+                late.by_id(ProviderId::Codex).unwrap().windows[0].used_percent,
+                Some(20.0)
+            );
+            assert_eq!(
+                late.by_id(ProviderId::Claude).unwrap().windows[0].used_percent,
+                Some(10.0)
+            );
+        };
+
+        tokio::join!(cycle, observer);
+    }
+
+    async fn switch_accounts_during_a_probe(observe_before_switch: bool) {
+        let app = Arc::new(RwLock::new(test_app()));
+        add_codex_account(&app, "acct_a", true).await;
+        let mut watch = app.read().await.watch_tx.subscribe();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let old_account_probe =
+            refresh_provider_with(app.clone(), ProviderId::Codex, move |_, _| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Some(observed_reading(ProviderId::Codex, 99.0))
+            });
+        let switch_then_refresh = async {
+            started_rx.await.unwrap();
+            let requested_before = observe(&*app.read().await, ProviderId::Codex);
+            add_codex_account(&app, "acct_b", true).await;
+            let request = if observe_before_switch {
+                requested_before
+            } else {
+                observe(&*app.read().await, ProviderId::Codex)
+            };
+            let new_account_probe = async {
+                let claim = request
+                    .claim()
+                    .await
+                    .expect("not answered by the old probe");
+                let probed = probe_claimed(&app, claim, |_, _| async {
+                    Some(observed_reading(ProviderId::Codex, 42.0))
+                })
+                .await;
+                publish(&app, probed.into_iter().collect()).await;
+            };
+            let release = async {
+                tokio::task::yield_now().await;
+                let _ = release_tx.send(());
+            };
+            tokio::join!(new_account_probe, release);
+        };
+
+        tokio::join!(old_account_probe, switch_then_refresh);
+
+        assert_eq!(latest_codex_used(&*app.read().await), Some(42.0));
+        let mut last = None;
+        while let Ok(update) = watch.try_recv() {
+            let codex = update.by_id(ProviderId::Codex).unwrap();
+            assert!(
+                codex.windows.iter().all(|w| w.used_percent != Some(99.0)),
+                "the old account's reading was broadcast"
+            );
+            last = codex.windows.first().and_then(|w| w.used_percent);
+        }
+        assert_eq!(last, Some(42.0));
+        let g = app.read().await;
+        assert!(g.store.history_ref().iter().all(|snapshot| snapshot
+            .by_id(ProviderId::Codex)
+            .is_none_or(|codex| codex.windows.iter().all(|w| w.used_percent != Some(99.0)))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_refresh_requested_after_an_account_switch_is_not_lost_to_the_old_probe() {
+        switch_accounts_during_a_probe(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_refresh_requested_before_an_account_switch_still_probes_the_new_account()
+    {
+        switch_accounts_during_a_probe(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_stated_zero_retry_after_is_not_replaced_by_the_maximum_delay() {
+        for provider in [ProviderId::Codex, ProviderId::Claude] {
+            let app = Arc::new(RwLock::new(test_app()));
+            let max = app.read().await.cfg.refresh_max_secs();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            for _ in 0..2 {
+                let calls = calls.clone();
+                refresh_providers(app.clone(), &[provider], move |_, _, mode| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        assert_eq!(mode, ProbeMode::Full);
+                        Some(rate_limited(provider, Some(0)))
+                    }
+                })
+                .await;
+            }
+
+            assert_eq!(calls.load(Ordering::Relaxed), 2, "{provider}");
+            assert!(!provider_in_backoff(&app, provider).await);
+            let g = app.read().await;
+            let stored = g.store.latest().unwrap().by_id(provider).unwrap();
+            assert_eq!(stored.retry_after_secs, Some(0));
+            assert_ne!(stored.retry_after_secs, Some(max));
+            assert_eq!(stored.retry_after_until, None);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_7_a_headerless_rate_limit_still_backs_off_for_the_maximum_delay() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let max = app.read().await.cfg.refresh_max_secs();
+
+        apply_provider_snapshot(&app, rate_limited(ProviderId::Claude, None)).await;
+
+        assert!(provider_in_backoff(&app, ProviderId::Claude).await);
+        let g = app.read().await;
+        let stored = g.store.latest().unwrap().by_id(ProviderId::Claude).unwrap();
+        assert_eq!(stored.retry_after_secs, Some(max));
     }
 
     #[tokio::test(flavor = "current_thread")]
