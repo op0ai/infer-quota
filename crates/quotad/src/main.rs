@@ -41,7 +41,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let cfg = match cli.config {
-        Some(p) => Config::load_path(&p),
+        Some(p) => Config::load_explicit(&p),
         None => Config::load_default(),
     };
     let mut cfg = match cfg {

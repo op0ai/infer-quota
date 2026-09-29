@@ -18,8 +18,8 @@
 use std::path::Path;
 
 use quota_core::types::{
-    AdapterError, Credits, ProviderId, ProviderObservation, ProviderPermission, ProviderSnapshot,
-    Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
+    ActiveIdentity, AdapterError, Credits, ProviderId, ProviderObservation, ProviderPermission,
+    ProviderSnapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use crate::creds::{load_claude_creds, ClaudeCreds, CredsError};
@@ -33,6 +33,17 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 pub struct ClaudeAdapter {
     /// When set, only this Claude config dir is consulted (`home_path` isolation).
     pub config_dir: Option<std::path::PathBuf>,
+}
+
+impl ClaudeAdapter {
+    /// Claude credentials carry no account id, so the account is `Unnamed`
+    /// while they load and `Absent` otherwise. Reads only the local file.
+    pub fn active_identity(&self) -> ActiveIdentity {
+        match load_claude_creds(self.config_dir.as_deref()) {
+            Ok(_) => ActiveIdentity::Unnamed,
+            Err(_) => ActiveIdentity::Absent,
+        }
+    }
 }
 
 impl Provider for ClaudeAdapter {

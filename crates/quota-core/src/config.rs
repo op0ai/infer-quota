@@ -107,7 +107,19 @@ impl Config {
             Err(CapReadError::NotFound(_)) => return Ok(Self::default()),
             Err(e) => return Err(ConfigError::Read(e.to_string())),
         };
-        let config: Self = serde_json::from_slice(&bytes)?;
+        Self::parse(&bytes)
+    }
+
+    /// A path the operator named must exist; only the default path may be absent.
+    pub fn load_explicit(path: &Path) -> Result<Self, ConfigError> {
+        match read_file_capped(path, 64 * 1024) {
+            Ok(bytes) => Self::parse(&bytes),
+            Err(e) => Err(ConfigError::Read(e.to_string())),
+        }
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let config: Self = serde_json::from_slice(bytes)?;
         config.validate()?;
         Ok(config)
     }
@@ -149,6 +161,17 @@ impl Config {
         default_socket_path()
     }
 
+    /// Socket for a client. `--socket` wins, then the config file, then
+    /// `QUOTA_SOCKET`. A broken default config does not hide a socket that
+    /// `QUOTA_SOCKET` names.
+    pub fn client_socket_path(explicit: Option<&Path>) -> Result<PathBuf, ConfigError> {
+        client_socket_from(
+            explicit,
+            Self::load_default,
+            std::env::var("QUOTA_SOCKET").ok(),
+        )
+    }
+
     pub fn history_file(&self) -> Option<PathBuf> {
         if !self.history {
             return None;
@@ -187,6 +210,24 @@ impl Config {
     }
 }
 
+fn client_socket_from(
+    explicit: Option<&Path>,
+    load: impl FnOnce() -> Result<Config, ConfigError>,
+    env_socket: Option<String>,
+) -> Result<PathBuf, ConfigError> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    match load() {
+        Ok(config) => Ok(config.socket_path()),
+        Err(error) => env_socket
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .map(PathBuf::from)
+            .ok_or(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +257,39 @@ mod tests {
         let error = Config::load_path(&path).unwrap_err();
         let _ = std::fs::remove_file(path);
         assert!(error.to_string().contains("malformed config JSON"));
+    }
+
+    #[test]
+    fn coderabbit_explicit_missing_config_is_an_error() {
+        let missing = Path::new("/no/such/quota-explicit-config-xyz.json");
+        let error = Config::load_explicit(missing).unwrap_err();
+        assert!(matches!(error, ConfigError::Read(_)), "{error}");
+        assert_eq!(Config::load_path(missing).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn greptile_5_malformed_default_config_does_not_hide_quota_socket() {
+        let malformed = || Err(ConfigError::Invalid("broken".into()));
+        assert_eq!(
+            client_socket_from(None, malformed, Some("/tmp/env.sock".into())).unwrap(),
+            PathBuf::from("/tmp/env.sock")
+        );
+        assert!(client_socket_from(None, malformed, None).is_err());
+        assert!(client_socket_from(None, malformed, Some("  ".into())).is_err());
+        assert_eq!(
+            client_socket_from(Some(Path::new("/tmp/flag.sock")), malformed, None).unwrap(),
+            PathBuf::from("/tmp/flag.sock")
+        );
+        let configured = || {
+            Ok(Config {
+                socket: Some(PathBuf::from("/tmp/config.sock")),
+                ..Config::default()
+            })
+        };
+        assert_eq!(
+            client_socket_from(None, configured, Some("/tmp/env.sock".into())).unwrap(),
+            PathBuf::from("/tmp/config.sock")
+        );
     }
 
     #[test]

@@ -10,6 +10,15 @@ use thiserror::Error;
 
 const MAX_CRED_BYTES: usize = 64 * 1024;
 
+/// Lowercase SHA-256 hex of a provider account id, so readings from different
+/// sources can be matched to one account without carrying the id itself.
+/// Ids are compared trimmed and case-insensitively (UUIDs vary in case).
+pub fn account_digest(account_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(account_id.trim().to_ascii_lowercase().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CredsError {
     #[error("credential file not found: {0}")]

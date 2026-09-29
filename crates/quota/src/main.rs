@@ -88,16 +88,9 @@ impl From<ProviderArg> for ProviderFilter {
     }
 }
 
-fn socket_path(cli: &Cli) -> Result<PathBuf, quota_core::ConfigError> {
-    if let Some(p) = &cli.socket {
-        return Ok(p.clone());
-    }
-    Ok(Config::load_default()?.socket_path())
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let sock = match socket_path(&cli) {
+    let sock = match Config::client_socket_path(cli.socket.as_deref()) {
         Ok(sock) => sock,
         Err(e) => {
             eprintln!("quota: {e}");

@@ -100,6 +100,19 @@ does not fetch vault material (see [SECURITY.md](SECURITY.md)).
 `deadline` is UTC unix seconds. When omitted, `can_start` binds to the window's
 published `reset_at`.
 
+Each `CanStartAnswer` names its `basis`:
+
+| `basis` | Meaning |
+|---|---|
+| `token_budget` | The window publishes a token budget, and the answer uses it. |
+| `percent_only` | The window publishes only a percentage, so a token request cannot be mapped (`ok: false` unless exhausted). |
+| `unavailable` | The provider has no current reading. |
+| `unknown_window` | The provider reported a window whose measurement could not be read, so that limit may already be exhausted. Refuses. |
+| `account_changed` | The reading was taken for a provider account other than the one the credentials name now. It is checked at every use, not only at publication. Refuses. |
+
+The credentials' account is `named`, `unnamed` (credentials load but name no account; every Claude credential) or `absent` (none load): unless the reading and the credentials name the same account, the reading answers only while exactly one account is known across it, the credentials and the provider's other local sources such as CodexBar, and some credential or local source is present, so a reading whose credentials were removed with no other source refuses with `account_changed`.
+
+
 `watch` keeps the connection open. After the first snapshot, each daemon
 refresh sends another `Response` with the same `id`. A later `ping` on that
 connection is answered and is the only inbound keepalive that resets the

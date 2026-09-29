@@ -8,6 +8,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use quota_core::types::MAX_RETRY_AFTER_SECS;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use thiserror::Error;
 
@@ -202,12 +203,16 @@ fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, TransportError> {
     })
 }
 
+/// Seconds to wait, clamped to [`MAX_RETRY_AFTER_SECS`] for both forms. A
+/// numeric value too large for `u64` is still a (very long) wait.
 fn parse_retry_after(value: &str, now: i64) -> Option<u64> {
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(seconds);
-    }
-    let target = parse_http_date(value, now)?;
-    Some(target.saturating_sub(now).max(0) as u64)
+    let seconds = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        value.parse::<u64>().unwrap_or(u64::MAX)
+    } else {
+        let target = parse_http_date(value, now)?;
+        target.saturating_sub(now).max(0) as u64
+    };
+    Some(seconds.min(MAX_RETRY_AFTER_SECS))
 }
 
 /// RFC 9110 HTTP-date: IMF-fixdate, obsolete RFC 850, and ANSI C `asctime()`.
@@ -405,6 +410,28 @@ mod tests {
             None
         );
         assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn coderabbit_retry_after_numeric_and_date_share_one_ceiling() {
+        let now = 1_445_412_300;
+        assert_eq!(parse_retry_after("0", now), Some(0));
+        assert_eq!(parse_retry_after("86400", now), Some(MAX_RETRY_AFTER_SECS));
+        assert_eq!(parse_retry_after("86401", now), Some(MAX_RETRY_AFTER_SECS));
+        assert_eq!(
+            parse_retry_after("99999999999999999999999", now),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            parse_retry_after("Fri, 21 Oct 2095 07:28:00 GMT", now),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        assert_eq!(parse_retry_after("-5", now), None);
+        let raw = b"HTTP/1.1 429 Too Many\r\nRetry-After: 31536000\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            parse_http_response(raw).unwrap().retry_after_secs,
+            Some(MAX_RETRY_AFTER_SECS)
+        );
     }
 
     #[test]

@@ -167,8 +167,16 @@ struct SnapshotBody {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct AccountIdentity {
+    #[serde(default, rename = "workspaceAccountID")]
+    workspace_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotRecord {
+    #[serde(default)]
+    account_identity: Option<AccountIdentity>,
     #[serde(default)]
     snapshot: Option<SnapshotBody>,
     #[serde(default)]
@@ -349,11 +357,14 @@ pub fn parse_account_snapshots(bytes: &[u8]) -> Result<Vec<ProviderSnapshot>, Co
         let Some(body) = rec.snapshot.as_ref() else {
             continue;
         };
-        out.push(body_to_provider(
-            body,
-            rec.credits.as_ref(),
-            rec.source_label.as_deref(),
-        ));
+        let mut snap = body_to_provider(body, rec.credits.as_ref(), rec.source_label.as_deref());
+        snap.account_digest = rec
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.workspace_account_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+            .map(crate::creds::account_digest);
+        out.push(snap);
     }
     Ok(out)
 }
@@ -484,6 +495,13 @@ const MAX_HISTORY_ROWS: usize = 4096;
 
 /// First readable snapshot in a CodexBar support dir. Skips `cursor-session.json`.
 pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)> {
+    let (snaps, path) = load_account_snapshots_from_dir(dir)?;
+    snaps.into_iter().next().map(|snap| (snap, path))
+}
+
+/// Every account snapshot in the first readable CodexBar snapshot file, one
+/// per account record, each tagged with its `account_digest` when known.
+pub fn load_account_snapshots_from_dir(dir: &Path) -> Option<(Vec<ProviderSnapshot>, PathBuf)> {
     for path in quota_core::codexbar_snapshot_candidates(dir) {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if name == "cursor-session.json" {
@@ -493,13 +511,13 @@ pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)>
             continue;
         };
         if let Ok(snaps) = parse_account_snapshots(&bytes) {
-            if let Some(snap) = snaps.into_iter().next() {
-                return Some((snap, path));
+            if !snaps.is_empty() {
+                return Some((snaps, path));
             }
         }
         if let Ok(snap) = parse_expect_snapshot(&bytes) {
             if snap.status != Availability::Unavailable {
-                return Some((snap, path));
+                return Some((vec![snap], path));
             }
         }
     }
