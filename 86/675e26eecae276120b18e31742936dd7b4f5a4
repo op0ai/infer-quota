@@ -1,0 +1,27 @@
+crates/quotad/src/daemon.rs
+  s_c93df940bfc6e2::t_15d54771a85c04 3629-3735
+  s_c93df940bfc6e2::t_637e6ccb8766ee 1434-1436,1440
+crates/quota-core/src/types.rs
+  s_c93df940bfc6e2::t_637e6ccb8766ee 529-535
+crates/quota-core/src/math.rs
+  s_c93df940bfc6e2::t_637e6ccb8766ee 240-246,250-256,259,264,269,278-279,283-285,288
+  s_c93df940bfc6e2::t_d2fba0646b0734 858-895
+docs/protocol.md
+  s_c93df940bfc6e2::t_2e664819089058 113-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "86675e26eecae276120b18e31742936dd7b4f5a4",
+  "prompts": {},
+  "sessions": {
+    "s_c93df940bfc6e2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b55a8de6-a9f6-484c-8d11-756ea5b0f208",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Arth Tyagi <onarth@icloud.com>"
+    }
+  }
+}
