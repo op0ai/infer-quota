@@ -206,33 +206,57 @@ fn parse_retry_after(value: &str, now: i64) -> Option<u64> {
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(seconds);
     }
-    let date = value.split_once(',')?.1.trim();
-    let mut parts = date.split_whitespace();
-    let day = parts.next()?.parse::<u32>().ok()?;
-    let month = match parts.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year = parts.next()?.parse::<i32>().ok()?;
-    let time = parts.next()?;
-    if parts.next()? != "GMT" || parts.next().is_some() {
+    let target = parse_http_date(value, now)?;
+    Some(target.saturating_sub(now).max(0) as u64)
+}
+
+/// RFC 9110 HTTP-date: IMF-fixdate, obsolete RFC 850, and ANSI C `asctime()`.
+fn parse_http_date(value: &str, now: i64) -> Option<i64> {
+    let normalized = value.replace([',', '-'], " ");
+    let mut tokens = normalized.split_whitespace();
+    let weekday = tokens.next()?;
+    if !weekday.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;
     }
-    let target = quota_core::timeutil::parse_reset_at_str(&format!(
-        "{year:04}-{month:02}-{day:02}T{time}Z"
-    ))?;
-    Some(target.saturating_sub(now).max(0) as u64)
+    let rest: Vec<&str> = tokens.collect();
+    let (day, month, year, time) = match rest.as_slice() {
+        [day, month, year, time, "GMT"] => (*day, *month, *year, *time),
+        [month, day, time, year] => (*day, *month, *year, *time),
+        _ => return None,
+    };
+    let day = day.parse::<u32>().ok()?;
+    let month = month_number(month)?;
+    let year = expand_year(year, now)?;
+    quota_core::timeutil::parse_reset_at_str(&format!("{year:04}-{month:02}-{day:02}T{time}Z"))
+}
+
+fn month_number(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .iter()
+        .position(|month| *month == name)
+        .map(|index| index as u32 + 1)
+}
+
+/// Two-digit RFC 850 years resolve to the century that is not more than 50
+/// years ahead of `now` (RFC 9110 §5.6.7).
+fn expand_year(raw: &str, now: i64) -> Option<i32> {
+    let year = raw.parse::<i32>().ok()?;
+    if raw.len() != 2 {
+        return Some(year);
+    }
+    let current_year = quota_core::timeutil::format_rfc3339(now)
+        .get(..4)?
+        .parse::<i32>()
+        .ok()?;
+    let candidate = current_year - current_year % 100 + year;
+    Some(if candidate > current_year + 50 {
+        candidate - 100
+    } else {
+        candidate
+    })
 }
 
 fn decode_chunked(
@@ -346,5 +370,48 @@ mod tests {
             parse_retry_after("Wed, 21 Oct 2015 07:13:00 GMT", 1_445_412_300),
             Some(0)
         );
+    }
+
+    #[test]
+    fn parses_every_rfc9110_http_date_form() {
+        let now = 1_445_412_300;
+        for date in [
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Wednesday, 21-Oct-15 07:28:00 GMT",
+            "Wed Oct 21 07:28:00 2015",
+        ] {
+            assert_eq!(parse_retry_after(date, now), Some(180), "{date}");
+        }
+        assert_eq!(
+            parse_retry_after("Wed Oct  1 07:28:00 2015", now),
+            Some(0),
+            "single-digit asctime day"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_http_dates() {
+        let now = 1_445_412_300;
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 PST", now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Foo 2015 07:28:00 GMT", now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 25:28:00 GMT", now),
+            None
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn two_digit_years_pick_the_century_within_fifty_years() {
+        let now = 1_445_412_300;
+        assert_eq!(expand_year("15", now), Some(2015));
+        assert_eq!(expand_year("99", now), Some(1999));
+        assert_eq!(expand_year("2015", now), Some(2015));
     }
 }

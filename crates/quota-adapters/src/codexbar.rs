@@ -9,10 +9,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use quota_core::timeutil::{parse_apple_reset_at, parse_apple_reset_at_str, parse_reset_at_str};
+use quota_core::timeutil::{parse_apple_reset_at, parse_reset_at_str};
 use quota_core::types::{
-    AdapterError, Availability, Credits, ProviderId, ProviderPermission, ProviderSnapshot,
-    Snapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
+    AdapterError, Availability, Credits, ProviderId, ProviderObservation, ProviderPermission,
+    ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -55,7 +55,7 @@ impl HistoryRow {
     }
 
     pub fn reset_at(&self) -> Option<i64> {
-        parse_apple_reset_at_str(&self.resets_at)
+        parse_reset_at_str(&self.resets_at)
     }
 
     pub fn quota_window_kind(&self) -> WindowKind {
@@ -75,17 +75,17 @@ impl HistoryRow {
             observed_at,
             DEFAULT_READING_MAX_AGE_SECS,
         );
-        let provider = ProviderSnapshot::observed(
-            ProviderId::parse(&self.provider).unwrap_or(ProviderId::Codex),
-            Some(Source::File),
-            vec![window],
-            None,
-            None,
-            None,
+        let provider = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::parse(&self.provider).unwrap_or(ProviderId::Codex),
+            source: Some(Source::File),
+            windows: vec![window],
+            credits: None,
+            plan: None,
+            credential_path: None,
             observed_at,
-            DEFAULT_READING_MAX_AGE_SECS,
-            ProviderPermission::Unknown,
-        );
+            max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+            permission: ProviderPermission::Unknown,
+        });
         Snapshot::new(fetched, vec![provider])
     }
 }
@@ -289,17 +289,26 @@ fn body_to_provider(
     credits: Option<&CreditsBlock>,
     source_label: Option<&str>,
 ) -> ProviderSnapshot {
-    let observed_at = body.updated_at.as_ref().and_then(parse_apple_reset_at);
+    let document_observed_at = body.updated_at.as_ref().and_then(parse_apple_reset_at);
     let mut windows = Vec::new();
-    if let Some(w) = lane_to_window("primary", body.primary.as_ref(), observed_at) {
+    if let Some(w) = lane_to_window("primary", body.primary.as_ref(), document_observed_at) {
         windows.push(w);
     }
-    if let Some(w) = lane_to_window("secondary", body.secondary.as_ref(), observed_at) {
+    if let Some(w) = lane_to_window("secondary", body.secondary.as_ref(), document_observed_at) {
         windows.push(w);
     }
-    if let Some(w) = lane_to_window("tertiary", body.tertiary.as_ref(), observed_at) {
+    if let Some(w) = lane_to_window("tertiary", body.tertiary.as_ref(), document_observed_at) {
         windows.push(w);
     }
+
+    // Without a document time the provider is only as fresh as its stalest lane.
+    let observed_at = document_observed_at.or_else(|| {
+        windows
+            .iter()
+            .map(|window| window.observed_at)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|times| times.into_iter().min())
+    });
 
     let credits = credits_from_blocks(credits, body.provider_cost.as_ref(), body.credits_remaining);
     let provider = body
@@ -318,17 +327,17 @@ fn body_to_provider(
         return snap;
     }
 
-    ProviderSnapshot::observed(
+    ProviderSnapshot::observed(ProviderObservation {
         provider,
-        Some(source_from_label(source_label)),
+        source: Some(source_from_label(source_label)),
         windows,
         credits,
-        body.login_method.clone(),
-        None,
+        plan: body.login_method.clone(),
+        credential_path: None,
         observed_at,
-        DEFAULT_READING_MAX_AGE_SECS,
-        ProviderPermission::Unknown,
-    )
+        max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+        permission: ProviderPermission::Unknown,
+    })
 }
 
 /// Parse `codex-account-snapshots.redacted.json` (versioned `records` envelope).
@@ -725,6 +734,41 @@ mod tests {
         let window = lane_to_window("primary", Some(&empty), None).unwrap();
         assert_eq!(window.state, quota_core::types::WindowState::Unknown);
         assert!(window.reading.is_none());
+    }
+
+    #[test]
+    fn lane_time_makes_the_provider_current_when_the_document_has_none() {
+        let now = quota_core::timeutil::now_unix();
+        let doc = format!(
+            r#"{{"provider":"codex","primary":{{"usedPercent":10,"windowMinutes":10080,"updatedAt":"{}"}}}}"#,
+            quota_core::timeutil::format_rfc3339(now - 5)
+        );
+        let snap = parse_expect_snapshot(doc.as_bytes()).unwrap();
+        assert_eq!(snap.observed_at, Some(now - 5));
+        assert_eq!(snap.freshness, quota_core::types::Freshness::Current);
+        assert_eq!(snap.status, Availability::Ok);
+    }
+
+    #[test]
+    fn a_lane_without_any_time_keeps_the_provider_stale() {
+        let now = quota_core::timeutil::now_unix();
+        let doc = format!(
+            r#"{{"provider":"codex","primary":{{"usedPercent":10,"windowMinutes":10080,"updatedAt":"{}"}},"secondary":{{"usedPercent":5,"windowMinutes":300}}}}"#,
+            quota_core::timeutil::format_rfc3339(now - 5)
+        );
+        let snap = parse_expect_snapshot(doc.as_bytes()).unwrap();
+        assert_eq!(snap.observed_at, None);
+        assert_ne!(snap.status, Availability::Ok);
+    }
+
+    #[test]
+    fn numeric_string_history_reset_is_unix_seconds() {
+        let row: HistoryRow = serde_json::from_str(
+            r#"{"accountKey":"a","provider":"codex","resetsAt":"1790000000","sampledAt":"1789990000","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#,
+        )
+        .unwrap();
+        assert_eq!(row.reset_at(), Some(1_790_000_000));
+        assert_eq!(row.fetched_at(), Some(1_789_990_000));
     }
 
     #[test]

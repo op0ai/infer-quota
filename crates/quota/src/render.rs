@@ -17,6 +17,18 @@ fn unavailable_status_line(p: &ProviderSnapshot, src: &str) -> String {
     )
 }
 
+/// Remaining wait, counted down to the daemon's deadline rather than echoing
+/// the delay the provider originally sent.
+fn retry_after_line(p: &ProviderSnapshot) -> Option<String> {
+    let remaining = match p.retry_after_until {
+        Some(until) => {
+            u64::try_from(until.saturating_sub(quota_core::timeutil::now_unix())).ok()?
+        }
+        None => p.retry_after_secs?,
+    };
+    (remaining > 0).then(|| format!("retry-after {remaining}s"))
+}
+
 pub fn print_status(snap: &Snapshot) {
     println!("fetched {}", snap.fetched_at_rfc3339);
     if snap.providers.is_empty() {
@@ -84,35 +96,14 @@ pub fn print_status(snap: &Snapshot) {
                     .unwrap_or_else(|| "unavailable".into());
                 println!("{}", unavailable_status_line(p, &src));
                 println!("         {reason}");
-                if let Some(seconds) = p.retry_after_secs {
-                    println!("         retry-after {seconds}s");
+                if let Some(line) = retry_after_line(p) {
+                    println!("         {line}");
                 }
                 if let Some(path) = &p.credential_path {
                     println!("         consulted {path}");
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use quota_core::types::{AdapterError, ProviderId};
-
-    #[test]
-    fn unavailable_status_includes_limit_reached_permission() {
-        let mut provider = ProviderSnapshot::unavailable(
-            ProviderId::Codex,
-            AdapterError::new("empty", "usage response had no windows"),
-        );
-        provider.permission = ProviderPermission::LimitReached;
-        provider.source = Some(quota_core::types::Source::Oauth);
-
-        let line = unavailable_status_line(&provider, "oauth");
-
-        assert!(line.contains("unavailable"));
-        assert!(line.contains("permission=limit_reached"));
     }
 }
 
@@ -144,5 +135,42 @@ pub fn print_can_start(result: &CanStartResult) {
             a.basis,
             a.explanation
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quota_core::types::{AdapterError, ProviderId};
+
+    #[test]
+    fn unavailable_status_includes_limit_reached_permission() {
+        let mut provider = ProviderSnapshot::unavailable(
+            ProviderId::Codex,
+            AdapterError::new("empty", "usage response had no windows"),
+        );
+        provider.permission = ProviderPermission::LimitReached;
+        provider.source = Some(quota_core::types::Source::Oauth);
+
+        let line = unavailable_status_line(&provider, "oauth");
+
+        assert!(line.contains("unavailable"));
+        assert!(line.contains("permission=limit_reached"));
+    }
+
+    #[test]
+    fn retry_after_counts_down_to_the_deadline() {
+        let now = quota_core::timeutil::now_unix();
+        let mut provider = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("rate_limited", "HTTP 429"),
+        );
+        provider.retry_after_secs = Some(120);
+        provider.retry_after_until = Some(now + 30);
+        let line = retry_after_line(&provider).unwrap();
+        assert!(["retry-after 30s", "retry-after 29s"].contains(&line.as_str()));
+
+        provider.retry_after_until = Some(now - 5);
+        assert_eq!(retry_after_line(&provider), None);
     }
 }

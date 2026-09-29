@@ -18,8 +18,8 @@
 use std::path::Path;
 
 use quota_core::types::{
-    AdapterError, Credits, ProviderId, ProviderPermission, ProviderSnapshot, Source, UsageWindow,
-    WindowKind, DEFAULT_READING_MAX_AGE_SECS,
+    AdapterError, Credits, ProviderId, ProviderObservation, ProviderPermission, ProviderSnapshot,
+    Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use crate::creds::{load_claude_creds, ClaudeCreds, CredsError};
@@ -222,15 +222,13 @@ fn parse_usage_json(body: &[u8], path: &str, observed_at: i64) -> ProviderSnapsh
 
     let credits = v.get("extra_usage").and_then(map_extra_usage);
     if let Some(extra) = v.get("extra_usage") {
-        if let Some(util) = extra.get("utilization").and_then(|x| x.as_f64()) {
-            windows.push(UsageWindow::from_percent_at(
+        if let Some(node) = extra.get("utilization").filter(|node| !node.is_null()) {
+            windows.push(percent_window(
+                node.as_f64(),
                 WindowKind::Monthly,
                 "extra usage",
-                util,
                 None,
-                None,
-                Some(observed_at),
-                DEFAULT_READING_MAX_AGE_SECS,
+                observed_at,
             ));
         }
     }
@@ -248,17 +246,17 @@ fn parse_usage_json(body: &[u8], path: &str, observed_at: i64) -> ProviderSnapsh
         return snap;
     }
 
-    ProviderSnapshot::observed(
-        ProviderId::Claude,
-        Some(Source::Oauth),
+    ProviderSnapshot::observed(ProviderObservation {
+        provider: ProviderId::Claude,
+        source: Some(Source::Oauth),
         windows,
         credits,
-        None,
-        Some(path.to_string()),
-        Some(observed_at),
-        DEFAULT_READING_MAX_AGE_SECS,
-        ProviderPermission::Unknown,
-    )
+        plan: None,
+        credential_path: Some(path.to_string()),
+        observed_at: Some(observed_at),
+        max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+        permission: ProviderPermission::Unknown,
+    })
 }
 
 fn push_bucket(
@@ -278,7 +276,23 @@ fn push_bucket(
     let reset = node
         .get("resets_at")
         .and_then(quota_core::timeutil::parse_reset_at);
-    windows.push(match node.get("utilization").and_then(|x| x.as_f64()) {
+    windows.push(percent_window(
+        node.get("utilization").and_then(|x| x.as_f64()),
+        kind,
+        label,
+        reset,
+        observed_at,
+    ));
+}
+
+fn percent_window(
+    used: Option<f64>,
+    kind: WindowKind,
+    label: &str,
+    reset: Option<i64>,
+    observed_at: i64,
+) -> UsageWindow {
+    match used {
         Some(used) if used.is_finite() && used >= 0.0 => UsageWindow::from_percent_at(
             kind,
             label,
@@ -296,7 +310,7 @@ fn push_bucket(
             Some(observed_at),
             DEFAULT_READING_MAX_AGE_SECS,
         ),
-    });
+    }
 }
 
 fn map_extra_usage(node: &serde_json::Value) -> Option<Credits> {
@@ -372,7 +386,8 @@ mod tests {
             br#"{"five_hour":{"resets_at":"2026-10-01T00:00:00Z"}}"#,
             Path::new("c.json"),
         );
-        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.error.as_ref().unwrap().code, "unreadable");
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(
             snap.windows[0].state,
@@ -380,6 +395,23 @@ mod tests {
         );
         assert!(snap.windows[0].reading.is_none());
         assert!(serde_json::to_value(&snap).unwrap()["windows"][0]["reading"].is_null());
+    }
+
+    #[test]
+    fn negative_extra_usage_is_unknown_and_not_healthy() {
+        let snap = parse_usage_http(
+            200,
+            br#"{"extra_usage":{"utilization":-5.0}}"#,
+            Path::new("c.json"),
+        );
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(snap.windows[0].label, "extra usage");
+        assert_eq!(
+            snap.windows[0].state,
+            quota_core::types::WindowState::Unknown
+        );
+        assert!(snap.windows[0].reading.is_none());
+        assert_eq!(snap.status, Availability::Unavailable);
     }
 
     #[test]

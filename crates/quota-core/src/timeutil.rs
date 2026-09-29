@@ -28,8 +28,9 @@ pub fn parse_reset_at(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-/// Parse a CodexBar timestamp, whose numeric values use Apple's 2001 epoch.
-/// RFC3339 values are already unambiguous and remain ordinary UTC timestamps.
+/// Parse a CodexBar timestamp, whose JSON numbers use Apple's 2001 epoch.
+/// Strings are RFC3339 or Unix text, exactly as in [`parse_reset_at_str`]: only
+/// a JSON number carries the Apple epoch.
 pub fn parse_apple_reset_at(value: &serde_json::Value) -> Option<i64> {
     match value {
         serde_json::Value::Null => None,
@@ -37,20 +38,9 @@ pub fn parse_apple_reset_at(value: &serde_json::Value) -> Option<i64> {
             .as_i64()
             .or_else(|| n.as_f64().map(|f| f as i64))
             .map(normalize_apple_epoch),
-        serde_json::Value::String(s) => parse_apple_reset_at_str(s),
+        serde_json::Value::String(s) => parse_reset_at_str(s),
         _ => None,
     }
-}
-
-pub fn parse_apple_reset_at_str(s: &str) -> Option<i64> {
-    let t = s.trim();
-    if let Ok(n) = t.parse::<i64>() {
-        return Some(normalize_apple_epoch(n));
-    }
-    if let Ok(n) = t.parse::<f64>() {
-        return Some(normalize_apple_epoch(n as i64));
-    }
-    parse_reset_at_str(t)
 }
 
 pub fn parse_reset_at_str(s: &str) -> Option<i64> {
@@ -213,15 +203,29 @@ mod tests {
     fn apple_epoch_is_source_specific_and_has_no_2032_cutoff() {
         assert_eq!(normalize_apple_epoch(812_739_489), 1_791_046_689);
         assert_eq!(normalize_apple_epoch(812_739_489_000), 1_791_046_689);
-        assert_eq!(parse_apple_reset_at_str("812739489"), Some(1_791_046_689));
+        assert_eq!(
+            parse_apple_reset_at(&serde_json::json!(812_739_489)),
+            Some(1_791_046_689)
+        );
         assert_eq!(normalize_apple_epoch(1_009_843_200), 1_988_150_400);
         assert_eq!(normalize_apple_epoch(1_009_843_200_000), 1_988_150_400);
-        assert_eq!(parse_apple_reset_at_str("1009843200"), Some(1_988_150_400));
         assert_eq!(
             parse_apple_reset_at(&serde_json::json!(1_009_843_200)),
             Some(1_988_150_400)
         );
         assert_eq!(normalize_epoch(1_009_843_200), 1_009_843_200);
         assert_eq!(parse_reset_at_str("812739489"), Some(812_739_489));
+    }
+
+    #[test]
+    fn numeric_strings_stay_unix_seconds_for_codexbar_values() {
+        assert_eq!(
+            parse_apple_reset_at(&serde_json::json!("1790000000")),
+            Some(1_790_000_000)
+        );
+        assert_eq!(
+            parse_apple_reset_at(&serde_json::json!("2026-08-06T17:40:00Z")),
+            parse_reset_at_str("2026-08-06T17:40:00Z")
+        );
     }
 }

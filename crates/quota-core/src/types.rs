@@ -320,8 +320,13 @@ pub struct ProviderSnapshot {
     pub max_age_secs: u64,
     #[serde(default)]
     pub freshness: Freshness,
+    /// Seconds left until the provider may be probed again. Recomputed from
+    /// `retry_after_until` every time freshness is refreshed.
     #[serde(default)]
     pub retry_after_secs: Option<u64>,
+    /// UTC Unix second at which the provider's retry deadline elapses.
+    #[serde(default)]
+    pub retry_after_until: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
     pub windows: Vec<UsageWindow>,
@@ -336,32 +341,60 @@ pub struct ProviderSnapshot {
     pub credential_path: Option<String>,
 }
 
+/// Everything a collector learned from one successful provider response.
+pub struct ProviderObservation {
+    pub provider: ProviderId,
+    pub source: Option<Source>,
+    pub windows: Vec<UsageWindow>,
+    pub credits: Option<Credits>,
+    pub plan: Option<String>,
+    pub credential_path: Option<String>,
+    pub observed_at: Option<i64>,
+    pub max_age_secs: u64,
+    pub permission: ProviderPermission,
+}
+
 impl ProviderSnapshot {
-    pub fn observed(
-        provider: ProviderId,
-        source: Option<Source>,
-        windows: Vec<UsageWindow>,
-        credits: Option<Credits>,
-        plan: Option<String>,
-        credential_path: Option<String>,
-        observed_at: Option<i64>,
-        max_age_secs: u64,
-        permission: ProviderPermission,
-    ) -> Self {
+    pub fn observed(observation: ProviderObservation) -> Self {
+        let ProviderObservation {
+            provider,
+            source,
+            windows,
+            credits,
+            plan,
+            credential_path,
+            observed_at,
+            max_age_secs,
+            permission,
+        } = observation;
+        let readable = windows
+            .iter()
+            .any(|window| window.state != WindowState::Unknown);
+        let error = (!readable && credits.is_none()).then(|| {
+            AdapterError::new(
+                "unreadable",
+                "provider reported windows but none had a readable measurement",
+            )
+        });
         let mut snapshot = Self {
             provider,
-            status: Availability::Ok,
+            status: if error.is_some() {
+                Availability::Unavailable
+            } else {
+                Availability::Ok
+            },
             permission,
             exhausted_windows: Vec::new(),
             observed_at,
             max_age_secs,
             freshness: Freshness::Unknown,
             retry_after_secs: None,
+            retry_after_until: None,
             source,
             windows,
             credits,
             plan,
-            error: None,
+            error,
             credential_path,
         };
         for window in &mut snapshot.windows {
@@ -384,6 +417,7 @@ impl ProviderSnapshot {
             max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
             freshness: Freshness::Unknown,
             retry_after_secs: None,
+            retry_after_until: None,
             source: None,
             windows: Vec::new(),
             credits: None,
@@ -398,6 +432,15 @@ impl ProviderSnapshot {
     }
 
     pub fn refresh_freshness(&mut self, now: i64) {
+        if self.retry_after_until.is_none() {
+            self.retry_after_until = self
+                .retry_after_secs
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| now.saturating_add(seconds.min(i64::MAX as u64) as i64));
+        }
+        if let Some(until) = self.retry_after_until {
+            self.retry_after_secs = (until > now).then(|| until.abs_diff(now));
+        }
         for window in &mut self.windows {
             window.refresh_freshness(now);
         }
@@ -458,6 +501,27 @@ impl Snapshot {
             provider.refresh_freshness(now);
         }
         snapshot
+    }
+
+    /// Seconds until the first reading in this snapshot stops being current,
+    /// or `None` when nothing is still current.
+    pub fn secs_until_next_expiry(&self, now: i64) -> Option<u64> {
+        self.providers
+            .iter()
+            .flat_map(|provider| {
+                std::iter::once((provider.observed_at, provider.max_age_secs)).chain(
+                    provider
+                        .windows
+                        .iter()
+                        .map(|window| (window.observed_at, window.max_age_secs)),
+                )
+            })
+            .filter_map(|(observed_at, max_age_secs)| {
+                let expires_at =
+                    observed_at?.saturating_add(max_age_secs.min(i64::MAX as u64) as i64);
+                (expires_at >= now).then(|| expires_at.abs_diff(now).saturating_add(1))
+            })
+            .min()
     }
 }
 
@@ -523,17 +587,17 @@ mod tests {
             Some(1_000),
             60,
         );
-        let provider = ProviderSnapshot::observed(
-            ProviderId::Codex,
-            Some(Source::Oauth),
-            vec![window],
-            None,
-            None,
-            None,
-            Some(1_000),
-            60,
-            ProviderPermission::Allowed,
-        );
+        let provider = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(Source::Oauth),
+            windows: vec![window],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(1_000),
+            max_age_secs: 60,
+            permission: ProviderPermission::Allowed,
+        });
         let snapshot = Snapshot::new(1_000, vec![provider]).refreshed_at(1_061);
         let codex = snapshot.by_id(ProviderId::Codex).unwrap();
         assert_eq!(codex.status, Availability::Stale);
@@ -546,10 +610,10 @@ mod tests {
 
     #[test]
     fn evidence_within_max_age_is_current() {
-        let mut provider = ProviderSnapshot::observed(
-            ProviderId::Codex,
-            Some(Source::Oauth),
-            vec![UsageWindow::from_percent_at(
+        let mut provider = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(Source::Oauth),
+            windows: vec![UsageWindow::from_percent_at(
                 WindowKind::Weekly,
                 "weekly",
                 20.0,
@@ -558,15 +622,85 @@ mod tests {
                 Some(1_000),
                 60,
             )],
-            None,
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(1_000),
+            max_age_secs: 60,
+            permission: ProviderPermission::Allowed,
+        });
+        provider.refresh_freshness(1_060);
+        assert_eq!(provider.status, Availability::Ok);
+        assert_eq!(provider.freshness, Freshness::Current);
+    }
+
+    fn observation(windows: Vec<UsageWindow>) -> ProviderObservation {
+        ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(Source::Oauth),
+            windows,
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(1_000),
+            max_age_secs: 60,
+            permission: ProviderPermission::Unknown,
+        }
+    }
+
+    #[test]
+    fn only_unreadable_windows_are_not_a_healthy_provider() {
+        let unreadable =
+            UsageWindow::unreadable(WindowKind::FiveHour, "5h", None, None, Some(1_000), 60);
+        let provider = ProviderSnapshot::observed(observation(vec![unreadable.clone()]));
+        assert_eq!(provider.status, Availability::Unavailable);
+        assert_eq!(provider.error.as_ref().unwrap().code, "unreadable");
+        assert_eq!(provider.windows.len(), 1);
+
+        let readable = UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            10.0,
             None,
             None,
             Some(1_000),
             60,
-            ProviderPermission::Allowed,
         );
-        provider.refresh_freshness(1_060);
-        assert_eq!(provider.status, Availability::Ok);
-        assert_eq!(provider.freshness, Freshness::Current);
+        let mixed = ProviderSnapshot::observed(observation(vec![unreadable, readable]));
+        assert!(mixed.error.is_none());
+    }
+
+    #[test]
+    fn retry_after_counts_down_from_a_fixed_deadline() {
+        let mut provider = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("rate_limited", "HTTP 429"),
+        );
+        provider.retry_after_secs = Some(120);
+        provider.refresh_freshness(1_000);
+        assert_eq!(provider.retry_after_until, Some(1_120));
+        assert_eq!(provider.retry_after_secs, Some(120));
+        provider.refresh_freshness(1_100);
+        assert_eq!(provider.retry_after_secs, Some(20));
+        provider.refresh_freshness(1_120);
+        assert_eq!(provider.retry_after_secs, None);
+    }
+
+    #[test]
+    fn next_expiry_names_the_first_reading_to_go_stale() {
+        let window = UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            10.0,
+            None,
+            None,
+            Some(1_000),
+            60,
+        );
+        let provider = ProviderSnapshot::observed(observation(vec![window]));
+        let snapshot = Snapshot::new(1_000, vec![provider]);
+        assert_eq!(snapshot.secs_until_next_expiry(1_000), Some(61));
+        assert_eq!(snapshot.secs_until_next_expiry(1_060), Some(1));
+        assert_eq!(snapshot.secs_until_next_expiry(1_061), None);
     }
 }

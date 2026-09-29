@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use quota_core::types::{
-    AdapterError, Availability, Credits, ProviderId, ProviderPermission, ProviderSnapshot, Source,
-    UsageWindow, DEFAULT_READING_MAX_AGE_SECS,
+    AdapterError, Availability, Credits, ProviderId, ProviderObservation, ProviderPermission,
+    ProviderSnapshot, Source, UsageWindow, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use crate::codexbar;
@@ -69,11 +69,6 @@ impl Provider for CodexAdapter {
                 // A file snapshot can provide fallback usage, but it must not
                 // erase the API's per-provider rate-limit deadline.
                 file.retry_after_secs = api.retry_after_secs;
-                // Permission is independent evidence from the API response.
-                // Keep an explicit decision when the file only contributes usage.
-                if api.permission != ProviderPermission::Unknown {
-                    file.permission = api.permission;
-                }
                 file
             }
             None => api,
@@ -302,17 +297,17 @@ fn parse_usage_json(body: &[u8], path: &str, observed_at: i64) -> ProviderSnapsh
         return snap;
     }
 
-    ProviderSnapshot::observed(
-        ProviderId::Codex,
-        Some(Source::Oauth),
+    ProviderSnapshot::observed(ProviderObservation {
+        provider: ProviderId::Codex,
+        source: Some(Source::Oauth),
         windows,
         credits,
         plan,
-        Some(path.to_string()),
-        Some(observed_at),
-        DEFAULT_READING_MAX_AGE_SECS,
+        credential_path: Some(path.to_string()),
+        observed_at: Some(observed_at),
+        max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
         permission,
-    )
+    })
 }
 
 fn parse_permission(rate: &serde_json::Value) -> ProviderPermission {
@@ -517,7 +512,8 @@ mod tests {
             br#"{"rate_limit":{"primary_window":{"reset_at":1800000000}}}"#,
             Path::new("auth.json"),
         );
-        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.error.as_ref().unwrap().code, "unreadable");
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(
             snap.windows[0].state,
@@ -660,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn file_fallback_preserves_explicit_api_refusal_without_windows() {
+    fn file_fallback_does_not_inherit_permission_from_an_unmatched_account() {
         let home = unique_test_dir();
         std::fs::write(home.join("auth.json"), br#"{"access_token":"test-token"}"#).unwrap();
         let transport = MockTransport::ok_json(
@@ -680,7 +676,7 @@ mod tests {
         let snapshot = adapter.probe(&ctx);
 
         assert_eq!(snapshot.source, Some(Source::File));
-        assert_eq!(snapshot.permission, ProviderPermission::LimitReached);
+        assert_eq!(snapshot.permission, ProviderPermission::Unknown);
         assert!(!snapshot.windows.is_empty());
         let _ = std::fs::remove_dir_all(home);
     }

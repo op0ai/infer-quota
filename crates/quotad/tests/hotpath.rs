@@ -41,7 +41,7 @@ fn fixtures_dir() -> PathBuf {
 fn spawn_daemon(enable_codexbar: bool) -> Daemon {
     let temp_dir = tempfile::tempdir().expect("unique hotpath test directory");
     let dir = temp_dir.path();
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     let socket = dir.join("quota.sock");
     let home = dir.join("home");
     fs::create_dir_all(&home).unwrap();

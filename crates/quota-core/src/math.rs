@@ -390,13 +390,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AdapterError, Credits};
+    use crate::types::{AdapterError, Credits, ProviderObservation};
 
     fn provider_at(provider: ProviderId, used: f64, observed_at: i64) -> ProviderSnapshot {
-        ProviderSnapshot::observed(
+        ProviderSnapshot::observed(ProviderObservation {
             provider,
-            Some(crate::types::Source::Oauth),
-            vec![UsageWindow::from_percent_at(
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![UsageWindow::from_percent_at(
                 WindowKind::Session,
                 "5h",
                 used,
@@ -405,13 +405,13 @@ mod tests {
                 Some(observed_at),
                 crate::types::DEFAULT_READING_MAX_AGE_SECS,
             )],
-            None,
-            Some("plus".into()),
-            None,
-            Some(observed_at),
-            crate::types::DEFAULT_READING_MAX_AGE_SECS,
-            crate::types::ProviderPermission::Unknown,
-        )
+            credits: None,
+            plan: Some("plus".into()),
+            credential_path: None,
+            observed_at: Some(observed_at),
+            max_age_secs: crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            permission: crate::types::ProviderPermission::Unknown,
+        })
     }
 
     fn ok_provider(used: f64) -> ProviderSnapshot {
@@ -539,17 +539,17 @@ mod tests {
             ),
             UsageWindow::unreadable(WindowKind::Monthly, "monthly", None, None, Some(now), 300),
         ];
-        let snapshot = ProviderSnapshot::observed(
-            ProviderId::Codex,
-            Some(crate::types::Source::Oauth),
+        let snapshot = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(crate::types::Source::Oauth),
             windows,
-            None,
-            None,
-            None,
-            Some(now),
-            300,
-            crate::types::ProviderPermission::Unknown,
-        );
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 300,
+            permission: crate::types::ProviderPermission::Unknown,
+        });
         assert_eq!(snapshot.exhausted_windows, ["5h", "weekly"]);
         assert_eq!(
             snapshot.windows[2].state,

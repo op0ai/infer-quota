@@ -597,12 +597,33 @@ fn apply_snapshot_locked(g: &mut App, snap: Snapshot) {
 }
 
 async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
-    let snap = snap.refreshed_at(now_unix());
+    let mut snap = snap;
     let mut g = app.write().await;
+    for provider in &mut snap.providers {
+        ensure_rate_limit_backoff(&g, provider);
+    }
+    let snap = snap.refreshed_at(now_unix());
     for provider in &snap.providers {
         record_retry_after(&mut g, provider);
     }
     apply_snapshot_locked(&mut g, snap);
+}
+
+/// A 429 that names no `Retry-After` still backs that provider off, for the
+/// longest interval the scheduler would ever wait.
+fn ensure_rate_limit_backoff(g: &App, provider: &mut ProviderSnapshot) {
+    let rate_limited = provider
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == "rate_limited");
+    if rate_limited
+        && provider
+            .retry_after_secs
+            .filter(|seconds| *seconds > 0)
+            .is_none()
+    {
+        provider.retry_after_secs = Some(g.cfg.refresh_max_secs());
+    }
 }
 
 fn record_retry_after(g: &mut App, provider: &ProviderSnapshot) {
@@ -619,9 +640,10 @@ fn record_retry_after(g: &mut App, provider: &ProviderSnapshot) {
     }
 }
 
-async fn apply_provider_snapshot(app: &Arc<RwLock<App>>, provider: ProviderSnapshot) {
+async fn apply_provider_snapshot(app: &Arc<RwLock<App>>, mut provider: ProviderSnapshot) {
     let now = now_unix();
     let mut g = app.write().await;
+    ensure_rate_limit_backoff(&g, &mut provider);
     let mut providers = g
         .store
         .latest()
@@ -799,7 +821,7 @@ async fn handle_client(
             };
             let params: WatchParams =
                 serde_json::from_value(req.params.clone()).unwrap_or_default();
-            let (mut rx, idle_dur) = {
+            let (mut rx, idle_dur, mut latest) = {
                 let g = app.read().await;
                 let snap = filter_snapshot(g.store.latest(), params.provider);
                 write_frame_timed(
@@ -808,25 +830,40 @@ async fn handle_client(
                 )
                 .await?;
                 let idle_dur = watch_idle_timeout(g.cfg.refresh_max_secs());
-                (g.watch_tx.subscribe(), idle_dur)
+                (g.watch_tx.subscribe(), idle_dur, g.store.latest().cloned())
             };
             let idle = tokio::time::sleep(idle_dur);
             tokio::pin!(idle);
+            let expiry = tokio::time::sleep_until(next_expiry_deadline(latest.as_ref()));
+            tokio::pin!(expiry);
             loop {
                 tokio::select! {
                     next = rx.recv() => {
                         match next {
                             Ok(snap) => {
-                                let snap = filter_snapshot(Some(&snap), params.provider);
+                                let filtered = filter_snapshot(Some(&snap), params.provider);
+                                latest = Some(snap);
                                 write_frame_timed(
                                     &mut stream,
-                                    &Response::result(req.id, StatusResult { snapshot: snap }),
+                                    &Response::result(req.id, StatusResult { snapshot: filtered }),
                                 )
                                 .await?;
                                 idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
+                                expiry.as_mut().reset(next_expiry_deadline(latest.as_ref()));
                             }
                             Err(_) => return Ok(()),
                         }
+                    }
+                    _ = &mut expiry => {
+                        // Readings age out between refreshes; tell the watcher
+                        // the moment `current` stops being true.
+                        let aged = filter_snapshot(latest.as_ref(), params.provider);
+                        write_frame_timed(
+                            &mut stream,
+                            &Response::result(req.id, StatusResult { snapshot: aged }),
+                        )
+                        .await?;
+                        expiry.as_mut().reset(next_expiry_deadline(latest.as_ref()));
                     }
                     incoming = read_frame_async(&mut stream) => {
                         match incoming {
@@ -1003,6 +1040,16 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
     }
 }
 
+/// When the newest reading stops being current; a year out when none will.
+fn next_expiry_deadline(latest: Option<&Snapshot>) -> tokio::time::Instant {
+    const NEVER: Duration = Duration::from_secs(365 * 24 * 3600);
+    let wait = latest
+        .and_then(|snapshot| snapshot.secs_until_next_expiry(now_unix()))
+        .map(Duration::from_secs)
+        .unwrap_or(NEVER);
+    tokio::time::Instant::now() + wait
+}
+
 fn filter_snapshot(snap: Option<&Snapshot>, filter: ProviderFilter) -> Snapshot {
     let now = now_unix();
     match snap {
@@ -1062,7 +1109,7 @@ async fn write_frame_timed(stream: &mut UnixStream, resp: &Response) -> Result<(
 mod tests {
     use super::*;
     use quota_core::protocol::{METHOD_PING, METHOD_VERSION};
-    use quota_core::types::{AdapterError, ProviderId, ProviderSnapshot};
+    use quota_core::types::{AdapterError, ProviderId, ProviderObservation, ProviderSnapshot};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1152,6 +1199,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn headerless_rate_limit_backs_off_for_the_longest_refresh_interval() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let max = app.read().await.cfg.refresh_max_secs();
+        let limited = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("rate_limited", "HTTP 429"),
+        );
+        assert_eq!(limited.retry_after_secs, None);
+
+        apply_provider_snapshot(&app, limited).await;
+
+        assert!(provider_in_backoff(&app, ProviderId::Claude).await);
+        let g = app.read().await;
+        let stored = g.store.latest().unwrap().by_id(ProviderId::Claude).unwrap();
+        assert_eq!(stored.retry_after_secs, Some(max));
+    }
+
+    #[test]
+    fn watch_deadline_tracks_the_first_reading_to_expire() {
+        let now = now_unix();
+        let provider = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: None,
+            windows: vec![quota_core::types::UsageWindow::from_percent_at(
+                quota_core::types::WindowKind::Weekly,
+                "weekly",
+                10.0,
+                None,
+                None,
+                Some(now),
+                2,
+            )],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 2,
+            permission: quota_core::types::ProviderPermission::Unknown,
+        });
+        let snapshot = Snapshot::new(now, vec![provider]);
+        let soon = next_expiry_deadline(Some(&snapshot)) - tokio::time::Instant::now();
+        assert!(soon <= Duration::from_secs(4), "{soon:?}");
+        let never = next_expiry_deadline(None) - tokio::time::Instant::now();
+        assert!(never > Duration::from_secs(24 * 3600));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn codex_fallback_retry_after_does_not_block_claude_refresh() {
         use quota_adapters::http::{HttpResponse, MockTransport};
         use quota_adapters::provider::ProbeCtx;
@@ -1206,10 +1300,10 @@ mod tests {
         refresh_provider_with(app.clone(), ProviderId::Claude, move |_| async move {
             claude_calls_probe.fetch_add(1, Ordering::Relaxed);
             let now = now_unix();
-            Some(ProviderSnapshot::observed(
-                ProviderId::Claude,
-                Some(Source::Oauth),
-                vec![UsageWindow::from_percent_at(
+            Some(ProviderSnapshot::observed(ProviderObservation {
+                provider: ProviderId::Claude,
+                source: Some(Source::Oauth),
+                windows: vec![UsageWindow::from_percent_at(
                     WindowKind::Weekly,
                     "weekly",
                     25.0,
@@ -1218,13 +1312,13 @@ mod tests {
                     Some(now),
                     300,
                 )],
-                None,
-                None,
-                None,
-                Some(now),
-                300,
-                ProviderPermission::Allowed,
-            ))
+                credits: None,
+                plan: None,
+                credential_path: None,
+                observed_at: Some(now),
+                max_age_secs: 300,
+                permission: ProviderPermission::Allowed,
+            }))
         })
         .await;
 
@@ -1249,10 +1343,10 @@ mod tests {
         let now = now_unix();
         apply_provider_snapshot(
             &app,
-            ProviderSnapshot::observed(
-                ProviderId::Codex,
-                Some(Source::Oauth),
-                vec![UsageWindow::from_percent_at(
+            ProviderSnapshot::observed(ProviderObservation {
+                provider: ProviderId::Codex,
+                source: Some(Source::Oauth),
+                windows: vec![UsageWindow::from_percent_at(
                     WindowKind::Weekly,
                     "weekly",
                     30.0,
@@ -1261,13 +1355,13 @@ mod tests {
                     Some(now),
                     300,
                 )],
-                None,
-                None,
-                None,
-                Some(now),
-                300,
-                ProviderPermission::Allowed,
-            ),
+                credits: None,
+                plan: None,
+                credential_path: None,
+                observed_at: Some(now),
+                max_age_secs: 300,
+                permission: ProviderPermission::Allowed,
+            }),
         )
         .await;
         let mut claude_limited = ProviderSnapshot::unavailable(
@@ -1284,10 +1378,10 @@ mod tests {
         refresh_provider_with(app.clone(), ProviderId::Codex, move |_| async move {
             codex_after_claude_probe.fetch_add(1, Ordering::Relaxed);
             let now = now_unix();
-            Some(ProviderSnapshot::observed(
-                ProviderId::Codex,
-                Some(Source::Oauth),
-                vec![UsageWindow::from_percent_at(
+            Some(ProviderSnapshot::observed(ProviderObservation {
+                provider: ProviderId::Codex,
+                source: Some(Source::Oauth),
+                windows: vec![UsageWindow::from_percent_at(
                     WindowKind::Weekly,
                     "weekly",
                     35.0,
@@ -1296,13 +1390,13 @@ mod tests {
                     Some(now),
                     300,
                 )],
-                None,
-                None,
-                None,
-                Some(now),
-                300,
-                ProviderPermission::Allowed,
-            ))
+                credits: None,
+                plan: None,
+                credential_path: None,
+                observed_at: Some(now),
+                max_age_secs: 300,
+                permission: ProviderPermission::Allowed,
+            }))
         })
         .await;
         assert_eq!(codex_after_claude_calls.load(Ordering::Relaxed), 1);
@@ -1342,10 +1436,10 @@ mod tests {
         let app = Arc::new(RwLock::new(test_app()));
         let now = now_unix();
         let observed = |provider, used, observed_at| {
-            ProviderSnapshot::observed(
+            ProviderSnapshot::observed(ProviderObservation {
                 provider,
-                Some(Source::Oauth),
-                vec![UsageWindow::from_percent_at(
+                source: Some(Source::Oauth),
+                windows: vec![UsageWindow::from_percent_at(
                     WindowKind::Weekly,
                     "weekly",
                     used,
@@ -1354,13 +1448,13 @@ mod tests {
                     Some(observed_at),
                     300,
                 )],
-                None,
-                None,
-                None,
-                Some(observed_at),
-                300,
-                ProviderPermission::Allowed,
-            )
+                credits: None,
+                plan: None,
+                credential_path: None,
+                observed_at: Some(observed_at),
+                max_age_secs: 300,
+                permission: ProviderPermission::Allowed,
+            })
         };
 
         apply_provider_snapshot(&app, observed(ProviderId::Codex, 10.0, now - 100)).await;
@@ -1413,17 +1507,17 @@ mod tests {
         let make = |permission| {
             Snapshot::new(
                 now,
-                vec![ProviderSnapshot::observed(
-                    ProviderId::Codex,
-                    Some(quota_core::types::Source::Oauth),
-                    Vec::new(),
-                    None,
-                    None,
-                    None,
-                    Some(now),
-                    300,
+                vec![ProviderSnapshot::observed(ProviderObservation {
+                    provider: ProviderId::Codex,
+                    source: Some(quota_core::types::Source::Oauth),
+                    windows: Vec::new(),
+                    credits: None,
+                    plan: None,
+                    credential_path: None,
+                    observed_at: Some(now),
+                    max_age_secs: 300,
                     permission,
-                )],
+                })],
             )
         };
         let allowed = make(quota_core::types::ProviderPermission::Allowed);
