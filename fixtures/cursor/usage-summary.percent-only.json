@@ -1,0 +1,22 @@
+{
+  "_pinned_from": [
+    "https://github.com/steipete/CodexBar/blob/25bba9b7fd9ce83c33053958f7366e23b2dc8a82/Sources/CodexBarCore/Providers/Cursor/CursorStatusProbe.swift#L1404-L1438 (fetchUsageSummary: GET /api/usage-summary, Cookie header L1412, 401/403 = not logged in L1420)",
+    "https://github.com/steipete/CodexBar/blob/25bba9b7fd9ce83c33053958f7366e23b2dc8a82/Sources/CodexBarCore/Providers/Cursor/CursorStatusProbe.swift#L201-L278 (CursorUsageSummary, CursorIndividualUsage, CursorPlanUsage, CursorOnDemandUsage; used/limit/remaining in cents)",
+    "https://github.com/steipete/CodexBar/blob/25bba9b7fd9ce83c33053958f7366e23b2dc8a82/Sources/CodexBarCore/Providers/Cursor/CursorStatusProbe+UsageSummary.swift#L15-L16,L43-L61,L85-L86 (billing cycle dates, plan percent, on-demand cents to USD)",
+    "Synthetic values: no real account data."
+  ],
+  "billingCycleStart": "2025-10-01T00:00:00.000Z",
+  "billingCycleEnd": "2025-11-01T00:00:00.000Z",
+  "membershipType": "free_trial",
+  "individualUsage": {
+    "plan": {
+      "enabled": true,
+      "totalPercentUsed": 64.5
+    },
+    "onDemand": {
+      "enabled": false,
+      "used": 0,
+      "limit": 0
+    }
+  }
+}

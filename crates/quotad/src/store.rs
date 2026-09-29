@@ -40,6 +40,16 @@ impl Store {
         self.ring.push_back(snap);
     }
 
+    /// Overwrite the newest entry instead of growing the ring. A passive
+    /// source re-confirming the same numbers must not evict other providers'
+    /// history.
+    pub fn replace_latest(&mut self, snap: Snapshot) {
+        match self.ring.back_mut() {
+            Some(last) => *last = snap,
+            None => self.push_memory(snap),
+        }
+    }
+
     pub fn latest(&self) -> Option<&Snapshot> {
         self.ring.back()
     }

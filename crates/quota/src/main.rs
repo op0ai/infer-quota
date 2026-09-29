@@ -1,6 +1,8 @@
 //! `quota` — thin CLI client for `quotad`.
 //!
 //! No HTTP, no credential reads. The daemon is the only source of truth.
+//! `statusline` reads Claude Code's status JSON from stdin (no credentials in
+//! it) and may run the user's own chained command.
 
 #![forbid(unsafe_code)]
 
@@ -9,6 +11,7 @@ compile_error!("quota requires a Unix domain socket (macOS or Linux)");
 
 mod client;
 mod render;
+mod statusline;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,7 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quota_core::protocol::{
     CanStartParams, CanStartResult, PaceParams, PaceResult, ProviderFilter, StatusParams,
     StatusResult, VersionInfo, WatchParams, METHOD_CAN_START, METHOD_PACE, METHOD_PING,
-    METHOD_STATUS, METHOD_VERSION, METHOD_WATCH,
+    METHOD_STATUS, METHOD_VERSION, METHOD_WATCH, PERCENT_ADMISSION_MIN_PROTOCOL,
 };
 use quota_core::Config;
 
@@ -48,8 +51,16 @@ enum Command {
         provider: ProviderArg,
     },
     CanStart {
-        #[arg(long)]
-        tokens: u64,
+        /// Token budget the job needs. Only providers that publish tokens can answer.
+        #[arg(long, conflicts_with = "percent", required_unless_present = "percent")]
+        tokens: Option<u64>,
+        /// Percent of the binding window the job will spend. Admits when
+        /// `remaining - percent >= reserve` and the pace projection holds.
+        #[arg(long, conflicts_with = "tokens")]
+        percent: Option<f64>,
+        /// Percent to leave untouched after `--percent` (default 2).
+        #[arg(long, requires = "percent")]
+        reserve: Option<f64>,
         /// UTC unix seconds. Default: the window's published reset.
         #[arg(long)]
         deadline: Option<i64>,
@@ -64,6 +75,15 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ProviderArg::All)]
         provider: ProviderArg,
     },
+    /// Claude Code statusline hook: push rate limits to quotad, print a segment.
+    ///
+    /// Set as the statusLine command. Never blocks (50 ms push budget), prints
+    /// even when quotad is down, and always exits 0.
+    Statusline {
+        /// Your previous statusline command; its output is joined with ours.
+        #[arg(long)]
+        chain: Option<String>,
+    },
     Ping,
     Version {
         #[arg(long)]
@@ -76,6 +96,7 @@ enum ProviderArg {
     All,
     Codex,
     Claude,
+    Cursor,
 }
 
 impl From<ProviderArg> for ProviderFilter {
@@ -84,6 +105,7 @@ impl From<ProviderArg> for ProviderFilter {
             ProviderArg::All => ProviderFilter::All,
             ProviderArg::Codex => ProviderFilter::Codex,
             ProviderArg::Claude => ProviderFilter::Claude,
+            ProviderArg::Cursor => ProviderFilter::Cursor,
         }
     }
 }
@@ -99,6 +121,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let sock = match socket_path(&cli) {
         Ok(sock) => sock,
+        Err(e) if matches!(cli.command, Command::Statusline { .. }) => {
+            // A bad config file must not blank the status line.
+            eprintln!("quota: {e}");
+            quota_core::default_socket_path()
+        }
         Err(e) => {
             eprintln!("quota: {e}");
             return ExitCode::FAILURE;
@@ -117,6 +144,19 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Refuse before asking a question an older daemon would misread.
+fn require_protocol(sock: &std::path::Path, min: u32, feature: &str) -> Result<(), ClientError> {
+    let resp = rpc(sock, 1, METHOD_VERSION, serde_json::Value::Null)?;
+    let info: VersionInfo = decode_result(&resp)?;
+    if info.protocol < min {
+        return Err(ClientError::Rpc(format!(
+            "{feature} needs quotad protocol {min}, this quotad speaks {}; upgrade quotad",
+            info.protocol
+        )));
+    }
+    Ok(())
 }
 
 fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, ClientError> {
@@ -178,14 +218,25 @@ fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, ClientError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Statusline { chain } => {
+            statusline::run(sock, chain.as_deref());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::CanStart {
             tokens,
+            percent,
+            reserve,
             deadline,
             json,
             provider,
         } => {
+            if percent.is_some() {
+                require_protocol(sock, PERCENT_ADMISSION_MIN_PROTOCOL, "percent admission")?;
+            }
             let params = CanStartParams {
-                tokens: *tokens,
+                tokens: tokens.unwrap_or(0),
+                percent: *percent,
+                reserve: *reserve,
                 deadline: *deadline,
                 provider: (*provider).into(),
             };

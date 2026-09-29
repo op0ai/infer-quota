@@ -115,6 +115,7 @@ enum ProviderArg {
     All,
     Codex,
     Claude,
+    Cursor,
 }
 
 impl From<ProviderArg> for ProviderFilter {
@@ -123,6 +124,7 @@ impl From<ProviderArg> for ProviderFilter {
             ProviderArg::All => ProviderFilter::All,
             ProviderArg::Codex => ProviderFilter::Codex,
             ProviderArg::Claude => ProviderFilter::Claude,
+            ProviderArg::Cursor => ProviderFilter::Cursor,
         }
     }
 }

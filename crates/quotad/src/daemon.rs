@@ -14,18 +14,22 @@ use quota_adapters::http::TlsTransport;
 use quota_adapters::provider::{ProbeCtx, Provider};
 use quota_adapters::{ClaudeAdapter, CodexAdapter};
 use quota_core::framing::{decode_len, encode_frame, FrameError};
-use quota_core::math::{can_start, pace_for};
+use quota_core::math::{can_start, can_start_percent, pace_for, DEFAULT_RESERVE_PERCENT};
 use quota_core::protocol::{
     AccountMutationResult, AccountsAddParams, AccountsRemoveParams, AccountsSelectParams,
-    CanStartParams, CanStartResult, ErrorBody, PaceParams, PaceResult, ProviderFilter,
-    RefreshParams, Request, Response, StatusParams, StatusResult, VersionInfo, WatchParams,
-    METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT,
-    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION,
-    METHOD_WATCH,
+    CanStartParams, CanStartResult, ErrorBody, ObserveParams, ObserveResult, PaceParams,
+    PaceResult, ProviderFilter, RefreshParams, Request, Response, StatusParams, StatusResult,
+    VersionInfo, WatchParams, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE,
+    METHOD_ACCOUNTS_SELECT, METHOD_CAN_START, METHOD_OBSERVE, METHOD_PACE, METHOD_PING,
+    METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
-use quota_core::types::{Availability, ProviderId, ProviderSnapshot, Snapshot};
+use quota_core::types::{
+    freshness_for, AdapterError, Availability, Freshness, ProviderId, ProviderSnapshot, Snapshot,
+    DEFAULT_READING_MAX_AGE_SECS,
+};
 use quota_core::Config;
+use quota_source_cursor::CursorAdapter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
@@ -43,6 +47,7 @@ const WATCH_IDLE_FLOOR_SECS: u64 = 600;
 const WATCH_IDLE_SLACK_SECS: u64 = 30;
 
 use crate::accounts::AccountStore;
+use crate::observe::{snapshot_from_push, PUSH_RING_MIN_GAP_SECS};
 use crate::store::Store;
 
 pub fn run(cfg: Config) -> Result<(), DaemonError> {
@@ -139,6 +144,13 @@ struct App {
     /// Each provider has its own single-flight gate and generation.
     refresh_gates: HashMap<ProviderId, Arc<RefreshGate>>,
     watch_tx: broadcast::Sender<Snapshot>,
+    /// Receipt time of the newest push per provider. A current push outranks
+    /// polling that provider.
+    pushed_at: HashMap<ProviderId, i64>,
+    /// When the ring last took a pushed snapshot, per provider.
+    last_ring_push: HashMap<ProviderId, i64>,
+    /// When a rate-limited-by-us provider (Cursor) was last probed.
+    last_polled: HashMap<ProviderId, tokio::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +253,9 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
         accounts,
         cfg,
         watch_tx,
+        pushed_at: HashMap::new(),
+        last_ring_push: HashMap::new(),
+        last_polled: HashMap::new(),
     }));
 
     // Register both signals before starting the initial provider
@@ -276,8 +291,15 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
         }
     };
     apply_snapshot(&app, snapshot).await;
-    for gate in app.read().await.refresh_gates.values() {
-        gate.mark_complete();
+    {
+        let mut g = app.write().await;
+        if g.cfg.enable_cursor {
+            g.last_polled
+                .insert(ProviderId::Cursor, tokio::time::Instant::now());
+        }
+        for gate in g.refresh_gates.values() {
+            gate.mark_complete();
+        }
     }
 
     let mut scheduled_refresh: Option<tokio::task::JoinHandle<()>> = None;
@@ -506,6 +528,8 @@ struct ProbePlan {
     timeout: u64,
     enable_codex: bool,
     enable_claude: bool,
+    enable_cursor: bool,
+    cursor_secret_path: String,
     codex_home: Option<PathBuf>,
     claude_home: Option<PathBuf>,
     codexbar_dir: PathBuf,
@@ -526,6 +550,8 @@ fn probe_plan(g: &App) -> ProbePlan {
         timeout: g.cfg.http_timeout_secs,
         enable_codex: g.cfg.enable_codex,
         enable_claude: g.cfg.enable_claude,
+        enable_cursor: g.cfg.enable_cursor,
+        cursor_secret_path: g.cfg.cursor_secret_path.clone(),
         codex_home,
         claude_home,
         codexbar_dir: g.cfg.codexbar_dir(),
@@ -534,7 +560,7 @@ fn probe_plan(g: &App) -> ProbePlan {
 }
 
 fn provider_refresh_gates() -> HashMap<ProviderId, Arc<RefreshGate>> {
-    [ProviderId::Codex, ProviderId::Claude]
+    [ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor]
         .into_iter()
         .map(|provider| (provider, Arc::new(RefreshGate::default())))
         .collect()
@@ -563,10 +589,16 @@ fn collect_provider(plan: ProbePlan, provider: ProviderId) -> ProviderSnapshot {
             enable_codexbar_files: plan.enable_codexbar_files,
         }
         .probe(&ctx),
-        ProviderId::Claude => ClaudeAdapter {
-            config_dir: plan.claude_home,
+        ProviderId::Claude => ClaudeAdapter::for_account(plan.claude_home).probe(&ctx),
+        ProviderId::Cursor => {
+            match CursorAdapter::from_keychain_first_chain(plan.cursor_secret_path) {
+                Ok(adapter) => adapter.probe(&ctx),
+                Err(e) => ProviderSnapshot::unavailable(
+                    ProviderId::Cursor,
+                    AdapterError::new("secrets_config", e.to_string()),
+                ),
+            }
         }
-        .probe(&ctx),
     }
 }
 
@@ -576,7 +608,10 @@ fn collect_snapshot(plan: ProbePlan) -> Snapshot {
         providers.push(collect_provider(plan.clone(), ProviderId::Codex));
     }
     if plan.enable_claude {
-        providers.push(collect_provider(plan, ProviderId::Claude));
+        providers.push(collect_provider(plan.clone(), ProviderId::Claude));
+    }
+    if plan.enable_cursor {
+        providers.push(collect_provider(plan, ProviderId::Cursor));
     }
     Snapshot::new(now_unix(), providers)
 }
@@ -602,11 +637,31 @@ async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
     for provider in &mut snap.providers {
         ensure_rate_limit_backoff(&g, provider);
     }
-    let snap = snap.refreshed_at(now_unix());
+    let now = now_unix();
+    let mut snap = snap.refreshed_at(now);
     for provider in &snap.providers {
         record_retry_after(&mut g, provider);
     }
+    keep_current_pushes(&g, &mut snap.providers, now);
     apply_snapshot_locked(&mut g, snap);
+}
+
+/// A poll result lands under the write lock. A push that arrived while the
+/// poll was in flight is newer evidence, so the precedence check runs here, at
+/// commit, and the pushed entry survives.
+fn keep_current_pushes(g: &App, providers: &mut [ProviderSnapshot], now: i64) {
+    let Some(latest) = g.store.latest() else {
+        return;
+    };
+    for polled in providers.iter_mut() {
+        if !push_is_current(g, polled.provider, now) {
+            continue;
+        }
+        if let Some(pushed) = latest.by_id(polled.provider) {
+            *polled = pushed.clone();
+            polled.refresh_freshness(now);
+        }
+    }
 }
 
 /// A 429 that names no `Retry-After` still backs that provider off, for the
@@ -650,6 +705,9 @@ async fn apply_provider_snapshot(app: &Arc<RwLock<App>>, mut provider: ProviderS
         .map(|snapshot| snapshot.refreshed_at(now).providers)
         .unwrap_or_default();
     record_retry_after(&mut g, &provider);
+    if push_is_current(&g, provider.provider, now) {
+        return;
+    }
     if let Some(existing) = providers
         .iter_mut()
         .find(|existing| existing.provider == provider.provider)
@@ -709,14 +767,21 @@ async fn refresh_provider(app: Arc<RwLock<App>>, provider: ProviderId) {
             let enabled = match provider {
                 ProviderId::Codex => g.cfg.enable_codex,
                 ProviderId::Claude => g.cfg.enable_claude,
+                ProviderId::Cursor => g.cfg.enable_cursor,
             };
-            if !enabled {
+            if !enabled || !poll_due(&g, provider) {
                 return None;
             }
             probe_plan(&g)
         };
         match probe_on_thread(move || collect_provider(plan, provider)).await {
-            Ok(snapshot) => Some(snapshot),
+            Ok(snapshot) => {
+                app.write()
+                    .await
+                    .last_polled
+                    .insert(provider, tokio::time::Instant::now());
+                Some(snapshot)
+            }
             Err(error) => {
                 eprintln!("quotad: {provider} refresh task failed: {error}");
                 None
@@ -726,40 +791,94 @@ async fn refresh_provider(app: Arc<RwLock<App>>, provider: ProviderId) {
     .await;
 }
 
+/// Providers that are disabled, in backoff, or already covered by fresher
+/// evidence return without probing.
 async fn refresh(app: Arc<RwLock<App>>) {
-    let (codex, claude) = {
-        let g = app.read().await;
-        (g.cfg.enable_codex, g.cfg.enable_claude)
-    };
-    match (codex, claude) {
-        (true, true) => {
-            tokio::join!(
-                refresh_provider(app.clone(), ProviderId::Codex),
-                refresh_provider(app, ProviderId::Claude)
-            );
-        }
-        (true, false) => refresh_provider(app, ProviderId::Codex).await,
-        (false, true) => refresh_provider(app, ProviderId::Claude).await,
-        (false, false) => {}
+    tokio::join!(
+        refresh_provider(app.clone(), ProviderId::Codex),
+        refresh_provider(app.clone(), ProviderId::Claude),
+        refresh_provider(app, ProviderId::Cursor)
+    );
+}
+
+/// A current statusline push already answers for Claude, so its OAuth poll
+/// waits; Cursor's dashboard route is polled no faster than its own floor.
+fn poll_due(g: &App, provider: ProviderId) -> bool {
+    match provider {
+        ProviderId::Claude => !push_is_current(g, provider, now_unix()),
+        ProviderId::Cursor => g.last_polled.get(&provider).is_none_or(|at| {
+            at.elapsed() >= Duration::from_secs(quota_source_cursor::MIN_POLL_SECS)
+        }),
+        ProviderId::Codex => true,
     }
+}
+
+fn push_is_current(g: &App, provider: ProviderId, now: i64) -> bool {
+    g.pushed_at.get(&provider).is_some_and(|at| {
+        freshness_for(Some(*at), DEFAULT_READING_MAX_AGE_SECS, now) == Freshness::Current
+    })
 }
 
 fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
     if a.providers.len() != b.providers.len() {
         return false;
     }
-    a.providers.iter().zip(b.providers.iter()).all(|(x, y)| {
-        x.provider == y.provider
-            && x.status == y.status
-            && x.permission == y.permission
-            && x.windows.len() == y.windows.len()
-            && x.windows.iter().zip(y.windows.iter()).all(|(a, b)| {
-                a.kind == b.kind
-                    && a.state == b.state
-                    && a.reading == b.reading
-                    && a.reset_at == b.reset_at
-            })
-    })
+    a.providers
+        .iter()
+        .zip(b.providers.iter())
+        .all(|(x, y)| same_provider_usage(x, y))
+}
+
+fn same_provider_usage(x: &ProviderSnapshot, y: &ProviderSnapshot) -> bool {
+    x.provider == y.provider
+        && x.status == y.status
+        && x.permission == y.permission
+        && x.source == y.source
+        && x.windows.len() == y.windows.len()
+        && x.windows.iter().zip(y.windows.iter()).all(|(a, b)| {
+            a.kind == b.kind
+                && a.state == b.state
+                && a.reading == b.reading
+                && a.reset_at == b.reset_at
+        })
+}
+
+/// Fold one pushed provider snapshot into the latest snapshot. Unlike a poll
+/// it leaves the adaptive refresh interval alone, and while the numbers repeat
+/// it refreshes the newest ring entry in place so a chatty statusline cannot
+/// push other providers' history out of the ring.
+async fn apply_pushed_snapshot(app: &Arc<RwLock<App>>, provider: ProviderSnapshot, now: i64) {
+    let id = provider.provider;
+    let mut g = app.write().await;
+    g.pushed_at.insert(id, now);
+    let mut providers = g
+        .store
+        .latest()
+        .map(|snapshot| snapshot.refreshed_at(now).providers)
+        .unwrap_or_default();
+    let unchanged = providers
+        .iter()
+        .find(|existing| existing.provider == id)
+        .is_some_and(|existing| same_provider_usage(existing, &provider));
+    match providers
+        .iter_mut()
+        .find(|existing| existing.provider == id)
+    {
+        Some(existing) => *existing = provider,
+        None => providers.push(provider),
+    }
+    let snapshot = Snapshot::new(now, providers).refreshed_at(now);
+    let ring_due = g
+        .last_ring_push
+        .get(&id)
+        .is_none_or(|at| now.saturating_sub(*at) >= PUSH_RING_MIN_GAP_SECS);
+    let _ = g.watch_tx.send(snapshot.clone());
+    if unchanged && !ring_due {
+        g.store.replace_latest(snapshot);
+    } else {
+        g.store.push(snapshot);
+        g.last_ring_push.insert(id, now);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -950,6 +1069,10 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("can_start: {e}"));
                 }
             };
+            let request = match admission_request(&params) {
+                Ok(request) => request,
+                Err(message) => return Response::err(req.id, "bad_params", message),
+            };
             let g = app.read().await;
             let latest = g.snapshot_or_empty();
             let now = now_unix();
@@ -959,13 +1082,15 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                answers.push(can_start(
-                    p,
-                    g.store.history_ref(),
-                    params.tokens,
-                    params.deadline,
-                    now,
-                ));
+                let history = g.store.history_ref();
+                answers.push(match request {
+                    Admission::Tokens(tokens) => {
+                        can_start(p, history, tokens, params.deadline, now)
+                    }
+                    Admission::Percent { percent, reserve } => {
+                        can_start_percent(p, history, percent, reserve, params.deadline, now)
+                    }
+                });
             }
             let available: Vec<_> = answers
                 .iter()
@@ -973,6 +1098,26 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                 .collect();
             let ok = !available.is_empty() && available.iter().all(|a| a.ok);
             Response::result(req.id, CanStartResult { ok, answers })
+        }
+        METHOD_OBSERVE => {
+            let params: ObserveParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Response::err(req.id, "bad_params", format!("observe: {e}")),
+            };
+            let now = now_unix();
+            match snapshot_from_push(&params, now) {
+                Ok(snapshot) => {
+                    apply_pushed_snapshot(app, snapshot, now).await;
+                    Response::result(
+                        req.id,
+                        ObserveResult {
+                            accepted: params.windows.len(),
+                            observed_at: now,
+                        },
+                    )
+                }
+                Err(rejection) => Response::err(req.id, rejection.code, rejection.message),
+            }
         }
         METHOD_REFRESH => {
             let params: RefreshParams = serde_json::from_value(req.params).unwrap_or_default();
@@ -1038,6 +1183,33 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
             }),
         },
     }
+}
+
+#[derive(Clone, Copy)]
+enum Admission {
+    Tokens(u64),
+    Percent { percent: f64, reserve: f64 },
+}
+
+/// `tokens` and `percent` are separate questions; ask exactly one.
+fn admission_request(params: &CanStartParams) -> Result<Admission, String> {
+    let Some(percent) = params.percent else {
+        if params.reserve.is_some() {
+            return Err("can_start: reserve only applies to a percent request".into());
+        }
+        return Ok(Admission::Tokens(params.tokens));
+    };
+    if params.tokens > 0 {
+        return Err("can_start: give tokens or percent, not both".into());
+    }
+    let reserve = params.reserve.unwrap_or(DEFAULT_RESERVE_PERCENT);
+    if !(percent.is_finite() && percent > 0.0 && percent <= 100.0) {
+        return Err("can_start: percent must be in (0, 100]".into());
+    }
+    if !(reserve.is_finite() && (0.0..100.0).contains(&reserve)) {
+        return Err("can_start: reserve must be in [0, 100)".into());
+    }
+    Ok(Admission::Percent { percent, reserve })
 }
 
 /// When the newest reading stops being current; a year out when none will.
@@ -1109,6 +1281,9 @@ async fn write_frame_timed(stream: &mut UnixStream, resp: &Response) -> Result<(
 mod tests {
     use super::*;
     use quota_core::protocol::{METHOD_PING, METHOD_VERSION};
+
+    /// A push outranks polling while its reading is current: the core max age.
+    const PUSH_PRECEDENCE_SECS: i64 = DEFAULT_READING_MAX_AGE_SECS as i64;
     use quota_core::types::{AdapterError, ProviderId, ProviderObservation, ProviderSnapshot};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
@@ -1151,6 +1326,9 @@ mod tests {
             accounts: AccountStore::load(accounts_path),
             cfg,
             watch_tx,
+            pushed_at: HashMap::new(),
+            last_ring_push: HashMap::new(),
+            last_polled: HashMap::new(),
         }
     }
 
@@ -1663,6 +1841,8 @@ mod tests {
             METHOD_CAN_START,
             quota_core::CanStartParams {
                 tokens: 50_000,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::All,
             },
@@ -1707,5 +1887,324 @@ mod tests {
         assert!(!blob.contains("rt-secret"));
         assert!(!blob.contains("hunter2"));
         assert!(!blob.contains("access_token"));
+    }
+
+    fn observe_request(id: u64, used: f64) -> Request {
+        Request::with_params(
+            id,
+            METHOD_OBSERVE,
+            serde_json::json!({
+                "schema": 1,
+                "provider": "claude",
+                "source": "statusline",
+                "windows": [{
+                    "kind": "five_hour", "label": "5h", "used_percent": used,
+                    "reset_at": now_unix() + 7_200, "limit_window_seconds": 18_000
+                }]
+            }),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_becomes_current_claude_evidence_and_outranks_polling() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let before = app.read().await.interval_secs;
+        assert!(poll_due(&*app.read().await, ProviderId::Claude));
+
+        let resp = dispatch(&app, observe_request(1, 34.0)).await;
+        assert!(resp.ok, "{resp:?}");
+        let result: ObserveResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.accepted, 1);
+
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.status, Availability::Ok);
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+        assert!(
+            !poll_due(&g, ProviderId::Claude),
+            "fresh push must beat OAuth polling"
+        );
+        assert_eq!(
+            g.interval_secs, before,
+            "a push never retunes the poll cadence"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_flight_poll_never_overwrites_a_push_that_landed_during_it() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(poll_due(&*app.read().await, ProviderId::Claude));
+        refresh_provider_with(app.clone(), ProviderId::Claude, |app| async move {
+            assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+            let mut polled = ProviderSnapshot::unavailable(
+                ProviderId::Claude,
+                AdapterError::new("http_401", "token expired"),
+            );
+            polled.source = Some(quota_core::types::Source::Oauth);
+            Some(polled)
+        })
+        .await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.status, Availability::Ok);
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_poll_snapshot_keeps_a_current_push() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+        let polled = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("http_401", "token expired"),
+        );
+        apply_snapshot(&app, Snapshot::new(now_unix(), vec![polled])).await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_poll_replaces_a_push_once_the_push_is_no_longer_current() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+        let stale = now_unix() - PUSH_PRECEDENCE_SECS - 1;
+        app.write()
+            .await
+            .pushed_at
+            .insert(ProviderId::Claude, stale);
+        let polled = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("http_401", "token expired"),
+        );
+        apply_provider_snapshot(&app, polled).await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.status, Availability::Unavailable);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn polling_resumes_once_the_push_is_no_longer_current() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let mut g = app.write().await;
+        let stale = now_unix() - PUSH_PRECEDENCE_SECS - 1;
+        g.pushed_at.insert(ProviderId::Claude, stale);
+        assert!(poll_due(&g, ProviderId::Claude));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_precedence_and_reading_freshness_agree_at_the_max_age_boundary() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let mut g = app.write().await;
+        let now = now_unix();
+        for (age, current) in [
+            (PUSH_PRECEDENCE_SECS - 1, true),
+            (PUSH_PRECEDENCE_SECS, true),
+            (PUSH_PRECEDENCE_SECS + 1, false),
+            (-1, false),
+        ] {
+            g.pushed_at.insert(ProviderId::Claude, now - age);
+            assert_eq!(
+                push_is_current(&g, ProviderId::Claude, now),
+                current,
+                "push at age {age}"
+            );
+            let reading = freshness_for(Some(now - age), DEFAULT_READING_MAX_AGE_SECS, now);
+            assert_eq!(
+                reading == Freshness::Current,
+                current,
+                "reading at age {age}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_identical_pushes_do_not_evict_ring_history() {
+        let app = Arc::new(RwLock::new(test_app()));
+        for id in 0..10 {
+            assert!(dispatch(&app, observe_request(id, 34.0)).await.ok);
+        }
+        let g = app.read().await;
+        assert_eq!(
+            g.store.history_ref().len(),
+            2,
+            "seed entry plus one pushed entry, not one per push"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_push_takes_a_new_ring_entry_for_pace_history() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        dispatch(&app, observe_request(2, 35.0)).await;
+        assert_eq!(app.read().await.store.history_ref().len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_pushes_are_refused_with_codes_and_store_nothing() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let mut req = observe_request(1, 34.0);
+        req.params["schema"] = serde_json::json!(9);
+        let resp = dispatch(&app, req).await;
+        assert_eq!(resp.error.unwrap().code, "unsupported_schema");
+        let resp = dispatch(
+            &app,
+            Request::with_params(2, METHOD_OBSERVE, serde_json::json!({"x": 1})),
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "bad_params");
+        let g = app.read().await;
+        assert!(g.snapshot_or_empty().by_id(ProviderId::Claude).is_none());
+    }
+
+    fn can_start_request(params: serde_json::Value) -> Request {
+        Request::with_params(9, METHOD_CAN_START, params)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statusline_push_with_a_malformed_weekly_bucket_refuses_percent_admission() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let parsed = quota_source_claude_statusline::parse(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":4102444800},"seven_day":"soon"}}"#,
+        )
+        .unwrap();
+        let push = Request::with_params(1, METHOD_OBSERVE, parsed.observe_params().unwrap());
+        assert!(dispatch(&app, push).await.ok);
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(
+            result.answers[0].window_kind,
+            Some(quota_core::types::WindowKind::Weekly)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pushed_spend_limit_reads_back_from_status_as_a_coherent_usd_window() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/claude-statusline/spend-2.1.284.json"),
+        )
+        .unwrap();
+        let parsed = quota_source_claude_statusline::parse(&fixture).unwrap();
+        let push = Request::with_params(1, METHOD_OBSERVE, parsed.observe_params().unwrap());
+        assert!(dispatch(&app, push).await.ok);
+        let resp = dispatch(
+            &app,
+            Request::with_params(
+                2,
+                METHOD_STATUS,
+                StatusParams {
+                    provider: ProviderFilter::Claude,
+                },
+            ),
+        )
+        .await;
+        let status = resp.result.unwrap();
+        let spend = status["snapshot"]["providers"][0]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["kind"] == "spend")
+            .unwrap()
+            .clone();
+        for money in [&spend, &spend["reading"]] {
+            assert_eq!(money["unit"], "usd", "{spend}");
+            assert_eq!(money["used_usd"], 271.4, "{spend}");
+            assert_eq!(money["limit_usd"], 500.0, "{spend}");
+            assert_eq!(money["limit"], 500.0, "{spend}");
+            assert_eq!(money["remaining"], 500.0 - 271.4, "{spend}");
+        }
+        assert_eq!(spend["used_percent"], 271.4 / 500.0 * 100.0, "{spend}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn percent_admission_runs_through_dispatch_on_pushed_evidence() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 10.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(result.ok, "{result:?}");
+        assert_eq!(
+            result.answers[0].basis,
+            quota_core::types::CanStartBasis::PercentBudget
+        );
+
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 65.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.ok);
+        let admission = result.answers[0].admission.clone().unwrap();
+        assert!(!admission.headroom_ok);
+        assert_eq!(admission.reserve_percent, 2.0);
+
+        let resp = dispatch(
+            &app,
+            can_start_request(
+                serde_json::json!({"percent": 65.0, "reserve": 0.5, "provider": "claude"}),
+            ),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(result.ok, "reserve is the caller's to lower: {result:?}");
+    }
+
+    #[test]
+    fn admission_request_rejects_mixed_and_out_of_range_questions() {
+        let ask = |v: serde_json::Value| admission_request(&serde_json::from_value(v).unwrap());
+        assert!(matches!(
+            ask(serde_json::json!({"tokens": 5})),
+            Ok(Admission::Tokens(5))
+        ));
+        assert!(ask(serde_json::json!({"tokens": 5, "percent": 1.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 0.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 100.5})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0, "reserve": 100.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0, "reserve": -1.0})).is_err());
+        assert!(ask(serde_json::json!({"reserve": 1.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0})).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cursor_is_polled_no_faster_than_its_floor() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let mut g = app.write().await;
+        assert!(poll_due(&g, ProviderId::Cursor), "never polled yet");
+        g.last_polled
+            .insert(ProviderId::Cursor, tokio::time::Instant::now());
+        assert!(!poll_due(&g, ProviderId::Cursor));
     }
 }

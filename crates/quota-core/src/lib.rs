@@ -34,15 +34,18 @@ pub use paths::{
 };
 pub use protocol::{
     AccountMutationResult, AccountsAddParams, AccountsListResult, AccountsRemoveParams,
-    AccountsSelectParams, CanStartParams, ErrorBody, PaceParams, ProviderFilter, RefreshParams,
-    Request, Response, StatusParams, WatchParams, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST,
-    METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT, METHOD_CAN_START, METHOD_PACE, METHOD_PING,
-    METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH, PROTOCOL_VERSION,
+    AccountsSelectParams, CanStartParams, ErrorBody, ObserveParams, ObserveResult, ObservedWindow,
+    PaceParams, ProviderFilter, RefreshParams, Request, Response, StatusParams, WatchParams,
+    METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT,
+    METHOD_CAN_START, METHOD_OBSERVE, METHOD_PACE, METHOD_PING, METHOD_REFRESH, METHOD_STATUS,
+    METHOD_VERSION, METHOD_WATCH, OBSERVE_MAX_WINDOWS, OBSERVE_SCHEMA_VERSION,
+    PERCENT_ADMISSION_MIN_PROTOCOL, PROTOCOL_VERSION,
 };
 pub use types::{
     AdapterError, Availability, CanStartAnswer, CanStartBasis, Credits, Freshness, PaceReport,
-    ProviderId, ProviderPermission, ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind,
-    WindowReading, WindowState, DEFAULT_READING_MAX_AGE_SECS, PACKAGE_VERSION,
+    PercentAdmission, ProviderId, ProviderPermission, ProviderSnapshot, Snapshot, Source,
+    UsageWindow, WindowKind, WindowReading, WindowState, DEFAULT_READING_MAX_AGE_SECS,
+    PACKAGE_VERSION,
 };
 pub use windows::{
     classify_codex_window, FIVE_HOUR_MINUTES, FIVE_HOUR_SECS, WEEK_MINUTES, WEEK_SECS,

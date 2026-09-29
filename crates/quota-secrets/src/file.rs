@@ -78,12 +78,73 @@ fn extract_codex_token(bytes: &[u8]) -> Option<String> {
 
 type TokenExtract = fn(&[u8]) -> Option<String>;
 
-fn extract_claude_token(bytes: &[u8]) -> Option<String> {
+/// `claudeAiOauth.accessToken` from the JSON Claude Code stores in either its
+/// credentials file or its Keychain item.
+pub(crate) fn extract_claude_token(bytes: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     v.pointer("/claudeAiOauth/accessToken")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Env override for the Cursor session-cookie file.
+pub const ENV_CURSOR_COOKIE_FILE: &str = "QUOTA_CURSOR_COOKIE_FILE";
+
+fn cursor_cookie_candidates() -> Vec<PathBuf> {
+    if let Ok(path) = std::env::var(ENV_CURSOR_COOKIE_FILE) {
+        let path = path.trim();
+        if !path.is_empty() {
+            return vec![PathBuf::from(path)];
+        }
+    }
+    quota_core::home_dir()
+        .map(|home| vec![home.join(".config/quota/cursor-session")])
+        .unwrap_or_default()
+}
+
+/// The user-written cookie file is a secret: refuse it when group or other
+/// can read it, the same bar `ssh` applies to private keys.
+#[cfg(unix)]
+fn reject_open_permissions(path: &Path) -> Result<(), SecretsError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| SecretsError::Io(e.to_string()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(SecretsError::Io(format!(
+            "{} is readable by group/other (mode {:o}); chmod 600 it",
+            path.display(),
+            mode & 0o777
+        )));
+    }
+    Ok(())
+}
+
+fn read_cursor_cookie_file() -> Result<Option<SecretRecord>, SecretsError> {
+    for path in cursor_cookie_candidates() {
+        match read_capped(&path) {
+            Ok(bytes) => {
+                #[cfg(unix)]
+                reject_open_permissions(&path)?;
+                let value = String::from_utf8(bytes)
+                    .map_err(|_| SecretsError::Parse("cursor cookie file is not utf-8".into()))?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(SecretRecord {
+                    backend: "file",
+                    path: path.display().to_string(),
+                    value: value.to_string(),
+                }));
+            }
+            Err(SecretsError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 impl SecretsBackend for FileOauthBackend {
@@ -101,9 +162,10 @@ impl SecretsBackend for FileOauthBackend {
             "claude" | "claude/access_token" | "oauth/claude" => {
                 (claude_candidates(), extract_claude_token)
             }
+            "cursor" | "cursor/session" => return read_cursor_cookie_file(),
             other => {
                 return Err(SecretsError::NotFound(format!(
-                    "unknown file secret path {other} (try file:codex or file:claude)"
+                    "unknown file secret path {other} (try file:codex, file:claude or file:cursor)"
                 )));
             }
         };
@@ -140,6 +202,25 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_cookie_file_must_be_private_and_is_trimmed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("quota-secrets-cursor-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cursor-session");
+        fs::write(&file, "WorkosCursorSessionToken=abc\n").unwrap();
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let open = super::reject_open_permissions(&file).unwrap_err();
+        assert!(open.to_string().contains("chmod 600"));
+        assert!(!open.to_string().contains("abc"));
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::reject_open_permissions(&file).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_codex_auth_json_and_refuses_write() {

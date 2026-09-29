@@ -1,11 +1,12 @@
+use crate::claude_code::ClaudeCodeKeychain;
 use crate::file::FileOauthBackend;
 use crate::keychain::KeychainBackend;
 #[cfg(feature = "openbao")]
 use crate::openbao::OpenBaoBackend;
 use crate::types::{SecretRecord, SecretsBackend, SecretsError};
 
-/// Ordered fallback: OpenBao (if the `openbao` feature is on and env is set)
-/// → OS keychain → read-only CLI files.
+/// Ordered fallback, first hit wins. [`from_env`] and
+/// [`keychain_first_from_env`] fix the two orders the crate hands out.
 pub struct SecretChain {
     backends: Vec<Box<dyn SecretsBackend>>,
 }
@@ -75,17 +76,45 @@ impl SecretsBackend for SecretChain {
     }
 }
 
-/// Build the default ordered chain. OpenBao is included only when the
-/// `openbao` feature is enabled and `QUOTA_OPENBAO_ADDR` is set.
-pub fn from_env() -> Result<SecretChain, SecretsError> {
-    let mut backends: Vec<Box<dyn SecretsBackend>> = Vec::new();
+/// OpenBao is configured only when the `openbao` feature is enabled and
+/// `QUOTA_OPENBAO_ADDR` is set.
+fn openbao_from_env() -> Result<Option<Box<dyn SecretsBackend>>, SecretsError> {
     #[cfg(feature = "openbao")]
-    if let Some(bao) = OpenBaoBackend::from_env()? {
-        backends.push(Box::new(bao));
-    }
-    backends.push(Box::new(KeychainBackend));
-    backends.push(Box::new(FileOauthBackend::default()));
-    Ok(SecretChain::new(backends))
+    let openbao = OpenBaoBackend::from_env()?.map(|bao| Box::new(bao) as Box<dyn SecretsBackend>);
+    #[cfg(not(feature = "openbao"))]
+    let openbao = None;
+    Ok(openbao)
+}
+
+/// Build the default ordered chain: OpenBao, then the OS keychain and Claude
+/// Code's own item, then the read-only CLI files.
+pub fn from_env() -> Result<SecretChain, SecretsError> {
+    let local: [Box<dyn SecretsBackend>; 3] = [
+        Box::new(KeychainBackend),
+        Box::new(ClaudeCodeKeychain),
+        Box::new(FileOauthBackend::default()),
+    ];
+    Ok(SecretChain::new(
+        openbao_from_env()?.into_iter().chain(local).collect(),
+    ))
+}
+
+/// The chain for a session cookie the user copies in by hand (Cursor): the OS
+/// keychain, then OpenBao when configured, then the private read-only file.
+pub fn keychain_first_from_env() -> Result<SecretChain, SecretsError> {
+    Ok(keychain_first(openbao_from_env()?))
+}
+
+/// [`keychain_first_from_env`] with the OpenBao slot supplied by the caller.
+pub fn keychain_first(openbao: Option<Box<dyn SecretsBackend>>) -> SecretChain {
+    let keychain: Box<dyn SecretsBackend> = Box::new(KeychainBackend);
+    let file: Box<dyn SecretsBackend> = Box::new(FileOauthBackend::default());
+    SecretChain::new(
+        std::iter::once(keychain)
+            .chain(openbao)
+            .chain(std::iter::once(file))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -122,6 +151,23 @@ mod tests {
             !names.contains(&"openbao"),
             "openbao must stay feature-gated out of default tests"
         );
+    }
+
+    #[test]
+    fn keychain_first_orders_keychain_then_openbao_then_file() {
+        let chain = keychain_first(Some(Box::new(MemoryBackend::new())));
+        assert_eq!(chain.backend_names(), ["keychain", "memory", "file"]);
+        assert_eq!(keychain_first(None).backend_names(), ["keychain", "file"]);
+    }
+
+    #[test]
+    fn keychain_first_from_env_starts_at_the_keychain_and_ends_at_the_file() {
+        let names = keychain_first_from_env().unwrap().backend_names();
+        assert_eq!(names.first(), Some(&"keychain"));
+        assert_eq!(names.last(), Some(&"file"));
+        assert!(!names.contains(&"claude-code-keychain"), "{names:?}");
+        #[cfg(not(feature = "openbao"))]
+        assert_eq!(names, ["keychain", "file"]);
     }
 
     #[test]

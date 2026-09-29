@@ -1,0 +1,38 @@
+{
+  "observe": {
+    "plan": null,
+    "provider": "claude",
+    "schema": 1,
+    "source": "statusline",
+    "windows": [
+      {
+        "kind": "five_hour",
+        "label": "5h",
+        "limit_usd": null,
+        "limit_window_seconds": 18000,
+        "reset_at": 1746540000,
+        "used_percent": 8.5,
+        "used_usd": null
+      },
+      {
+        "kind": "weekly",
+        "label": "weekly",
+        "limit_usd": null,
+        "limit_window_seconds": 604800,
+        "reset_at": 1746799200,
+        "used_percent": 40.0,
+        "used_usd": null
+      },
+      {
+        "kind": "spend",
+        "label": "spend",
+        "limit_usd": 500.0,
+        "limit_window_seconds": null,
+        "reset_at": 1748736000,
+        "used_percent": 54.28,
+        "used_usd": 271.4
+      }
+    ]
+  },
+  "segment": "5h 8% ↺1h00m · wk 40% ↺3d1h · $271/$500 month ↺25d11h"
+}

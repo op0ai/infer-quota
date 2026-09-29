@@ -7,10 +7,23 @@
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountBook, AccountRecord};
-use crate::types::{CanStartAnswer, PaceReport, ProviderId, Snapshot, PACKAGE_VERSION};
+use crate::types::{
+    CanStartAnswer, PaceReport, ProviderId, Snapshot, Source, WindowKind, PACKAGE_VERSION,
+};
 
-/// Bump when adding a breaking field. Additive optional fields do not require a bump.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bump whenever a response may carry a value an older client cannot decode
+/// (a new variant of a closed enum such as [`ProviderId`], [`Source`],
+/// [`WindowKind`] or `CanStartBasis`) or a request field changes what a method
+/// answers. A new method or a new optional response field does not bump it.
+///
+/// 2: `cursor` provider, `statusline` source, `spend` window kind,
+/// `percent_budget` basis, `can_start.percent`/`reserve`, `observe`.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Lowest daemon protocol that understands `can_start.percent`. An older
+/// daemon ignores the unknown field and answers a `tokens: 0` question, so a
+/// percent client checks `version` first.
+pub const PERCENT_ADMISSION_MIN_PROTOCOL: u32 = 2;
 
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_VERSION: &str = "version";
@@ -18,8 +31,11 @@ pub const METHOD_STATUS: &str = "status";
 pub const METHOD_PACE: &str = "pace";
 pub const METHOD_CAN_START: &str = "can_start";
 pub const METHOD_WATCH: &str = "watch";
-/// Immediate provider probe (same as the timer). Additive in protocol 1.
+/// Immediate provider probe (same as the timer). Added in protocol 1.
 pub const METHOD_REFRESH: &str = "refresh";
+/// Push one observation from a passive source (Claude Code's statusline).
+/// Added in protocol 2; the payload carries its own [`OBSERVE_SCHEMA_VERSION`].
+pub const METHOD_OBSERVE: &str = "observe";
 pub const METHOD_ACCOUNTS_LIST: &str = "accounts.list";
 pub const METHOD_ACCOUNTS_ADD: &str = "accounts.add";
 pub const METHOD_ACCOUNTS_REMOVE: &str = "accounts.remove";
@@ -32,6 +48,7 @@ pub enum ProviderFilter {
     All,
     Codex,
     Claude,
+    Cursor,
 }
 
 impl ProviderFilter {
@@ -40,15 +57,17 @@ impl ProviderFilter {
             "all" => Some(Self::All),
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
 
     pub fn as_ids(self) -> Vec<ProviderId> {
         match self {
-            Self::All => vec![ProviderId::Codex, ProviderId::Claude],
+            Self::All => vec![ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor],
             Self::Codex => vec![ProviderId::Codex],
             Self::Claude => vec![ProviderId::Claude],
+            Self::Cursor => vec![ProviderId::Cursor],
         }
     }
 
@@ -57,6 +76,7 @@ impl ProviderFilter {
             Self::All => true,
             Self::Codex => id == ProviderId::Codex,
             Self::Claude => id == ProviderId::Claude,
+            Self::Cursor => id == ProviderId::Cursor,
         }
     }
 }
@@ -77,14 +97,66 @@ pub struct PaceParams {
     pub provider: ProviderFilter,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanStartParams {
+    /// Token budget request. Zero (or absent) when `percent` is used.
+    #[serde(default)]
     pub tokens: u64,
+    /// Percent-of-window admission: admit when `remaining - percent >= reserve`,
+    /// the pace projection does not empty the window before its reset, and,
+    /// when `deadline` is set, the remainder also outlasts it. A deadline only
+    /// adds a refusal. Mutually exclusive with a non-zero `tokens`.
+    #[serde(default)]
+    pub percent: Option<f64>,
+    /// Percent that must stay untouched after `percent` is spent. Default 2.
+    #[serde(default)]
+    pub reserve: Option<f64>,
     /// UTC unix seconds. When omitted, the binding deadline is the window reset.
     #[serde(default)]
     pub deadline: Option<i64>,
     #[serde(default = "default_all")]
     pub provider: ProviderFilter,
+}
+
+/// Wire schema for [`METHOD_OBSERVE`]. Bump on a breaking change; the daemon
+/// refuses a schema it does not know rather than guessing at fields.
+pub const OBSERVE_SCHEMA_VERSION: u32 = 1;
+pub const OBSERVE_MAX_WINDOWS: usize = 8;
+
+/// One pushed measurement. The daemon stamps `observed_at` with its own clock
+/// at receipt, so a client cannot backdate or future-date evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservedWindow {
+    pub kind: WindowKind,
+    pub label: String,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    /// UTC unix seconds.
+    #[serde(default)]
+    pub reset_at: Option<i64>,
+    #[serde(default)]
+    pub limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    pub used_usd: Option<f64>,
+    #[serde(default)]
+    pub limit_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObserveParams {
+    pub schema: u32,
+    pub provider: ProviderId,
+    pub source: Source,
+    #[serde(default)]
+    pub plan: Option<String>,
+    pub windows: Vec<ObservedWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveResult {
+    pub accepted: usize,
+    /// Daemon receipt time; the evidence timestamp the snapshot carries.
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -276,6 +348,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens: 50_000,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::Codex,
             },
@@ -308,6 +382,30 @@ mod tests {
         assert!(!encoded.contains("access_token"));
         assert!(!encoded.contains("refresh_token"));
         assert!(!encoded.contains("password"));
+    }
+
+    #[test]
+    fn can_start_params_accept_the_old_tokens_only_shape() {
+        let p: CanStartParams = serde_json::from_value(serde_json::json!({"tokens": 5})).unwrap();
+        assert_eq!((p.tokens, p.percent, p.reserve), (5, None, None));
+        let p: CanStartParams =
+            serde_json::from_value(serde_json::json!({"percent": 3.5, "reserve": 1.0})).unwrap();
+        assert_eq!((p.tokens, p.percent, p.reserve), (0, Some(3.5), Some(1.0)));
+    }
+
+    #[test]
+    fn observe_params_roundtrip_and_reject_unknown_source() {
+        let raw = serde_json::json!({
+            "schema": 1,
+            "provider": "claude",
+            "source": "statusline",
+            "windows": [{"kind": "five_hour", "label": "5h", "used_percent": 12.0, "reset_at": 1_800_000_000}]
+        });
+        let p: ObserveParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.source, Source::Statusline);
+        assert_eq!(p.windows[0].kind, WindowKind::FiveHour);
+        let bad = serde_json::json!({"schema": 1, "provider": "claude", "source": "vibes", "windows": []});
+        assert!(serde_json::from_value::<ObserveParams>(bad).is_err());
     }
 
     #[test]

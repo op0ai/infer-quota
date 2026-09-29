@@ -1,11 +1,18 @@
 # Secrets
 
 `quota-secrets` is the unified lookup crate. `quota-ctl` is the human CLI.
-`quotad` never stores passwords, API keys, or JWTs, and does not depend on
-this crate. The CLI-file paths below are what the first shipped collectors
-(Codex and Claude) read.
+`quotad` never stores passwords, API keys, or JWTs. It links this crate only to
+*read*: Claude Code's own Keychain item on macOS, and the Cursor session cookie
+(`quota-source-cursor`). The CLI-file paths below are what the first shipped
+collectors (Codex and Claude) read.
 
 ## Order (first hit wins)
+
+This is the default chain, `quota_secrets::from_env`, used by `quota-ctl`.
+The Cursor session cookie has its own order,
+`quota_secrets::keychain_first_from_env`: **OS keychain**, then **OpenBao**
+(when configured), then the read-only cookie file below. Claude Code's item is
+not in that chain.
 
 1. **OpenBao** (feature `openbao`) — KV v2. `quota-ctl` enables the feature.
    Building `quota-secrets` without it omits the HTTP client and rustls.
@@ -21,10 +28,16 @@ this crate. The CLI-file paths below are what the first shipped collectors
      `target_os = "macos"`.
    - **Other OS:** `Unavailable` with an explicit message. The chain skips
      it. This is not a silent success.
+   Then, macOS only and read-only, **Claude Code's own item** (service
+   `Claude Code-credentials`), served for the logical path `claude` alone.
+   macOS prompts on the first read from a new binary. `QUOTA_NO_KEYCHAIN=1`
+   skips it.
 3. **CLI files** (read-only, last resort) — the same paths `quota-adapters`
    already consult:
    - `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
    - `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`
+   - `$QUOTA_CURSOR_COOKIE_FILE` or `~/.config/quota/cursor-session` (Cursor
+     cookie; refused unless mode `0600`)
 
 File writes are refused (`ReadOnly`). Official CLIs own those files
 (`codex login`, Claude Code `/login`). `secret put` never creates or
@@ -87,8 +100,12 @@ in-process rustls listener with a throwaway CA and leaf embedded in the
 test. Keychain tests skip
 cleanly when the session bus (or macOS keychain) is unavailable.
 
-`quotad` does not call this crate. `secret_ref` on an account is metadata
-for humans / future wiring — the daemon still reads CLI session files.
+`quotad` does call this crate, read-only, through two collectors: the Claude
+OAuth adapter reads Claude Code's own Keychain item (macOS) before the
+credentials file, and `quota-source-cursor` reads the Cursor session cookie
+through `keychain_first_from_env`. Codex still reads its CLI session file
+directly. `secret_ref` on an account is metadata only: the daemon does not
+resolve it and never writes to any backend.
 
 ## What never goes in git
 
@@ -104,8 +121,8 @@ Account metadata on the Unix socket (`accounts.add`) may include a
 **VERIFIED** (this tree, `cargo test`, no live OpenBao):
 
 - Feature `openbao` compiles the client and rustls; without the feature the
-  module is absent. `quota-ctl` enables it. `quotad` does not depend on
-  `quota-secrets`.
+  module is absent. `quota-ctl` enables it. `quotad` links `quota-secrets`
+  without it unless built with `--features openbao`.
 - Plain-HTTP loopback fence, nested prefix, 32 KiB put cap, empty-secret
   refusal, credential-in-URL refusal.
 - In-process mock HTTP get/put/delete.

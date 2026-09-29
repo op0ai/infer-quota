@@ -11,3 +11,7 @@ readme = false
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Property test that a deadline can only add a refusal to percent admission.
+proptest = { version = "1", default-features = false, features = ["std"] }

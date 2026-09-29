@@ -9,6 +9,8 @@ readme = false
 
 [dependencies]
 quota-core.workspace = true
+# Claude Code keeps its live OAuth in the macOS Keychain; read it through the shared backend.
+quota-secrets.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

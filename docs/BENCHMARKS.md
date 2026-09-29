@@ -36,6 +36,77 @@ binary grew vs `"s"` (quota +39 768, quotad +193 368, quota-ctl +306 432).
 
 ---
 
+## 2026-09-29 statusline push RTT + source crates (VERIFIED, macOS)
+
+Different machine from the rows below: Apple M5 Pro (15 cores), Darwin 25.6.0
+arm64, rustc 1.98.1, release profile. Tree is `b30700f` plus IQ-A2. Not
+comparable with the Linux VM rows.
+
+### Push RTT (`quota-bench statusline`)
+
+quotad on a temp socket with `enable_codex/claude/cursor` off (no provider
+traffic, no credentials, `QUOTA_NO_KEYCHAIN=1`). n=500 after 50 warmup. Input is
+`fixtures/claude-statusline/full-2.1.80.json` (two windows).
+
+Round 3 (Cursor buckets kept as `unknown`, Claude spend built as one USD
+window, keychain-first Cursor chain), same host and method:
+
+| row | p50 | p95 | p99 | max |
+|-----|-----|-----|-----|-----|
+| `push_rtt`, `full-2.1.80.json` (2 windows) | 57.3 us | 69.3 us | 91.3 us | 125.3 us |
+| `statusline_e2e`, `full-2.1.80.json` | 2120 us | 2571 us | 2994 us | 5350 us |
+| `statusline_daemon_down`, `full-2.1.80.json` | 2066 us | 2368 us | 2592 us | 2850 us |
+| `push_rtt`, `spend-2.1.284.json` (3 windows, one USD) | 58.0 us | 70.7 us | 84.2 us | 114.5 us |
+| `statusline_e2e`, `spend-2.1.284.json` | 2054 us | 2360 us | 2541 us | 2791 us |
+| `statusline_daemon_down`, `spend-2.1.284.json` | 2063 us | 2409 us | 2595 us | 2894 us |
+
+Release sizes after round 3: `quotad` 2 512 544 (+944 over round 2), `quota`
+1 233 696 (unchanged), `quota-ctl` 2 049 888 (+80).
+
+Round 2 (after the review fixes: commit-time push precedence, window-identity
+pace history, protocol 2), same host and method:
+
+| row | p50 | p95 | p99 | max |
+|-----|-----|-----|-----|-----|
+| `push_rtt` (new connection, connect + write + ack, in-process) | 60.0 us | 85.2 us | 140.6 us | 215.2 us |
+| `statusline_e2e` (`quota statusline` fork+exec, parse, push, print) | 2558 us | 3489 us | 4021 us | 4758 us |
+| `statusline_daemon_down` (same, socket absent) | 2714 us | 3640 us | 4264 us | 4725 us |
+
+Round 1, for comparison: push 54.5 / 66.4 / 81.9 / 100.5 us; e2e 2033 / 2316 /
+2527 / 2789 us; daemon down 1918 / 2283 / 2388 / 2479 us. The round-2 run was
+noisier across all three rows, including the daemon-down row that does no
+socket work, so the spread is host load, not the new commit-time check (one
+map lookup under the write lock the push already takes).
+
+The 50 ms push budget is about 350x the measured push p99. Nearly all of the
+end-to-end time is process spawn; the push itself is ~60 us.
+`crates/quota/tests/statusline.rs` pins the budget: against a daemon that
+accepts and never replies, `quota statusline` must reach the daemon, spend at
+least the 50 ms budget, and finish within the daemon-down time plus 50 ms plus
+100 ms of spawn slack.
+
+```bash
+quotad --config CFG --socket "$SOCK" run &
+quota-bench statusline --socket "$SOCK" --quota target/release/quota --iters 500 --warmup 50
+# $SOCK must fit in SUN_LEN (104 bytes on macOS); use a relative ./q.sock from a long temp dir
+```
+
+### Release binary size (macOS arm64, `cargo build --release --workspace`)
+
+| binary | `b30700f` | with IQ-A2 | delta |
+|--------|----------:|-----------:|------:|
+| `quotad` | 2 254 128 | 2 511 600 | +257 472 (+11.4%) |
+| `quota` | 1 067 328 | 1 233 696 | +166 368 (+15.6%) |
+| `quota-ctl` | 2 028 576 | 2 049 808 | +21 232 (+1.0%) |
+
+`quotad` grows from the Cursor collector and from linking `quota-secrets`
+(Security.framework for the Keychain reads). `quota` grows from the statusline
+command (JSON parse, child process, timeout threads). Not re-measured: RSS,
+Linux and musl sizes (on Linux `quotad` now also links `secret-service`/zbus
+through `quota-secrets`; that delta is not measured). No size win is claimed.
+
+---
+
 ## 2026-09-27 14:12 UTC Pareto pass (VERIFIED)
 
 Same VM class as the 13:16 UTC row (`uname` / `rustc` 1.83.0 / 4× Xeon @

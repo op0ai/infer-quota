@@ -3,7 +3,8 @@
 [![CI](https://github.com/op0ai/infer-quota/actions/workflows/ci.yml/badge.svg)](https://github.com/op0ai/infer-quota/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/op0ai/infer-quota)](LICENSE)
 
-Provider-agnostic inference quota daemon. Codex and Claude are the first adapters.
+Provider-agnostic inference quota daemon. Codex and Claude are the first adapters;
+Claude statusline push and Cursor are separate source crates.
 
 `quotad` polls enabled adapters, stores a snapshot, and owns a Unix socket.
 `quota` is a thin read client. `quota-ctl` is the optional control plane.
@@ -68,7 +69,17 @@ only process that may read existing CLI sessions. Never scrape:
 | browser cookie DBs | refused — we will not load a cookie store |
 
 Read `quota status --json`, `pace`, and `can-start`. Do not invent extra
-providers; v0 adapters are Codex and Claude.
+providers; sources are Codex, Claude (OAuth poll or statusline push) and
+Cursor (opt-in).
+
+```sh
+quota can-start --provider codex --percent 5              # may I spend ~5% more? (reserve 2%)
+quota can-start --provider claude --percent 10 --reserve 5 --json
+```
+
+Claude with no credentials at all: set the Claude Code `statusLine` command to
+`quota statusline` (or `quota statusline --chain "<old command>"`). Details:
+[docs/SOURCES.md](docs/SOURCES.md).
 
 ## Security
 

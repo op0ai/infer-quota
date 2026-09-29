@@ -1,0 +1,21 @@
+[package]
+name = "quota-source-cursor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cursor plan usage and on-demand spend (dashboard usage-summary endpoint, session cookie from quota-secrets)"
+readme = false
+
+[features]
+default = []
+# Adds OpenBao to the cookie lookup, after the OS keychain. quotad forwards its own `openbao` feature here.
+openbao = ["quota-secrets/openbao"]
+
+[dependencies]
+quota-adapters.workspace = true
+quota-core.workspace = true
+quota-secrets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
