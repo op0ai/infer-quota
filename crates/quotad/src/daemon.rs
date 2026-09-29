@@ -1431,12 +1431,13 @@ fn answering_now(g: &App, mut snapshot: Snapshot) -> Snapshot {
     snapshot
 }
 
-/// A reading with no quota evidence answers nothing, so it is shown as is.
-/// Claude credentials name no provider account, so a Claude reading is bound
+/// A placeholder tied to no account answers nothing, so it is shown as is.
+/// Every other reading, an error one included, answers only for the account
+/// it was taken for. Claude credentials name no provider account, so a Claude reading is bound
 /// to its account only by the quota account scope, whose switch drops it, and
 /// answers only while Claude credentials load.
 fn reading_answers_now(g: &App, reading: &ProviderSnapshot) -> bool {
-    if !reading.holds_quota_evidence() {
+    if reading.is_unattributed_placeholder() {
         return true;
     }
     let taken_for = reading.account_digest.as_deref();
@@ -3624,5 +3625,112 @@ mod tests {
         let shown = codex_status(&app).await;
         assert_eq!(shown.error.as_ref().unwrap().code, "no_credentials");
         assert!(!shown.is_for_another_account());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round6_an_error_reading_for_account_a_is_refused_after_credentials_rotate_to_b() {
+        use quota_adapters::creds::account_digest;
+        use quota_core::types::CanStartBasis;
+
+        let home = codex_home_for(FIXTURE_ACCOUNT);
+        let mut app = test_app();
+        app.codex_home = Some(home.clone());
+        let app = Arc::new(RwLock::new(app));
+        let outage = quota_adapters::http::HttpResponse {
+            status: 503,
+            body: b"{}".to_vec(),
+            retry_after_secs: None,
+        };
+        let transport = Arc::new(PerAccountTransport::new([
+            (FIXTURE_ACCOUNT, outage),
+            (ROTATED_ACCOUNT, weekly_usage(70)),
+        ]));
+        refresh_provider_with(
+            app.clone(),
+            ProviderId::Codex,
+            codex_probe_through(transport, now_unix()),
+        )
+        .await;
+
+        let shown = codex_status(&app).await;
+        assert_eq!(shown.account_digest, Some(account_digest(FIXTURE_ACCOUNT)));
+        assert!(
+            !shown.holds_quota_evidence(),
+            "premise: an error with no quota fields"
+        );
+        assert!(!shown.is_for_another_account());
+        let before = codex_can_start(&app, 0).await;
+        assert_eq!(before.answers[0].basis, CanStartBasis::Unavailable);
+
+        write_codex_auth(&home, ROTATED_ACCOUNT);
+
+        let shown = codex_status(&app).await;
+        assert!(shown.is_for_another_account());
+        assert_eq!(shown.account_digest, Some(account_digest(FIXTURE_ACCOUNT)));
+        let refused = codex_can_start(&app, 0).await;
+        assert!(!refused.ok);
+        assert_eq!(refused.answers[0].basis, CanStartBasis::AccountChanged);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round6_pace_and_can_start_after_rotation_use_only_the_new_accounts_samples() {
+        let home = codex_home_for(FIXTURE_ACCOUNT);
+        let mut app = test_app();
+        app.codex_home = Some(home.clone());
+        let app = Arc::new(RwLock::new(app));
+        let now = now_unix();
+        let as_account = |used: u32, observed_at: i64| {
+            let transport = Arc::new(PerAccountTransport::new([
+                (FIXTURE_ACCOUNT, weekly_usage(used)),
+                (ROTATED_ACCOUNT, weekly_usage(used)),
+            ]));
+            codex_probe_through(transport, observed_at)
+        };
+
+        refresh_provider_with(app.clone(), ProviderId::Codex, as_account(10, now - 400)).await;
+        refresh_provider_with(app.clone(), ProviderId::Codex, as_account(60, now - 300)).await;
+        write_codex_auth(&home, ROTATED_ACCOUNT);
+        refresh_provider_with(app.clone(), ProviderId::Codex, as_account(20, now - 200)).await;
+        refresh_provider_with(app.clone(), ProviderId::Codex, as_account(21, now - 100)).await;
+
+        let pace = codex_pace(&app).await;
+        assert_eq!(pace.samples, 2, "only the active account's readings count");
+        assert!((pace.burn_percent_per_hour.unwrap() - 36.0).abs() < 1e-6);
+        let answer = codex_can_start(&app, 0).await.answers.remove(0);
+        assert_eq!(answer.burn_percent_per_hour, pace.burn_percent_per_hour);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round6_a_file_only_result_never_holds_a_deadline_issued_to_another_digest() {
+        let named = Some("b".repeat(64));
+        let file_for = |digest: Option<String>| {
+            move |_, mode: ProbeMode| {
+                let digest = digest.clone();
+                async move {
+                    assert_eq!(mode, ProbeMode::FileOnly);
+                    let mut file = observed_reading(ProviderId::Codex, 30.0);
+                    file.source = Some(quota_core::types::Source::File);
+                    file.account_digest = digest;
+                    Some(file)
+                }
+            }
+        };
+        for (issued_to, file_of) in [(None, named.clone()), (Some("a".repeat(64)), None)] {
+            let app = Arc::new(RwLock::new(test_app()));
+            let mut refused = rate_limited(ProviderId::Codex, Some(120));
+            refused.account_digest = issued_to;
+            apply_provider_snapshot(&app, refused).await;
+            assert!(provider_in_backoff(&app, ProviderId::Codex).await);
+
+            refresh_provider_with(app.clone(), ProviderId::Codex, file_for(file_of)).await;
+
+            assert!(!provider_in_backoff(&app, ProviderId::Codex).await);
+            let g = app.read().await;
+            let codex = g.store.latest().unwrap().by_id(ProviderId::Codex).unwrap();
+            assert_eq!(codex.retry_after_secs, None);
+            assert_eq!(codex.retry_after_until, None);
+        }
     }
 }

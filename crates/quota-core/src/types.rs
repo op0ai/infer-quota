@@ -526,6 +526,13 @@ impl ProviderSnapshot {
             || self.plan.is_some()
     }
 
+    /// A placeholder never tied to an account: it names none and holds no
+    /// quota evidence. Every other reading, an error one included, was taken
+    /// for an account and answers only for that account.
+    pub fn is_unattributed_placeholder(&self) -> bool {
+        self.account_digest.is_none() && !self.holds_quota_evidence()
+    }
+
     pub fn is_for_another_account(&self) -> bool {
         self.error
             .as_ref()
