@@ -1,0 +1,52 @@
+crates/quota/Cargo.toml
+  s_36d4c5b33e5d76::t_cae0e6e56273d8 14-17
+crates/quota-adapters/src/http.rs
+  s_69549f00189629::t_cece4d5fcc4b55 8,101-104,110-111,113-124,126,131-133,141-170,172-179,181-245,247-256
+  s_36d4c5b33e5d76::t_4e90334f524563 7,9,105-109,112,125,127-130,134-140,171,180,246,257-258,265,513-539,640,681-688
+  s_69549f00189629::t_6af4f7023461ef 664-675
+  s_69549f00189629::t_b2f01f20587f95 501-512,540-639,641-663,676-680
+  s_69549f00189629::t_b740fa87f47548 689
+crates/quota-adapters/src/codex.rs
+  s_36d4c5b33e5d76::t_56a6a47296eb21 160-162,882-950
+  s_36d4c5b33e5d76::t_b1ece4959d3856 951
+docs/protocol.md
+  s_36d4c5b33e5d76::t_05e65f9b20d16e 113
+crates/quota-core/src/math.rs
+  s_36d4c5b33e5d76::t_a2b33e3e1b59b5 263,894-973,975-980,983
+  s_36d4c5b33e5d76::t_36604ec1907adf 9-10,100-114,255-258,289
+  s_36d4c5b33e5d76::t_7ad2cd29afdf52 259-262,974,981-982
+crates/quotad/src/daemon.rs
+  s_36d4c5b33e5d76::t_d1ed6874505630 978-982,991-1004,1019-1020,1022-1025,1029-1037,1039-1048,1051
+  s_36d4c5b33e5d76::t_b1006ae6444bd6 2600-2601,2603-2653,2655-2678,2680-2697,2702-2809,2811-2860,2862-2879
+  s_36d4c5b33e5d76::t_8689a76ba0d5ed 2602,2654,2679,2698-2701
+  s_36d4c5b33e5d76::t_50affc4c77ad90 1021,1026-1028,1038
+  s_36d4c5b33e5d76::t_924507c51c2f62 2810,2861
+crates/quota/tests/socket_resolution.rs
+  s_36d4c5b33e5d76::t_cae0e6e56273d8 8-9,13-15,21-22,41,58
+Cargo.lock
+  s_36d4c5b33e5d76::t_adf321460904cb 814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b752528cfb49c1428d46203f2ae72f6ebe36d129",
+  "prompts": {},
+  "sessions": {
+    "s_36d4c5b33e5d76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "308a3227-2fea-4aa0-a4cb-a739b65d14fb",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Arth Tyagi <onarth@icloud.com>"
+    },
+    "s_69549f00189629": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd8e69b6-8f63-4261-8ce4-1bde4f456c1b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Arth Tyagi <onarth@icloud.com>"
+    }
+  }
+}
