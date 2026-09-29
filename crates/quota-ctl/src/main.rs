@@ -142,16 +142,22 @@ impl From<ProviderIdArg> for ProviderId {
     }
 }
 
-fn socket_path(cli: &Cli) -> PathBuf {
+fn socket_path(cli: &Cli) -> Result<PathBuf, quota_core::ConfigError> {
     if let Some(p) = &cli.socket {
-        return p.clone();
+        return Ok(p.clone());
     }
-    Config::load_default().socket_path()
+    Ok(Config::load_default()?.socket_path())
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let sock = socket_path(&cli);
+    let sock = match socket_path(&cli) {
+        Ok(sock) => sock,
+        Err(e) => {
+            eprintln!("quota-ctl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&cli, &sock) {
         Ok(code) => code,
         Err(e) => {

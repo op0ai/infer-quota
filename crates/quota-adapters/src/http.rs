@@ -180,7 +180,7 @@ fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, TransportError> {
             continue;
         };
         if k.eq_ignore_ascii_case("retry-after") {
-            retry_after_secs = v.trim().parse::<u64>().ok();
+            retry_after_secs = parse_retry_after(v.trim(), quota_core::timeutil::now_unix());
         } else if k.eq_ignore_ascii_case("content-length") {
             content_length = v.trim().parse::<usize>().ok();
         } else if k.eq_ignore_ascii_case("transfer-encoding")
@@ -200,6 +200,39 @@ fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, TransportError> {
         body,
         retry_after_secs,
     })
+}
+
+fn parse_retry_after(value: &str, now: i64) -> Option<u64> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let date = value.split_once(',')?.1.trim();
+    let mut parts = date.split_whitespace();
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let time = parts.next()?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let target = quota_core::timeutil::parse_reset_at_str(&format!(
+        "{year:04}-{month:02}-{day:02}T{time}Z"
+    ))?;
+    Some(target.saturating_sub(now).max(0) as u64)
 }
 
 fn decode_chunked(
@@ -300,5 +333,18 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
         let r = parse_http_response(raw).unwrap();
         assert_eq!(r.body, b"{}");
+    }
+
+    #[test]
+    fn parses_retry_after_delta_and_http_date() {
+        assert_eq!(parse_retry_after("17", 1_000), Some(17));
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT", 1_445_412_300),
+            Some(180)
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:13:00 GMT", 1_445_412_300),
+            Some(0)
+        );
     }
 }

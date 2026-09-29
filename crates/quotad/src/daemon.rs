@@ -1,15 +1,17 @@
 //! Accept loop, adaptive refresh, and request dispatch.
 
+use std::collections::HashMap;
 use std::fs::{self, DirBuilder};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use quota_adapters::http::TlsTransport;
-use quota_adapters::provider::Provider;
+use quota_adapters::provider::{ProbeCtx, Provider};
 use quota_adapters::{ClaudeAdapter, CodexAdapter};
 use quota_core::framing::{decode_len, encode_frame, FrameError};
 use quota_core::math::{can_start, pace_for};
@@ -22,11 +24,11 @@ use quota_core::protocol::{
     METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
-use quota_core::types::{Availability, ProviderId, Snapshot};
+use quota_core::types::{Availability, ProviderId, ProviderSnapshot, Snapshot};
 use quota_core::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Same-UID local DoS cap. Watchers cannot consume the RPC pool.
 const MAX_RPC_CLIENTS: usize = 16;
@@ -46,11 +48,26 @@ use crate::store::Store;
 pub fn run(cfg: Config) -> Result<(), DaemonError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .max_blocking_threads(1)
-        .thread_keep_alive(Duration::from_millis(1))
         .build()
         .map_err(|e| DaemonError::Io(e.to_string()))?;
     rt.block_on(run_async(cfg))
+}
+
+/// Run a synchronous provider probe outside Tokio's blocking pool.
+///
+/// Dropping the receiver cancels observation, not the synchronous I/O. The
+/// detached worker can finish independently, while runtime shutdown never
+/// waits for a stalled provider request.
+async fn probe_on_thread<T, F>(probe: F) -> Result<T, tokio::sync::oneshot::error::RecvError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(probe());
+    });
+    receive.await
 }
 
 fn watch_idle_override_secs() -> Option<u64> {
@@ -116,7 +133,34 @@ struct App {
     store: Store,
     accounts: AccountStore,
     interval_secs: u64,
+    /// Retry deadlines are keyed by provider so one refusal cannot pause the
+    /// other provider's collector.
+    retry_after_until: HashMap<ProviderId, RetryAfterDeadline>,
+    /// Each provider has its own single-flight gate and generation.
+    refresh_gates: HashMap<ProviderId, Arc<RefreshGate>>,
     watch_tx: broadcast::Sender<Snapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAfterDeadline {
+    At(tokio::time::Instant),
+    Unrepresentable,
+}
+
+impl RetryAfterDeadline {
+    fn from_secs(seconds: u64) -> Self {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(seconds))
+            .map(Self::At)
+            .unwrap_or(Self::Unrepresentable)
+    }
+
+    fn is_active(self, now: tokio::time::Instant) -> bool {
+        match self {
+            Self::At(deadline) => now < deadline,
+            Self::Unrepresentable => true,
+        }
+    }
 }
 
 impl App {
@@ -124,7 +168,42 @@ impl App {
         self.store
             .latest()
             .cloned()
+            .map(|snapshot| snapshot.refreshed_at(now_unix()))
             .unwrap_or_else(|| Snapshot::new(now_unix(), Vec::new()))
+    }
+}
+
+/// Coalesces simultaneous refresh requests for one provider. The observation
+/// generation is captured before waiting; waiters reuse that provider's result.
+#[derive(Default)]
+struct RefreshGate {
+    lock: Mutex<()>,
+    generation: AtomicU64,
+}
+
+impl RefreshGate {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn mark_complete(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    async fn run_if_current<F, Fut>(&self, observed_generation: u64, refresh: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let _guard = self.lock.lock().await;
+        if self.generation() > observed_generation {
+            return false;
+        }
+        if !refresh().await {
+            return false;
+        }
+        self.mark_complete();
+        true
     }
 }
 
@@ -136,6 +215,12 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     let listener = bind_private_socket(&socket)?;
     let rpc_slots = Arc::new(Semaphore::new(MAX_RPC_CLIENTS));
     let watch_slots = Arc::new(Semaphore::new(MAX_WATCH_CLIENTS));
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| DaemonError::Io(format!("register SIGINT handler: {e}")))?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| DaemonError::Io(format!("register SIGTERM handler: {e}")))?;
 
     eprintln!(
         "quotad {} listening on {} (protocol {})",
@@ -150,30 +235,74 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
     seed_codexbar_history(&mut store, &cfg);
     let app = Arc::new(RwLock::new(App {
         interval_secs: cfg.refresh_min_secs(),
+        retry_after_until: HashMap::new(),
+        refresh_gates: provider_refresh_gates(),
         store,
         accounts,
         cfg,
         watch_tx,
     }));
 
-    // First probe on this thread (accept loop is not up yet). Avoids creating
-    // the blocking-pool thread before the first scheduled refresh.
-    {
-        let plan = {
-            let g = app.read().await;
-            probe_plan(&g)
-        };
-        apply_snapshot(&app, collect_snapshot(plan)).await;
+    // Register both signals before starting the initial provider
+    // probes. A startup SIGTERM then follows the same socket cleanup path as a
+    // signal received after the accept loop starts.
+    let plan = {
+        let g = app.read().await;
+        probe_plan(&g)
+    };
+    let startup_probe = probe_on_thread(move || collect_snapshot(plan));
+    let startup = tokio::select! {
+        _ = interrupt.recv() => {
+            eprintln!("quotad: received SIGINT during startup, shutting down");
+            None
+        }
+        _ = terminate.recv() => {
+            eprintln!("quotad: received SIGTERM during startup, shutting down");
+            None
+        }
+        result = startup_probe => Some(result),
+    };
+    let snapshot = match startup {
+        Some(Ok(snapshot)) => snapshot,
+        Some(Err(error)) => {
+            let _ = fs::remove_file(&socket);
+            return Err(DaemonError::Io(format!(
+                "initial provider probe task failed: {error}"
+            )));
+        }
+        None => {
+            let _ = fs::remove_file(&socket);
+            return Ok(());
+        }
+    };
+    apply_snapshot(&app, snapshot).await;
+    for gate in app.read().await.refresh_gates.values() {
+        gate.mark_complete();
     }
 
+    let mut scheduled_refresh: Option<tokio::task::JoinHandle<()>> = None;
     loop {
+        if scheduled_refresh
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            if let Some(task) = scheduled_refresh.take() {
+                if let Err(error) = task.await {
+                    eprintln!("quotad: scheduled refresh task failed: {error}");
+                }
+            }
+        }
         let wait = {
             let g = app.read().await;
             Duration::from_secs(g.interval_secs)
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = interrupt.recv() => {
                 eprintln!("quotad: shutting down");
+                break;
+            }
+            _ = terminate.recv() => {
+                eprintln!("quotad: received SIGTERM, shutting down");
                 break;
             }
             accepted = listener.accept() => {
@@ -196,9 +325,16 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
                 }
             }
             _ = tokio::time::sleep(wait) => {
-                refresh(app.clone()).await;
+                // Keep this event loop polling signals and accepting socket
+                // clients while providers refresh on independent threads.
+                if scheduled_refresh.is_none() {
+                    scheduled_refresh = Some(tokio::spawn(refresh(app.clone())));
+                }
             }
         }
+    }
+    if let Some(task) = scheduled_refresh {
+        task.abort();
     }
     let _ = fs::remove_file(&socket);
     Ok(())
@@ -365,6 +501,7 @@ fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct ProbePlan {
     timeout: u64,
     enable_codex: bool,
@@ -396,69 +533,193 @@ fn probe_plan(g: &App) -> ProbePlan {
     }
 }
 
-fn collect_snapshot(plan: ProbePlan) -> Snapshot {
-    let transport = TlsTransport::new(Duration::from_secs(plan.timeout));
-    let codex = CodexAdapter {
-        home: plan.codex_home,
-        codexbar_dir: Some(plan.codexbar_dir),
-        enable_codexbar_files: plan.enable_codexbar_files,
-    };
-    let claude = ClaudeAdapter {
-        config_dir: plan.claude_home,
-    };
-    let mut providers: Vec<&dyn Provider> = Vec::new();
-    if plan.enable_codex {
-        providers.push(&codex);
-    }
-    if plan.enable_claude {
-        providers.push(&claude);
-    }
-    quota_adapters::probe_all(&providers, &transport)
+fn provider_refresh_gates() -> HashMap<ProviderId, Arc<RefreshGate>> {
+    [ProviderId::Codex, ProviderId::Claude]
+        .into_iter()
+        .map(|provider| (provider, Arc::new(RefreshGate::default())))
+        .collect()
 }
 
-async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
-    let mut g = app.write().await;
+fn refresh_interval_secs(any_ok: bool, changed: bool, current: u64, min: u64, max: u64) -> u64 {
+    if !any_ok {
+        current.saturating_mul(2).clamp(min, max)
+    } else if changed {
+        min
+    } else {
+        (current.saturating_mul(3) / 2).clamp(min, max)
+    }
+}
+
+fn collect_provider(plan: ProbePlan, provider: ProviderId) -> ProviderSnapshot {
+    let transport = TlsTransport::new(Duration::from_secs(plan.timeout));
+    let ctx = ProbeCtx {
+        transport: &transport,
+        now: now_unix(),
+    };
+    match provider {
+        ProviderId::Codex => CodexAdapter {
+            home: plan.codex_home,
+            codexbar_dir: Some(plan.codexbar_dir),
+            enable_codexbar_files: plan.enable_codexbar_files,
+        }
+        .probe(&ctx),
+        ProviderId::Claude => ClaudeAdapter {
+            config_dir: plan.claude_home,
+        }
+        .probe(&ctx),
+    }
+}
+
+fn collect_snapshot(plan: ProbePlan) -> Snapshot {
+    let mut providers = Vec::new();
+    if plan.enable_codex {
+        providers.push(collect_provider(plan.clone(), ProviderId::Codex));
+    }
+    if plan.enable_claude {
+        providers.push(collect_provider(plan, ProviderId::Claude));
+    }
+    Snapshot::new(now_unix(), providers)
+}
+
+fn apply_snapshot_locked(g: &mut App, snap: Snapshot) {
     let changed = match g.store.latest() {
         Some(prev) => !same_usage(prev, &snap),
         None => true,
     };
     let any_ok = snap.providers.iter().any(|p| p.status == Availability::Ok);
-    let rate_limited = snap
-        .providers
-        .iter()
-        .any(|p| p.error.as_ref().is_some_and(|e| e.code == "rate_limited"));
-
     let min_s = g.cfg.refresh_min_secs();
     let max_s = g.cfg.refresh_max_secs();
     // Adaptive refresh: stay faster while numbers move; idle longer when stable
     // or unavailable so we do not hammer undocumented endpoints.
-    g.interval_secs = if rate_limited {
-        max_s
-    } else if !any_ok {
-        (g.interval_secs.saturating_mul(2)).clamp(min_s, max_s)
-    } else if changed {
-        min_s
-    } else {
-        (g.interval_secs.saturating_mul(3) / 2).clamp(min_s, max_s)
-    };
-
+    g.interval_secs = refresh_interval_secs(any_ok, changed, g.interval_secs, min_s, max_s);
     let _ = g.watch_tx.send(snap.clone());
     g.store.push(snap);
 }
 
+async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
+    let snap = snap.refreshed_at(now_unix());
+    let mut g = app.write().await;
+    for provider in &snap.providers {
+        record_retry_after(&mut g, provider);
+    }
+    apply_snapshot_locked(&mut g, snap);
+}
+
+fn record_retry_after(g: &mut App, provider: &ProviderSnapshot) {
+    // A provider's Retry-After affects only that provider's next probe. It
+    // never lengthens the shared scheduler interval or another source's gate.
+    match provider.retry_after_secs.filter(|seconds| *seconds > 0) {
+        Some(seconds) => {
+            g.retry_after_until
+                .insert(provider.provider, RetryAfterDeadline::from_secs(seconds));
+        }
+        None => {
+            g.retry_after_until.remove(&provider.provider);
+        }
+    }
+}
+
+async fn apply_provider_snapshot(app: &Arc<RwLock<App>>, provider: ProviderSnapshot) {
+    let now = now_unix();
+    let mut g = app.write().await;
+    let mut providers = g
+        .store
+        .latest()
+        .map(|snapshot| snapshot.refreshed_at(now).providers)
+        .unwrap_or_default();
+    record_retry_after(&mut g, &provider);
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|existing| existing.provider == provider.provider)
+    {
+        *existing = provider;
+    } else {
+        providers.push(provider);
+    }
+    let snapshot = Snapshot::new(now, providers).refreshed_at(now);
+    apply_snapshot_locked(&mut g, snapshot);
+}
+
+async fn provider_in_backoff(app: &Arc<RwLock<App>>, provider: ProviderId) -> bool {
+    app.read()
+        .await
+        .retry_after_until
+        .get(&provider)
+        .is_some_and(|deadline| deadline.is_active(tokio::time::Instant::now()))
+}
+
+async fn refresh_provider_with<F, Fut>(app: Arc<RwLock<App>>, provider: ProviderId, probe: F)
+where
+    F: FnOnce(Arc<RwLock<App>>) -> Fut,
+    Fut: std::future::Future<Output = Option<ProviderSnapshot>>,
+{
+    let gate = app
+        .read()
+        .await
+        .refresh_gates
+        .get(&provider)
+        .expect("gate for each provider")
+        .clone();
+    let observed_generation = gate.generation();
+    let app_for_probe = app.clone();
+    let _ = gate
+        .run_if_current(observed_generation, || async move {
+            if provider_in_backoff(&app_for_probe, provider).await {
+                return false;
+            }
+            let Some(snapshot) = probe(app_for_probe.clone()).await else {
+                return false;
+            };
+            if snapshot.provider != provider {
+                eprintln!("quotad: {provider} refresh returned {}", snapshot.provider);
+                return false;
+            }
+            apply_provider_snapshot(&app_for_probe, snapshot).await;
+            true
+        })
+        .await;
+}
+
+async fn refresh_provider(app: Arc<RwLock<App>>, provider: ProviderId) {
+    refresh_provider_with(app, provider, move |app| async move {
+        let plan = {
+            let g = app.read().await;
+            let enabled = match provider {
+                ProviderId::Codex => g.cfg.enable_codex,
+                ProviderId::Claude => g.cfg.enable_claude,
+            };
+            if !enabled {
+                return None;
+            }
+            probe_plan(&g)
+        };
+        match probe_on_thread(move || collect_provider(plan, provider)).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                eprintln!("quotad: {provider} refresh task failed: {error}");
+                None
+            }
+        }
+    })
+    .await;
+}
+
 async fn refresh(app: Arc<RwLock<App>>) {
-    let plan = {
+    let (codex, claude) = {
         let g = app.read().await;
-        probe_plan(&g)
+        (g.cfg.enable_codex, g.cfg.enable_claude)
     };
-
-    let snap = tokio::task::spawn_blocking(move || collect_snapshot(plan)).await;
-
-    let Ok(snap) = snap else {
-        eprintln!("quotad: refresh task failed");
-        return;
-    };
-    apply_snapshot(&app, snap).await;
+    match (codex, claude) {
+        (true, true) => {
+            tokio::join!(
+                refresh_provider(app.clone(), ProviderId::Codex),
+                refresh_provider(app, ProviderId::Claude)
+            );
+        }
+        (true, false) => refresh_provider(app, ProviderId::Codex).await,
+        (false, true) => refresh_provider(app, ProviderId::Claude).await,
+        (false, false) => {}
+    }
 }
 
 fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
@@ -468,11 +729,14 @@ fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
     a.providers.iter().zip(b.providers.iter()).all(|(x, y)| {
         x.provider == y.provider
             && x.status == y.status
+            && x.permission == y.permission
             && x.windows.len() == y.windows.len()
-            && x.windows
-                .iter()
-                .zip(y.windows.iter())
-                .all(|(a, b)| a.kind == b.kind && a.used_percent == b.used_percent)
+            && x.windows.iter().zip(y.windows.iter()).all(|(a, b)| {
+                a.kind == b.kind
+                    && a.state == b.state
+                    && a.reading == b.reading
+                    && a.reset_at == b.reset_at
+            })
     })
 }
 
@@ -740,14 +1004,19 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
 }
 
 fn filter_snapshot(snap: Option<&Snapshot>, filter: ProviderFilter) -> Snapshot {
+    let now = now_unix();
     match snap {
-        Some(s) if filter == ProviderFilter::All => s.clone(),
+        Some(s) if filter == ProviderFilter::All => s.refreshed_at(now),
         Some(s) => Snapshot::new(
             s.fetched_at,
             s.providers
                 .iter()
                 .filter(|p| filter.matches(p.provider))
                 .cloned()
+                .map(|mut p| {
+                    p.refresh_freshness(now);
+                    p
+                })
                 .collect(),
         ),
         None => Snapshot::new(now_unix(), Vec::new()),
@@ -795,12 +1064,23 @@ mod tests {
     use quota_core::protocol::{METHOD_PING, METHOD_VERSION};
     use quota_core::types::{AdapterError, ProviderId, ProviderSnapshot};
 
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        for _ in 0..1_000 {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("{prefix}-{}-{serial}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test directory {}: {error}", dir.display()),
+            }
+        }
+        panic!("could not allocate unique test directory for {prefix}");
+    }
+
     fn test_app() -> App {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let accounts_path = std::env::temp_dir().join(format!("quota-test-acct-{stamp}.json"));
+        let accounts_path = unique_test_dir("quota-test-acct").join("accounts.json");
         let cfg = Config {
             history: false,
             ring_capacity: 16,
@@ -818,6 +1098,8 @@ mod tests {
         ));
         App {
             interval_secs: 30,
+            retry_after_until: HashMap::new(),
+            refresh_gates: provider_refresh_gates(),
             store,
             accounts: AccountStore::load(accounts_path),
             cfg,
@@ -834,6 +1116,265 @@ mod tests {
         assert!(ver.ok);
         let info: VersionInfo = serde_json::from_value(ver.result.unwrap()).unwrap();
         assert_eq!(info.protocol, quota_core::PROTOCOL_VERSION);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_refresh_requests_share_one_probe() {
+        let gate = Arc::new(RefreshGate::default());
+        let observed_generation = gate.generation();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let gate = gate.clone();
+            let calls = calls.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.run_if_current(observed_generation, || async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    true
+                })
+                .await
+            }));
+        }
+        let mut completed = 0;
+        for task in tasks {
+            completed += usize::from(task.await.unwrap());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(completed, 1);
+        assert_eq!(gate.generation(), 1);
+    }
+
+    #[test]
+    fn retry_after_does_not_lengthen_the_shared_refresh_interval() {
+        assert_eq!(refresh_interval_secs(true, false, 30, 5, 300), 45);
+        assert_eq!(refresh_interval_secs(false, false, 30, 5, 300), 60);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_fallback_retry_after_does_not_block_claude_refresh() {
+        use quota_adapters::http::{HttpResponse, MockTransport};
+        use quota_adapters::provider::ProbeCtx;
+        use quota_adapters::CodexAdapter;
+        use quota_core::types::{ProviderPermission, Source, UsageWindow, WindowKind};
+
+        let dir = unique_test_dir("quota-rate-limit-adapter");
+        let home = dir.join("codex");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("auth.json"), br#"{"access_token":"test-token"}"#).unwrap();
+        let transport = MockTransport {
+            next: Some(Ok(HttpResponse {
+                status: 429,
+                body: b"{}".to_vec(),
+                retry_after_secs: Some(120),
+            })),
+            last_url: std::sync::Mutex::new(None),
+        };
+        let adapter = CodexAdapter {
+            home: Some(home),
+            codexbar_dir: Some(quota_adapters::codexbar::workspace_fixtures_dir()),
+            enable_codexbar_files: true,
+        };
+        let ctx = ProbeCtx {
+            transport: &transport,
+            now: now_unix(),
+        };
+        let codex = adapter.probe(&ctx);
+        assert_eq!(codex.source, Some(Source::File));
+        assert_eq!(codex.retry_after_secs, Some(120));
+
+        let app = Arc::new(RwLock::new(test_app()));
+        apply_provider_snapshot(&app, codex).await;
+        assert!(provider_in_backoff(&app, ProviderId::Codex).await);
+        assert!(!provider_in_backoff(&app, ProviderId::Claude).await);
+
+        let codex_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codex_calls_probe = codex_calls.clone();
+        refresh_provider_with(app.clone(), ProviderId::Codex, move |_| async move {
+            codex_calls_probe.fetch_add(1, Ordering::Relaxed);
+            Some(ProviderSnapshot::unavailable(
+                ProviderId::Codex,
+                AdapterError::new("unexpected", "must remain in backoff"),
+            ))
+        })
+        .await;
+        assert_eq!(codex_calls.load(Ordering::Relaxed), 0);
+
+        let codex_deadline = app.read().await.retry_after_until[&ProviderId::Codex];
+        let claude_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let claude_calls_probe = claude_calls.clone();
+        refresh_provider_with(app.clone(), ProviderId::Claude, move |_| async move {
+            claude_calls_probe.fetch_add(1, Ordering::Relaxed);
+            let now = now_unix();
+            Some(ProviderSnapshot::observed(
+                ProviderId::Claude,
+                Some(Source::Oauth),
+                vec![UsageWindow::from_percent_at(
+                    WindowKind::Weekly,
+                    "weekly",
+                    25.0,
+                    None,
+                    None,
+                    Some(now),
+                    300,
+                )],
+                None,
+                None,
+                None,
+                Some(now),
+                300,
+                ProviderPermission::Allowed,
+            ))
+        })
+        .await;
+
+        assert_eq!(claude_calls.load(Ordering::Relaxed), 1);
+        assert!(provider_in_backoff(&app, ProviderId::Codex).await);
+        assert_eq!(
+            app.read().await.retry_after_until[&ProviderId::Codex],
+            codex_deadline
+        );
+        let latest = app.read().await.store.latest().cloned().unwrap();
+        assert!(latest.by_id(ProviderId::Codex).is_some());
+        assert!(latest.by_id(ProviderId::Claude).is_some());
+        assert_eq!(
+            latest
+                .providers
+                .iter()
+                .map(|provider| provider.provider)
+                .collect::<Vec<_>>(),
+            [ProviderId::Codex, ProviderId::Claude]
+        );
+
+        let now = now_unix();
+        apply_provider_snapshot(
+            &app,
+            ProviderSnapshot::observed(
+                ProviderId::Codex,
+                Some(Source::Oauth),
+                vec![UsageWindow::from_percent_at(
+                    WindowKind::Weekly,
+                    "weekly",
+                    30.0,
+                    None,
+                    None,
+                    Some(now),
+                    300,
+                )],
+                None,
+                None,
+                None,
+                Some(now),
+                300,
+                ProviderPermission::Allowed,
+            ),
+        )
+        .await;
+        let mut claude_limited = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("rate_limited", "HTTP 429"),
+        );
+        claude_limited.retry_after_secs = Some(120);
+        apply_provider_snapshot(&app, claude_limited).await;
+        assert!(provider_in_backoff(&app, ProviderId::Claude).await);
+        assert!(!provider_in_backoff(&app, ProviderId::Codex).await);
+
+        let codex_after_claude_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codex_after_claude_probe = codex_after_claude_calls.clone();
+        refresh_provider_with(app.clone(), ProviderId::Codex, move |_| async move {
+            codex_after_claude_probe.fetch_add(1, Ordering::Relaxed);
+            let now = now_unix();
+            Some(ProviderSnapshot::observed(
+                ProviderId::Codex,
+                Some(Source::Oauth),
+                vec![UsageWindow::from_percent_at(
+                    WindowKind::Weekly,
+                    "weekly",
+                    35.0,
+                    None,
+                    None,
+                    Some(now),
+                    300,
+                )],
+                None,
+                None,
+                None,
+                Some(now),
+                300,
+                ProviderPermission::Allowed,
+            ))
+        })
+        .await;
+        assert_eq!(codex_after_claude_calls.load(Ordering::Relaxed), 1);
+        assert!(provider_in_backoff(&app, ProviderId::Claude).await);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_gates_are_single_flight_without_cross_provider_locking() {
+        let app = test_app();
+        let codex = app.refresh_gates[&ProviderId::Codex].clone();
+        let claude = app.refresh_gates[&ProviderId::Claude].clone();
+        let codex_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let codex_done_task = codex_done.clone();
+        let codex_task = tokio::spawn(async move {
+            let generation = codex.generation();
+            codex
+                .run_if_current(generation, || async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    codex_done_task.store(true, Ordering::Release);
+                    true
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        let generation = claude.generation();
+        assert!(claude.run_if_current(generation, || async { true }).await);
+        assert!(!codex_done.load(Ordering::Acquire));
+        assert!(codex_task.await.unwrap());
+        assert!(codex_done.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interleaved_provider_refreshes_keep_pace_samples_source_scoped() {
+        use quota_core::types::{ProviderPermission, Source, UsageWindow, WindowKind};
+
+        let app = Arc::new(RwLock::new(test_app()));
+        let now = now_unix();
+        let observed = |provider, used, observed_at| {
+            ProviderSnapshot::observed(
+                provider,
+                Some(Source::Oauth),
+                vec![UsageWindow::from_percent_at(
+                    WindowKind::Weekly,
+                    "weekly",
+                    used,
+                    None,
+                    None,
+                    Some(observed_at),
+                    300,
+                )],
+                None,
+                None,
+                None,
+                Some(observed_at),
+                300,
+                ProviderPermission::Allowed,
+            )
+        };
+
+        apply_provider_snapshot(&app, observed(ProviderId::Codex, 10.0, now - 100)).await;
+        apply_provider_snapshot(&app, observed(ProviderId::Claude, 20.0, now - 100)).await;
+        apply_provider_snapshot(&app, observed(ProviderId::Codex, 15.0, now - 50)).await;
+        apply_provider_snapshot(&app, observed(ProviderId::Claude, 30.0, now)).await;
+
+        let g = app.read().await;
+        let latest = g.store.latest().unwrap();
+        let codex = latest.by_id(ProviderId::Codex).unwrap();
+        let report = pace_for(g.store.history_ref(), codex);
+
+        assert_eq!(report.samples, 2);
+        assert!((report.burn_percent_per_hour.unwrap() - 360.0).abs() < 1e-6);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -864,6 +1405,30 @@ mod tests {
         let a = Snapshot::new(1, vec![]);
         let b = Snapshot::new(2, vec![]);
         assert!(same_usage(&a, &b));
+    }
+
+    #[test]
+    fn permission_changes_count_as_usage_changes() {
+        let now = now_unix();
+        let make = |permission| {
+            Snapshot::new(
+                now,
+                vec![ProviderSnapshot::observed(
+                    ProviderId::Codex,
+                    Some(quota_core::types::Source::Oauth),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    300,
+                    permission,
+                )],
+            )
+        };
+        let allowed = make(quota_core::types::ProviderPermission::Allowed);
+        let refused = make(quota_core::types::ProviderPermission::LimitReached);
+        assert!(!same_usage(&allowed, &refused));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -908,12 +1473,7 @@ mod tests {
 
     #[test]
     fn instance_lock_is_exclusive() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-lock-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-lock");
         let sock = dir.join("quota.sock");
         let first = acquire_instance_lock(&sock).unwrap();
         let err = acquire_instance_lock(&sock).unwrap_err();
@@ -926,12 +1486,7 @@ mod tests {
 
     #[test]
     fn prepare_socket_refuses_symlink() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-sock-sym-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-sock-sym");
         let target = dir.join("target.sock");
         let link = dir.join("quota.sock");
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -942,12 +1497,7 @@ mod tests {
 
     #[test]
     fn prepare_socket_refuses_live_instance() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-sock-live-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-sock-live");
         let sock = dir.join("quota.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let err = prepare_socket(&sock).unwrap_err();
@@ -957,12 +1507,7 @@ mod tests {
 
     #[test]
     fn prepare_socket_unlinks_stale() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-sock-stale-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-sock-stale");
         let sock = dir.join("quota.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         drop(listener);
@@ -1003,12 +1548,7 @@ mod tests {
 
     #[test]
     fn socket_is_owner_only() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-sock-mode-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-sock-mode");
         let sock = dir.join("quota.sock");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

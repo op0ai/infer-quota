@@ -18,8 +18,8 @@
 use std::path::Path;
 
 use quota_core::types::{
-    AdapterError, Availability, Credits, ProviderId, ProviderSnapshot, Source, UsageWindow,
-    WindowKind,
+    AdapterError, Credits, ProviderId, ProviderPermission, ProviderSnapshot, Source, UsageWindow,
+    WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use crate::creds::{load_claude_creds, ClaudeCreds, CredsError};
@@ -81,7 +81,13 @@ fn fetch_usage(transport: &dyn Transport, creds: &ClaudeCreds, now: i64) -> Prov
     ];
     match transport.get(USAGE_URL, &headers) {
         Ok(resp) => {
-            let mut snap = parse_usage_http(resp.status, &resp.body, &creds.path);
+            let mut snap = parse_usage_http_with_meta(
+                resp.status,
+                &resp.body,
+                &creds.path,
+                now,
+                resp.retry_after_secs,
+            );
             if expired {
                 if let Some(err) = snap.error.as_mut() {
                     err.message.push_str(" (local expiresAt is in the past)");
@@ -107,6 +113,22 @@ fn fetch_usage(transport: &dyn Transport, creds: &ClaudeCreds, now: i64) -> Prov
 }
 
 pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderSnapshot {
+    parse_usage_http_with_meta(
+        status,
+        body,
+        cred_path,
+        quota_core::timeutil::now_unix(),
+        None,
+    )
+}
+
+fn parse_usage_http_with_meta(
+    status: u16,
+    body: &[u8],
+    cred_path: &Path,
+    observed_at: i64,
+    retry_after_secs: Option<u64>,
+) -> ProviderSnapshot {
     let path = cred_path.display().to_string();
     if status == 401 || status == 403 {
         let mut snap = ProviderSnapshot::unavailable(
@@ -120,6 +142,7 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
     if status == 429 {
@@ -132,6 +155,7 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
     if !(200..300).contains(&status) {
@@ -142,12 +166,13 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
-    parse_usage_json(body, &path)
+    parse_usage_json(body, &path, observed_at)
 }
 
-fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
+fn parse_usage_json(body: &[u8], path: &str, observed_at: i64) -> ProviderSnapshot {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -162,14 +187,29 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
     };
 
     let mut windows = Vec::new();
-    push_bucket(&mut windows, &v, "five_hour", WindowKind::FiveHour, "5h");
-    push_bucket(&mut windows, &v, "seven_day", WindowKind::Weekly, "weekly");
+    push_bucket(
+        &mut windows,
+        &v,
+        "five_hour",
+        WindowKind::FiveHour,
+        "5h",
+        observed_at,
+    );
+    push_bucket(
+        &mut windows,
+        &v,
+        "seven_day",
+        WindowKind::Weekly,
+        "weekly",
+        observed_at,
+    );
     push_bucket(
         &mut windows,
         &v,
         "seven_day_opus",
         WindowKind::Extra,
         "opus weekly",
+        observed_at,
     );
     push_bucket(
         &mut windows,
@@ -177,17 +217,20 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
         "seven_day_sonnet",
         WindowKind::Extra,
         "sonnet weekly",
+        observed_at,
     );
 
     let credits = v.get("extra_usage").and_then(map_extra_usage);
     if let Some(extra) = v.get("extra_usage") {
         if let Some(util) = extra.get("utilization").and_then(|x| x.as_f64()) {
-            windows.push(UsageWindow::from_percent(
+            windows.push(UsageWindow::from_percent_at(
                 WindowKind::Monthly,
                 "extra usage",
                 util,
                 None,
                 None,
+                Some(observed_at),
+                DEFAULT_READING_MAX_AGE_SECS,
             ));
         }
     }
@@ -205,16 +248,17 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
         return snap;
     }
 
-    ProviderSnapshot {
-        provider: ProviderId::Claude,
-        status: Availability::Ok,
-        source: Some(Source::Oauth),
+    ProviderSnapshot::observed(
+        ProviderId::Claude,
+        Some(Source::Oauth),
         windows,
         credits,
-        plan: None,
-        error: None,
-        credential_path: Some(path.to_string()),
-    }
+        None,
+        Some(path.to_string()),
+        Some(observed_at),
+        DEFAULT_READING_MAX_AGE_SECS,
+        ProviderPermission::Unknown,
+    )
 }
 
 fn push_bucket(
@@ -223,6 +267,7 @@ fn push_bucket(
     key: &str,
     kind: WindowKind,
     label: &str,
+    observed_at: i64,
 ) {
     let Some(node) = root.get(key) else {
         return;
@@ -230,13 +275,28 @@ fn push_bucket(
     if node.is_null() {
         return;
     }
-    let Some(used) = node.get("utilization").and_then(|x| x.as_f64()) else {
-        return;
-    };
     let reset = node
         .get("resets_at")
         .and_then(quota_core::timeutil::parse_reset_at);
-    windows.push(UsageWindow::from_percent(kind, label, used, reset, None));
+    windows.push(match node.get("utilization").and_then(|x| x.as_f64()) {
+        Some(used) if used.is_finite() && used >= 0.0 => UsageWindow::from_percent_at(
+            kind,
+            label,
+            used,
+            reset,
+            None,
+            Some(observed_at),
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+        _ => UsageWindow::unreadable(
+            kind,
+            label,
+            reset,
+            None,
+            Some(observed_at),
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+    });
 }
 
 fn map_extra_usage(node: &serde_json::Value) -> Option<Credits> {
@@ -264,6 +324,7 @@ fn map_extra_usage(node: &serde_json::Value) -> Option<Credits> {
 mod tests {
     use super::*;
     use crate::http::{MockTransport, TransportError};
+    use quota_core::types::Availability;
     use std::path::PathBuf;
 
     const FIXTURE: &str = r#"{
@@ -289,6 +350,8 @@ mod tests {
         assert!(snap.windows[0].reset_at.is_some());
         assert_eq!(snap.windows[1].kind, WindowKind::Weekly);
         assert_eq!(snap.windows[2].label, "sonnet weekly");
+        assert_eq!(snap.permission, ProviderPermission::Unknown);
+        assert!(snap.observed_at.is_some());
     }
 
     #[test]
@@ -303,10 +366,33 @@ mod tests {
     }
 
     #[test]
+    fn reported_bucket_without_utilization_is_unknown_not_zero() {
+        let snap = parse_usage_http(
+            200,
+            br#"{"five_hour":{"resets_at":"2026-10-01T00:00:00Z"}}"#,
+            Path::new("c.json"),
+        );
+        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(
+            snap.windows[0].state,
+            quota_core::types::WindowState::Unknown
+        );
+        assert!(snap.windows[0].reading.is_none());
+        assert!(serde_json::to_value(&snap).unwrap()["windows"][0]["reading"].is_null());
+    }
+
+    #[test]
     fn rate_limited() {
         let snap = parse_usage_http(429, b"{}", Path::new("c.json"));
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "rate_limited");
+    }
+
+    #[test]
+    fn retry_after_is_retained_from_rate_limit_response() {
+        let snap = parse_usage_http_with_meta(429, b"{}", Path::new("c.json"), 100, Some(45));
+        assert_eq!(snap.retry_after_secs, Some(45));
     }
 
     #[test]

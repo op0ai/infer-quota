@@ -5,23 +5,25 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use quota_core::framing::{decode_len, encode_frame, read_frame, write_frame, MAX_FRAME_BYTES};
 use quota_core::protocol::{
     CanStartResult, Request, Response, StatusResult, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST,
     METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_STATUS, METHOD_WATCH,
 };
-use quota_core::types::{Availability, CanStartBasis, ProviderId};
+use quota_core::types::{Availability, CanStartBasis, Freshness, ProviderId};
 
 struct Daemon {
     child: Child,
-    dir: PathBuf,
+    _temp_dir: tempfile::TempDir,
     socket: PathBuf,
 }
 
@@ -29,7 +31,6 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -38,12 +39,8 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn spawn_daemon(enable_codexbar: bool) -> Daemon {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("quota-hotpath-{stamp}"));
-    fs::create_dir_all(&dir).unwrap();
+    let temp_dir = tempfile::tempdir().expect("unique hotpath test directory");
+    let dir = temp_dir.path();
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let socket = dir.join("quota.sock");
     let home = dir.join("home");
@@ -79,7 +76,7 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .env("CLAUDE_CONFIG_DIR", home.join("no-claude"))
         .env("XDG_CONFIG_HOME", home.join("xdg-config"))
         .env("XDG_STATE_HOME", home.join("xdg-state"))
-        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_RUNTIME_DIR", dir)
         .env_remove("QUOTA_SOCKET")
         .env("QUOTA_WATCH_IDLE_SECS", "1")
         .stdin(Stdio::null())
@@ -88,7 +85,11 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .spawn()
         .expect("spawn quotad");
 
-    let daemon = Daemon { child, dir, socket };
+    let daemon = Daemon {
+        child,
+        _temp_dir: temp_dir,
+        socket,
+    };
     wait_ping(&daemon.socket, Duration::from_secs(8)).expect("quotad did not become ready");
     daemon
 }
@@ -221,8 +222,11 @@ fn fixture_ingest_and_percent_only_can_start() {
         .snapshot
         .by_id(ProviderId::Codex)
         .expect("codex present");
-    assert_eq!(codex.status, Availability::Ok);
+    assert_eq!(codex.status, Availability::Stale);
+    assert_eq!(codex.freshness, Freshness::Stale);
+    assert!(codex.observed_at.is_some());
     assert_eq!(codex.windows[0].used_percent, Some(59.0));
+    assert_eq!(codex.windows[0].freshness, Freshness::Stale);
     let claude = result
         .snapshot
         .by_id(ProviderId::Claude)
@@ -238,8 +242,8 @@ fn fixture_ingest_and_percent_only_can_start() {
     let answers: CanStartResult =
         serde_json::from_value(can.result.clone().expect("can_start result")).unwrap();
     assert!(!answers.ok);
-    assert_eq!(answers.answers[0].basis, CanStartBasis::PercentOnly);
-    assert!(answers.answers[0].explanation.contains("Cannot map"));
+    assert_eq!(answers.answers[0].basis, CanStartBasis::Unavailable);
+    assert!(answers.answers[0].explanation.contains("stale"));
 
     let pace = rpc(
         &d.socket,
@@ -251,6 +255,322 @@ fn fixture_ingest_and_percent_only_can_start() {
     assert_no_secrets(&serde_json::to_string(&status).unwrap());
     assert_no_secrets(&serde_json::to_string(&can).unwrap());
     assert_no_secrets(&serde_json::to_string(&pace).unwrap());
+}
+
+#[test]
+fn sigterm_removes_socket_and_lock_gracefully() {
+    let mut daemon = spawn_daemon(false);
+    let lock = daemon.socket.with_extension("lock");
+    assert!(daemon.socket.exists());
+    assert!(lock.exists());
+    let status = Command::new("/bin/kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit = loop {
+        if let Some(exit) = daemon.child.try_wait().expect("wait for quotad") {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "quotad did not stop on SIGTERM");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(exit.success());
+    assert!(!daemon.socket.exists(), "SIGTERM must unlink the socket");
+    assert!(!lock.exists(), "SIGTERM must remove the instance lock");
+}
+
+#[test]
+fn sigterm_during_startup_probe_removes_socket_and_lock() {
+    let temp_dir = tempfile::tempdir().expect("unique startup test directory");
+    let dir = temp_dir.path();
+    let socket = dir.join("startup.sock");
+    let home = dir.join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local TLS stall listener");
+    let port = listener.local_addr().unwrap().port();
+    fs::write(
+        home.join("config.toml"),
+        format!("chatgpt_base_url = \"https://localhost:{port}\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        br#"{"access_token":"startup-test-token"}"#,
+    )
+    .unwrap();
+    let cfg_path = dir.join("config.json");
+    let cfg = serde_json::json!({
+        "history": false,
+        "ring_capacity": 16,
+        "refresh_min_secs": 30,
+        "refresh_max_secs": 300,
+        "http_timeout_secs": 5,
+        "enable_codex": true,
+        "enable_claude": false,
+        "enable_codexbar_files": false,
+        "accounts_path": dir.join("accounts.json").to_string_lossy(),
+    });
+    fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+
+    let (connected_tx, connected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(8)))
+                        .unwrap();
+                    let mut client_hello = [0_u8; 1];
+                    if !matches!(stream.read(&mut client_hello), Ok(1)) {
+                        return;
+                    }
+                    let _ = connected_tx.send(());
+                    thread::sleep(Duration::from_secs(2));
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let child = Command::new(env!("CARGO_BIN_EXE_quotad"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("run")
+        .env("HOME", &home)
+        .env("CODEX_HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", dir.join("no-claude"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_RUNTIME_DIR", dir)
+        .env_remove("QUOTA_SOCKET")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn quotad with a stalled initial HTTPS probe");
+    let mut daemon = Daemon {
+        child,
+        _temp_dir: temp_dir,
+        socket: socket.clone(),
+    };
+    connected_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("initial provider probe did not connect to local stall server");
+    assert!(daemon.child.try_wait().unwrap().is_none());
+    let lock = socket.with_extension("lock");
+    assert!(socket.exists());
+    assert!(lock.exists());
+
+    let status = Command::new("/bin/kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM during startup");
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let exit = loop {
+        if let Some(exit) = daemon.child.try_wait().expect("wait for quotad") {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quotad did not stop during startup"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(exit.success(), "startup SIGTERM exit was {exit}");
+    assert!(!socket.exists(), "startup SIGTERM must unlink the socket");
+    assert!(
+        !lock.exists(),
+        "startup SIGTERM must remove the instance lock"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn scheduled_refresh_keeps_socket_and_sigterm_responsive() {
+    let temp_dir = tempfile::tempdir().expect("unique scheduled-refresh test directory");
+    let dir = temp_dir.path();
+    let socket = dir.join("scheduled.sock");
+    let home = dir.join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local TLS stall listener");
+    let port = listener.local_addr().unwrap().port();
+    let (connected_tx, connected_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(15)))
+                        .unwrap();
+                    let mut client_hello = [0_u8; 1];
+                    if matches!(stream.read(&mut client_hello), Ok(1)) {
+                        let _ = connected_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let cfg_path = dir.join("config.json");
+    let cfg = serde_json::json!({
+        "history": false,
+        "ring_capacity": 16,
+        "refresh_min_secs": 5,
+        "refresh_max_secs": 5,
+        "http_timeout_secs": 30,
+        "enable_codex": true,
+        "enable_claude": false,
+        "enable_codexbar_files": false,
+        "accounts_path": dir.join("accounts.json").to_string_lossy(),
+    });
+    fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_quotad"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("run")
+        .env("HOME", &home)
+        .env("CODEX_HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", dir.join("no-claude"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_RUNTIME_DIR", dir)
+        .env_remove("QUOTA_SOCKET")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn quotad before scheduled refresh");
+    let mut daemon = Daemon {
+        child,
+        _temp_dir: temp_dir,
+        socket: socket.clone(),
+    };
+    wait_ping(&socket, Duration::from_secs(8)).expect("quotad did not become ready");
+
+    fs::write(
+        home.join("config.toml"),
+        format!("chatgpt_base_url = \"https://localhost:{port}\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        br#"{"access_token":"scheduled-refresh-test-token"}"#,
+    )
+    .unwrap();
+    connected_rx
+        .recv_timeout(Duration::from_secs(12))
+        .expect("scheduled refresh did not connect to the stalled HTTPS server");
+
+    let ping_responsive = (|| -> Result<bool, Box<dyn std::error::Error>> {
+        let mut stream = UnixStream::connect(&socket)?;
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let request = Request::new(9, METHOD_PING);
+        write_frame(&mut stream, &serde_json::to_vec(&request).unwrap())?;
+        let payload = read_frame(&mut stream)?;
+        let response: Response = serde_json::from_slice(&payload)?;
+        Ok(response.ok)
+    })()
+    .unwrap_or(false);
+
+    let status = Command::new("/bin/kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM during scheduled refresh");
+    assert!(status.success());
+    let cleanup_deadline = Instant::now() + Duration::from_millis(750);
+    let lock = socket.with_extension("lock");
+    while (socket.exists() || lock.exists()) && Instant::now() < cleanup_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let socket_removed_before_probe_finished = !socket.exists();
+    let lock_removed_before_probe_finished = !lock.exists();
+
+    // Process exit must complete while the provider is still stalled. This
+    // catches runtime shutdown waiting for a blocking probe worker.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let exit = loop {
+        if let Some(exit) = daemon.child.try_wait().expect("wait for quotad") {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quotad did not exit while the scheduled provider probe was stalled"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        exit.success(),
+        "scheduled-refresh SIGTERM exit while probe stalled was {exit}"
+    );
+
+    // Only release the test server after process exit has been observed.
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        ping_responsive,
+        "socket ping must complete during scheduled refresh"
+    );
+    assert!(
+        socket_removed_before_probe_finished && lock_removed_before_probe_finished,
+        "SIGTERM must clean socket and lock before probe completion (socket_removed={}, lock_removed={})",
+        socket_removed_before_probe_finished,
+        lock_removed_before_probe_finished
+    );
+    assert!(exit.success(), "scheduled-refresh SIGTERM exit was {exit}");
+    assert!(!socket.exists());
+    assert!(!socket.with_extension("lock").exists());
+}
+
+#[test]
+fn malformed_config_does_not_start_with_defaults() {
+    let temp_dir = tempfile::tempdir().expect("unique malformed-config test directory");
+    let dir = temp_dir.path();
+    let cfg = dir.join("config.json");
+    let socket = dir.join("quota.sock");
+    fs::write(&cfg, b"{ malformed").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_quotad"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("run")
+        .output()
+        .expect("run quotad with malformed config");
+    assert!(!output.status.success());
+    assert!(!socket.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("malformed config JSON"));
 }
 
 #[test]

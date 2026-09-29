@@ -13,7 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use quota_core::types::{
-    AdapterError, Availability, Credits, ProviderId, ProviderSnapshot, Source, UsageWindow,
+    AdapterError, Availability, Credits, ProviderId, ProviderPermission, ProviderSnapshot, Source,
+    UsageWindow, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use crate::codexbar;
@@ -49,7 +50,7 @@ impl Provider for CodexAdapter {
 
     fn probe(&self, ctx: &ProbeCtx<'_>) -> ProviderSnapshot {
         let api = match load_codex_creds(self.home.as_deref()) {
-            Ok(creds) => fetch_usage(ctx.transport, &creds, self.home.as_deref()),
+            Ok(creds) => fetch_usage(ctx.transport, &creds, self.home.as_deref(), ctx.now),
             Err(e) => {
                 let mut snap = ProviderSnapshot::unavailable(
                     ProviderId::Codex,
@@ -64,7 +65,17 @@ impl Provider for CodexAdapter {
             return api;
         }
         match self.try_codexbar_file() {
-            Some(file) => file,
+            Some(mut file) => {
+                // A file snapshot can provide fallback usage, but it must not
+                // erase the API's per-provider rate-limit deadline.
+                file.retry_after_secs = api.retry_after_secs;
+                // Permission is independent evidence from the API response.
+                // Keep an explicit decision when the file only contributes usage.
+                if api.permission != ProviderPermission::Unknown {
+                    file.permission = api.permission;
+                }
+                file
+            }
             None => api,
         }
     }
@@ -133,6 +144,7 @@ fn fetch_usage(
     transport: &dyn Transport,
     creds: &CodexCreds,
     home: Option<&Path>,
+    now: i64,
 ) -> ProviderSnapshot {
     let url = usage_url(home);
     let auth = format!("Bearer {}", creds.access_token);
@@ -147,7 +159,13 @@ fn fetch_usage(
     }
 
     match transport.get(&url, &headers) {
-        Ok(resp) => parse_usage_http(resp.status, &resp.body, &creds.path),
+        Ok(resp) => parse_usage_http_with_meta(
+            resp.status,
+            &resp.body,
+            &creds.path,
+            now,
+            resp.retry_after_secs,
+        ),
         Err(e) => {
             let mut snap = ProviderSnapshot::unavailable(
                 ProviderId::Codex,
@@ -161,6 +179,22 @@ fn fetch_usage(
 }
 
 pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderSnapshot {
+    parse_usage_http_with_meta(
+        status,
+        body,
+        cred_path,
+        quota_core::timeutil::now_unix(),
+        None,
+    )
+}
+
+fn parse_usage_http_with_meta(
+    status: u16,
+    body: &[u8],
+    cred_path: &Path,
+    observed_at: i64,
+    retry_after_secs: Option<u64>,
+) -> ProviderSnapshot {
     let path = cred_path.display().to_string();
     if status == 401 || status == 403 {
         let mut snap = ProviderSnapshot::unavailable(
@@ -172,6 +206,7 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
     if status == 429 {
@@ -181,6 +216,7 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
     if !(200..300).contains(&status) {
@@ -191,12 +227,13 @@ pub fn parse_usage_http(status: u16, body: &[u8], cred_path: &Path) -> ProviderS
         );
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path);
+        snap.retry_after_secs = retry_after_secs;
         return snap;
     }
-    parse_usage_json(body, &path)
+    parse_usage_json(body, &path, observed_at)
 }
 
-fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
+fn parse_usage_json(body: &[u8], path: &str, observed_at: i64) -> ProviderSnapshot {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -211,12 +248,15 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
     };
 
     let rate = v.get("rate_limit");
+    let permission = rate
+        .map(parse_permission)
+        .unwrap_or(ProviderPermission::Unknown);
     let mut windows = Vec::new();
     if let Some(rate) = rate {
-        if let Some(w) = map_codex_window(rate.get("primary_window"), "primary") {
+        if let Some(w) = map_codex_window(rate.get("primary_window"), "primary", observed_at) {
             windows.push(w);
         }
-        if let Some(w) = map_codex_window(rate.get("secondary_window"), "secondary") {
+        if let Some(w) = map_codex_window(rate.get("secondary_window"), "secondary", observed_at) {
             windows.push(w);
         }
         if let Some(extra) = rate
@@ -230,7 +270,7 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
                     .and_then(|x| x.as_str())
                     .unwrap_or("extra")
                     .to_string();
-                if let Some(mut w) = map_codex_window(Some(item), "tertiary") {
+                if let Some(mut w) = map_codex_window(Some(item), "tertiary", observed_at) {
                     w.label = label;
                     windows.push(w);
                 }
@@ -255,27 +295,49 @@ fn parse_usage_json(body: &[u8], path: &str) -> ProviderSnapshot {
         snap.source = Some(Source::Oauth);
         snap.credential_path = Some(path.to_string());
         snap.plan = plan;
+        snap.permission = permission;
+        snap.observed_at = Some(observed_at);
+        snap.max_age_secs = DEFAULT_READING_MAX_AGE_SECS;
+        snap.refresh_freshness(quota_core::timeutil::now_unix());
         return snap;
     }
 
-    ProviderSnapshot {
-        provider: ProviderId::Codex,
-        status: Availability::Ok,
-        source: Some(Source::Oauth),
+    ProviderSnapshot::observed(
+        ProviderId::Codex,
+        Some(Source::Oauth),
         windows,
         credits,
         plan,
-        error: None,
-        credential_path: Some(path.to_string()),
+        Some(path.to_string()),
+        Some(observed_at),
+        DEFAULT_READING_MAX_AGE_SECS,
+        permission,
+    )
+}
+
+fn parse_permission(rate: &serde_json::Value) -> ProviderPermission {
+    let allowed = rate.get("allowed").and_then(serde_json::Value::as_bool);
+    let limit_reached = rate
+        .get("limit_reached")
+        .and_then(serde_json::Value::as_bool);
+    if allowed == Some(false) || limit_reached == Some(true) {
+        ProviderPermission::LimitReached
+    } else if allowed == Some(true) || limit_reached == Some(false) {
+        ProviderPermission::Allowed
+    } else {
+        ProviderPermission::Unknown
     }
 }
 
-fn map_codex_window(node: Option<&serde_json::Value>, slot: &str) -> Option<UsageWindow> {
+fn map_codex_window(
+    node: Option<&serde_json::Value>,
+    slot: &str,
+    observed_at: i64,
+) -> Option<UsageWindow> {
     let node = node?;
     if node.is_null() {
         return None;
     }
-    let used = node.get("used_percent")?.as_f64()?;
     let reset = node
         .get("reset_at")
         .and_then(quota_core::timeutil::parse_reset_at);
@@ -283,13 +345,25 @@ fn map_codex_window(node: Option<&serde_json::Value>, slot: &str) -> Option<Usag
     let minutes = node.get("window_minutes").and_then(|x| x.as_i64());
     let (kind, label) =
         quota_core::classify_codex_window(Some(slot), limit_window_seconds, minutes);
-    Some(UsageWindow::from_percent(
-        kind,
-        label,
-        used,
-        reset,
-        limit_window_seconds,
-    ))
+    Some(match node.get("used_percent").and_then(|x| x.as_f64()) {
+        Some(used) if used.is_finite() && used >= 0.0 => UsageWindow::from_percent_at(
+            kind,
+            label,
+            used,
+            reset,
+            limit_window_seconds,
+            Some(observed_at),
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+        _ => UsageWindow::unreadable(
+            kind,
+            label,
+            reset,
+            limit_window_seconds,
+            Some(observed_at),
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+    })
 }
 
 fn map_credits(node: &serde_json::Value) -> Option<Credits> {
@@ -321,6 +395,23 @@ mod tests {
     use crate::provider::ProbeCtx;
     use quota_core::types::WindowKind;
     use std::path::Path;
+
+    fn unique_test_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        for _ in 0..1_000 {
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "quota-codex-adapter-{}-{serial}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create {}: {error}", path.display()),
+            }
+        }
+        panic!("could not allocate unique Codex adapter test directory");
+    }
 
     const FIXTURE: &str = r#"{
         "plan_type": "plus",
@@ -355,6 +446,12 @@ mod tests {
         assert_eq!(snap.windows[0].reset_at, Some(1_782_770_922));
         assert_eq!(snap.plan.as_deref(), Some("plus"));
         assert_eq!(snap.credits.as_ref().and_then(|c| c.balance), Some(0.0));
+        assert_eq!(snap.permission, ProviderPermission::Allowed);
+        assert!(snap.observed_at.is_some());
+        assert!(snap
+            .windows
+            .iter()
+            .all(|w| w.observed_at == snap.observed_at));
     }
 
     #[test]
@@ -388,6 +485,55 @@ mod tests {
     }
 
     #[test]
+    fn empty_success_preserves_explicit_limit_reached_permission() {
+        let snap = parse_usage_http(
+            200,
+            br#"{"rate_limit":{"allowed":false,"limit_reached":true}}"#,
+            Path::new("auth.json"),
+        );
+        assert_eq!(snap.status, Availability::Unavailable);
+        assert_eq!(snap.permission, ProviderPermission::LimitReached);
+        assert!(snap.observed_at.is_some());
+    }
+
+    #[test]
+    fn refusal_is_preserved_even_with_low_usage() {
+        let json = r#"{
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {"used_percent": 1}
+            }
+        }"#;
+        let snap = parse_usage_http(200, json.as_bytes(), Path::new("auth.json"));
+        assert_eq!(snap.windows[0].used_percent, Some(1.0));
+        assert_eq!(snap.permission, ProviderPermission::LimitReached);
+    }
+
+    #[test]
+    fn reported_window_with_missing_measurement_is_unknown_and_null() {
+        let snap = parse_usage_http(
+            200,
+            br#"{"rate_limit":{"primary_window":{"reset_at":1800000000}}}"#,
+            Path::new("auth.json"),
+        );
+        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(
+            snap.windows[0].state,
+            quota_core::types::WindowState::Unknown
+        );
+        assert!(snap.windows[0].reading.is_none());
+        assert!(serde_json::to_value(&snap).unwrap()["windows"][0]["reading"].is_null());
+    }
+
+    #[test]
+    fn retry_after_is_retained_from_rate_limit_response() {
+        let snap = parse_usage_http_with_meta(429, b"{}", Path::new("auth.json"), 100, Some(90));
+        assert_eq!(snap.retry_after_secs, Some(90));
+    }
+
+    #[test]
     fn mock_transport_network_error() {
         let t = MockTransport {
             next: Some(Err(crate::http::TransportError::Message("dns".into()))),
@@ -398,7 +544,7 @@ mod tests {
             account_id: None,
             path: PathBuf::from("/tmp/auth.json"),
         };
-        let snap = fetch_usage(&t, &creds, None);
+        let snap = fetch_usage(&t, &creds, None, quota_core::timeutil::now_unix());
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "network");
     }
@@ -472,11 +618,71 @@ mod tests {
             now: 1,
         };
         let snap = adapter.probe(&ctx);
-        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.status, Availability::Stale);
+        assert_eq!(snap.freshness, quota_core::types::Freshness::Stale);
         assert_eq!(snap.source, Some(Source::File));
         assert_eq!(snap.windows[0].kind, WindowKind::Weekly);
         assert_eq!(snap.windows[0].label, "weekly");
         assert_eq!(snap.windows[0].used_percent, Some(59.0));
+    }
+
+    #[test]
+    fn file_fallback_preserves_api_retry_after() {
+        let home = unique_test_dir();
+        std::fs::write(home.join("auth.json"), br#"{"access_token":"test-token"}"#).unwrap();
+        let t = MockTransport {
+            next: Some(Ok(crate::http::HttpResponse {
+                status: 429,
+                body: b"{}".to_vec(),
+                retry_after_secs: Some(120),
+            })),
+            last_url: std::sync::Mutex::new(None),
+        };
+        let adapter = CodexAdapter {
+            home: Some(home.clone()),
+            codexbar_dir: Some(crate::codexbar::workspace_fixtures_dir()),
+            enable_codexbar_files: true,
+        };
+        let ctx = ProbeCtx {
+            transport: &t,
+            now: quota_core::timeutil::now_unix(),
+        };
+
+        let snap = adapter.probe(&ctx);
+
+        assert_eq!(snap.source, Some(Source::File));
+        assert_eq!(snap.retry_after_secs, Some(120));
+        assert_eq!(
+            t.last_url.lock().unwrap().as_deref(),
+            Some("https://chatgpt.com/backend-api/wham/usage")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn file_fallback_preserves_explicit_api_refusal_without_windows() {
+        let home = unique_test_dir();
+        std::fs::write(home.join("auth.json"), br#"{"access_token":"test-token"}"#).unwrap();
+        let transport = MockTransport::ok_json(
+            200,
+            r#"{"rate_limit":{"allowed":false,"limit_reached":true}}"#,
+        );
+        let adapter = CodexAdapter {
+            home: Some(home.clone()),
+            codexbar_dir: Some(crate::codexbar::workspace_fixtures_dir()),
+            enable_codexbar_files: true,
+        };
+        let ctx = ProbeCtx {
+            transport: &transport,
+            now: quota_core::timeutil::now_unix(),
+        };
+
+        let snapshot = adapter.probe(&ctx);
+
+        assert_eq!(snapshot.source, Some(Source::File));
+        assert_eq!(snapshot.permission, ProviderPermission::LimitReached);
+        assert!(!snapshot.windows.is_empty());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -502,7 +708,7 @@ mod tests {
             account_id: None,
             path: PathBuf::from("/tmp/auth.json"),
         };
-        let snap = fetch_usage(&t, &creds, None);
+        let snap = fetch_usage(&t, &creds, None, quota_core::timeutil::now_unix());
         assert_eq!(snap.status, Availability::Ok);
         assert!(t
             .last_url

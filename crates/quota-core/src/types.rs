@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 /// Crate / binary version string (workspace version).
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Evidence older than this is not presented as current by the collector.
+pub const DEFAULT_READING_MAX_AGE_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,7 +55,35 @@ pub enum Source {
 #[serde(rename_all = "lowercase")]
 pub enum Availability {
     Ok,
+    Stale,
     Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    Current,
+    Stale,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPermission {
+    Allowed,
+    LimitReached,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowState {
+    Ok,
+    Exhausted,
+    #[default]
+    Unknown,
 }
 
 /// Quota window kinds advertised by providers. Not every provider has all of them.
@@ -87,6 +117,20 @@ pub struct UsageWindow {
     pub kind: WindowKind,
     /// Stable display label, e.g. `"5h"`, `"weekly"`, `"opus weekly"`.
     pub label: String,
+    /// State of this individual window. Missing/unreadable measurements stay unknown.
+    #[serde(default)]
+    pub state: WindowState,
+    /// The source measurement. Null means the provider reported a window but
+    /// did not provide a readable measurement.
+    pub reading: Option<WindowReading>,
+    /// Time the source says this measurement was observed, in UTC Unix seconds.
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+    /// Maximum age at which this evidence may be presented as current.
+    #[serde(default = "default_max_age")]
+    pub max_age_secs: u64,
+    #[serde(default)]
+    pub freshness: Freshness,
     /// Percent already consumed in `[0, 100]` when the source provides it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
@@ -112,6 +156,26 @@ pub struct UsageWindow {
     pub limit_window_seconds: Option<i64>,
 }
 
+fn default_max_age() -> u64 {
+    DEFAULT_READING_MAX_AGE_SECS
+}
+
+/// Structured measurement. The legacy flat numeric fields on `UsageWindow`
+/// remain available for existing clients and are kept in sync by constructors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowReading {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
 impl UsageWindow {
     pub fn from_percent(
         kind: WindowKind,
@@ -120,10 +184,48 @@ impl UsageWindow {
         reset_at: Option<i64>,
         limit_window_seconds: Option<i64>,
     ) -> Self {
+        Self::from_percent_at(
+            kind,
+            label,
+            used_percent,
+            reset_at,
+            limit_window_seconds,
+            Some(crate::timeutil::now_unix()),
+            DEFAULT_READING_MAX_AGE_SECS,
+        )
+    }
+
+    pub fn from_percent_at(
+        kind: WindowKind,
+        label: impl Into<String>,
+        used_percent: f64,
+        reset_at: Option<i64>,
+        limit_window_seconds: Option<i64>,
+        observed_at: Option<i64>,
+        max_age_secs: u64,
+    ) -> Self {
         let remaining_percent = (100.0 - used_percent).clamp(0.0, 100.0);
+        let state = if used_percent >= 100.0 {
+            WindowState::Exhausted
+        } else {
+            WindowState::Ok
+        };
+        let reading = WindowReading {
+            used_percent: Some(used_percent),
+            remaining_percent: Some(remaining_percent),
+            remaining: None,
+            limit: None,
+            unit: Some("percent".to_string()),
+        };
+        let freshness = freshness_for(observed_at, max_age_secs, crate::timeutil::now_unix());
         Self {
             kind,
             label: label.into(),
+            state,
+            reading: Some(reading),
+            observed_at,
+            max_age_secs,
+            freshness,
             used_percent: Some(used_percent),
             remaining_percent: Some(remaining_percent),
             remaining: None,
@@ -133,6 +235,46 @@ impl UsageWindow {
             reset_at_rfc3339: reset_at.map(crate::timeutil::format_rfc3339),
             limit_window_seconds,
         }
+    }
+
+    pub fn unreadable(
+        kind: WindowKind,
+        label: impl Into<String>,
+        reset_at: Option<i64>,
+        limit_window_seconds: Option<i64>,
+        observed_at: Option<i64>,
+        max_age_secs: u64,
+    ) -> Self {
+        let freshness = freshness_for(observed_at, max_age_secs, crate::timeutil::now_unix());
+        Self {
+            kind,
+            label: label.into(),
+            state: WindowState::Unknown,
+            reading: None,
+            observed_at,
+            max_age_secs,
+            freshness,
+            used_percent: None,
+            remaining_percent: None,
+            remaining: None,
+            limit: None,
+            unit: None,
+            reset_at,
+            reset_at_rfc3339: reset_at.map(crate::timeutil::format_rfc3339),
+            limit_window_seconds,
+        }
+    }
+
+    fn refresh_freshness(&mut self, now: i64) {
+        self.freshness = freshness_for(self.observed_at, self.max_age_secs, now);
+    }
+}
+
+fn freshness_for(observed_at: Option<i64>, max_age_secs: u64, now: i64) -> Freshness {
+    match observed_at {
+        None => Freshness::Unknown,
+        Some(at) if at > now || now.saturating_sub(at) as u64 > max_age_secs => Freshness::Stale,
+        Some(_) => Freshness::Current,
     }
 }
 
@@ -167,6 +309,19 @@ impl AdapterError {
 pub struct ProviderSnapshot {
     pub provider: ProviderId,
     pub status: Availability,
+    #[serde(default)]
+    pub permission: ProviderPermission,
+    /// Labels for every window whose observed state is exhausted.
+    #[serde(default)]
+    pub exhausted_windows: Vec<String>,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+    #[serde(default = "default_max_age")]
+    pub max_age_secs: u64,
+    #[serde(default)]
+    pub freshness: Freshness,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
     pub windows: Vec<UsageWindow>,
@@ -182,10 +337,53 @@ pub struct ProviderSnapshot {
 }
 
 impl ProviderSnapshot {
+    pub fn observed(
+        provider: ProviderId,
+        source: Option<Source>,
+        windows: Vec<UsageWindow>,
+        credits: Option<Credits>,
+        plan: Option<String>,
+        credential_path: Option<String>,
+        observed_at: Option<i64>,
+        max_age_secs: u64,
+        permission: ProviderPermission,
+    ) -> Self {
+        let mut snapshot = Self {
+            provider,
+            status: Availability::Ok,
+            permission,
+            exhausted_windows: Vec::new(),
+            observed_at,
+            max_age_secs,
+            freshness: Freshness::Unknown,
+            retry_after_secs: None,
+            source,
+            windows,
+            credits,
+            plan,
+            error: None,
+            credential_path,
+        };
+        for window in &mut snapshot.windows {
+            if window.observed_at.is_none() {
+                window.observed_at = observed_at;
+                window.max_age_secs = max_age_secs;
+            }
+        }
+        snapshot.refresh_freshness(crate::timeutil::now_unix());
+        snapshot
+    }
+
     pub fn unavailable(provider: ProviderId, error: AdapterError) -> Self {
         Self {
             provider,
             status: Availability::Unavailable,
+            permission: ProviderPermission::Unknown,
+            exhausted_windows: Vec::new(),
+            observed_at: None,
+            max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+            freshness: Freshness::Unknown,
+            retry_after_secs: None,
             source: None,
             windows: Vec::new(),
             credits: None,
@@ -197,6 +395,33 @@ impl ProviderSnapshot {
 
     pub fn window(&self, kind: &WindowKind) -> Option<&UsageWindow> {
         self.windows.iter().find(|w| w.kind == *kind)
+    }
+
+    pub fn refresh_freshness(&mut self, now: i64) {
+        for window in &mut self.windows {
+            window.refresh_freshness(now);
+        }
+        self.exhausted_windows = self
+            .windows
+            .iter()
+            .filter(|window| window.state == WindowState::Exhausted)
+            .map(|window| window.label.clone())
+            .collect();
+        self.freshness = freshness_for(self.observed_at, self.max_age_secs, now);
+        if self
+            .windows
+            .iter()
+            .any(|window| window.freshness != Freshness::Current)
+        {
+            self.freshness = Freshness::Stale;
+        }
+        if self.status != Availability::Unavailable {
+            self.status = if self.freshness == Freshness::Current {
+                Availability::Ok
+            } else {
+                Availability::Stale
+            };
+        }
     }
 }
 
@@ -225,6 +450,14 @@ impl Snapshot {
             .iter()
             .filter(|p| filter.matches(p.provider))
             .collect()
+    }
+
+    pub fn refreshed_at(&self, now: i64) -> Self {
+        let mut snapshot = self.clone();
+        for provider in &mut snapshot.providers {
+            provider.refresh_freshness(now);
+        }
+        snapshot
     }
 }
 
@@ -273,4 +506,67 @@ pub struct PaceReport {
     pub reset_at: Option<i64>,
     pub samples: u32,
     pub explanation: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_evidence_is_never_serialized_as_current() {
+        let window = UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            20.0,
+            None,
+            Some(604_800),
+            Some(1_000),
+            60,
+        );
+        let provider = ProviderSnapshot::observed(
+            ProviderId::Codex,
+            Some(Source::Oauth),
+            vec![window],
+            None,
+            None,
+            None,
+            Some(1_000),
+            60,
+            ProviderPermission::Allowed,
+        );
+        let snapshot = Snapshot::new(1_000, vec![provider]).refreshed_at(1_061);
+        let codex = snapshot.by_id(ProviderId::Codex).unwrap();
+        assert_eq!(codex.status, Availability::Stale);
+        assert_eq!(codex.freshness, Freshness::Stale);
+        assert_eq!(codex.observed_at, Some(1_000));
+        assert_eq!(codex.windows[0].freshness, Freshness::Stale);
+        assert_eq!(codex.windows[0].observed_at, Some(1_000));
+        assert_eq!(codex.windows[0].max_age_secs, 60);
+    }
+
+    #[test]
+    fn evidence_within_max_age_is_current() {
+        let mut provider = ProviderSnapshot::observed(
+            ProviderId::Codex,
+            Some(Source::Oauth),
+            vec![UsageWindow::from_percent_at(
+                WindowKind::Weekly,
+                "weekly",
+                20.0,
+                None,
+                None,
+                Some(1_000),
+                60,
+            )],
+            None,
+            None,
+            None,
+            Some(1_000),
+            60,
+            ProviderPermission::Allowed,
+        );
+        provider.refresh_freshness(1_060);
+        assert_eq!(provider.status, Availability::Ok);
+        assert_eq!(provider.freshness, Freshness::Current);
+    }
 }
