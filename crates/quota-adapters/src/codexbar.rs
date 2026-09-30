@@ -9,10 +9,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use quota_core::timeutil::{parse_reset_at, parse_reset_at_str};
+use quota_core::timeutil::{parse_apple_reset_at, parse_reset_at_str};
 use quota_core::types::{
-    AdapterError, Availability, Credits, ProviderId, ProviderSnapshot, Snapshot, Source,
-    UsageWindow, WindowKind,
+    AdapterError, Availability, Credits, ProviderId, ProviderObservation, ProviderPermission,
+    ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -63,25 +63,29 @@ impl HistoryRow {
     }
 
     pub fn to_snapshot(&self) -> Snapshot {
-        let fetched = self.fetched_at().unwrap_or(0);
+        let observed_at = self.fetched_at();
+        let fetched = observed_at.unwrap_or(0);
         let (kind, label) = classify_lane(&self.window_kind, self.window_minutes);
-        let window = UsageWindow::from_percent(
+        let window = UsageWindow::from_percent_at(
             kind,
             label,
             self.used_percent,
             self.reset_at(),
             Some(self.window_minutes.saturating_mul(60)),
+            observed_at,
+            DEFAULT_READING_MAX_AGE_SECS,
         );
-        let provider = ProviderSnapshot {
+        let provider = ProviderSnapshot::observed(ProviderObservation {
             provider: ProviderId::parse(&self.provider).unwrap_or(ProviderId::Codex),
-            status: Availability::Ok,
             source: Some(Source::File),
             windows: vec![window],
             credits: None,
             plan: None,
-            error: None,
             credential_path: None,
-        };
+            observed_at,
+            max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+            permission: ProviderPermission::Unknown,
+        });
         Snapshot::new(fetched, vec![provider])
     }
 }
@@ -108,6 +112,8 @@ struct Lane {
     used_percent: Option<f64>,
     #[serde(default)]
     window_minutes: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,11 +162,21 @@ struct SnapshotBody {
     provider_cost: Option<ProviderCost>,
     #[serde(default)]
     credits_remaining: Option<f64>,
+    #[serde(default)]
+    updated_at: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AccountIdentity {
+    #[serde(default, rename = "workspaceAccountID")]
+    workspace_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotRecord {
+    #[serde(default)]
+    account_identity: Option<AccountIdentity>,
     #[serde(default)]
     snapshot: Option<SnapshotBody>,
     #[serde(default)]
@@ -196,23 +212,40 @@ struct ManagedFile {
     accounts: Vec<ManagedAccount>,
 }
 
-fn lane_to_window(kind: &str, lane: Option<&Lane>) -> Option<UsageWindow> {
+fn lane_to_window(
+    kind: &str,
+    lane: Option<&Lane>,
+    provider_observed_at: Option<i64>,
+) -> Option<UsageWindow> {
     let lane = lane?;
-    let used = lane.used_percent?;
     let minutes = lane.window_minutes.unwrap_or(0);
-    let reset = lane.resets_at.as_ref().and_then(parse_reset_at);
+    let reset = lane.resets_at.as_ref().and_then(parse_apple_reset_at);
+    let observed_at = lane
+        .updated_at
+        .as_ref()
+        .and_then(parse_apple_reset_at)
+        .or(provider_observed_at);
     let (wk, label) = classify_lane(kind, minutes);
-    Some(UsageWindow::from_percent(
-        wk,
-        label,
-        used,
-        reset,
-        if minutes > 0 {
-            Some(minutes.saturating_mul(60))
-        } else {
-            None
-        },
-    ))
+    let duration = (minutes > 0).then(|| minutes.saturating_mul(60));
+    Some(match lane.used_percent {
+        Some(used) if used.is_finite() && used >= 0.0 => UsageWindow::from_percent_at(
+            wk,
+            label,
+            used,
+            reset,
+            duration,
+            observed_at,
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+        _ => UsageWindow::unreadable(
+            wk,
+            label,
+            reset,
+            duration,
+            observed_at,
+            DEFAULT_READING_MAX_AGE_SECS,
+        ),
+    })
 }
 
 fn credits_from_blocks(
@@ -264,16 +297,26 @@ fn body_to_provider(
     credits: Option<&CreditsBlock>,
     source_label: Option<&str>,
 ) -> ProviderSnapshot {
+    let document_observed_at = body.updated_at.as_ref().and_then(parse_apple_reset_at);
     let mut windows = Vec::new();
-    if let Some(w) = lane_to_window("primary", body.primary.as_ref()) {
+    if let Some(w) = lane_to_window("primary", body.primary.as_ref(), document_observed_at) {
         windows.push(w);
     }
-    if let Some(w) = lane_to_window("secondary", body.secondary.as_ref()) {
+    if let Some(w) = lane_to_window("secondary", body.secondary.as_ref(), document_observed_at) {
         windows.push(w);
     }
-    if let Some(w) = lane_to_window("tertiary", body.tertiary.as_ref()) {
+    if let Some(w) = lane_to_window("tertiary", body.tertiary.as_ref(), document_observed_at) {
         windows.push(w);
     }
+
+    // Without a document time the provider is only as fresh as its stalest lane.
+    let observed_at = document_observed_at.or_else(|| {
+        windows
+            .iter()
+            .map(|window| window.observed_at)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|times| times.into_iter().min())
+    });
 
     let credits = credits_from_blocks(credits, body.provider_cost.as_ref(), body.credits_remaining);
     let provider = body
@@ -292,17 +335,17 @@ fn body_to_provider(
         return snap;
     }
 
-    ProviderSnapshot {
+    ProviderSnapshot::observed(ProviderObservation {
         provider,
-        status: Availability::Ok,
         source: Some(source_from_label(source_label)),
         windows,
         credits,
         plan: body.login_method.clone(),
-        error: None,
-        // `data_confidence` is not a filesystem path.
         credential_path: None,
-    }
+        observed_at,
+        max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+        permission: ProviderPermission::Unknown,
+    })
 }
 
 /// Parse `codex-account-snapshots.redacted.json` (versioned `records` envelope).
@@ -314,11 +357,14 @@ pub fn parse_account_snapshots(bytes: &[u8]) -> Result<Vec<ProviderSnapshot>, Co
         let Some(body) = rec.snapshot.as_ref() else {
             continue;
         };
-        out.push(body_to_provider(
-            body,
-            rec.credits.as_ref(),
-            rec.source_label.as_deref(),
-        ));
+        let mut snap = body_to_provider(body, rec.credits.as_ref(), rec.source_label.as_deref());
+        snap.account_digest = rec
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.workspace_account_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+            .map(crate::creds::account_digest);
+        out.push(snap);
     }
     Ok(out)
 }
@@ -449,6 +495,13 @@ const MAX_HISTORY_ROWS: usize = 4096;
 
 /// First readable snapshot in a CodexBar support dir. Skips `cursor-session.json`.
 pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)> {
+    let (snaps, path) = load_account_snapshots_from_dir(dir)?;
+    snaps.into_iter().next().map(|snap| (snap, path))
+}
+
+/// Every account snapshot in the first readable CodexBar snapshot file, one
+/// per account record, each tagged with its `account_digest` when known.
+pub fn load_account_snapshots_from_dir(dir: &Path) -> Option<(Vec<ProviderSnapshot>, PathBuf)> {
     for path in quota_core::codexbar_snapshot_candidates(dir) {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if name == "cursor-session.json" {
@@ -458,13 +511,13 @@ pub fn load_snapshot_from_dir(dir: &Path) -> Option<(ProviderSnapshot, PathBuf)>
             continue;
         };
         if let Ok(snaps) = parse_account_snapshots(&bytes) {
-            if let Some(snap) = snaps.into_iter().next() {
-                return Some((snap, path));
+            if !snaps.is_empty() {
+                return Some((snaps, path));
             }
         }
         if let Ok(snap) = parse_expect_snapshot(&bytes) {
-            if snap.status == Availability::Ok {
-                return Some((snap, path));
+            if snap.status != Availability::Unavailable {
+                return Some((vec![snap], path));
             }
         }
     }
@@ -496,9 +549,25 @@ mod tests {
     use quota_core::math::{can_start, pace_for};
     use quota_core::types::CanStartBasis;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn fixtures() -> std::path::PathBuf {
         workspace_fixtures_dir()
+    }
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        for _ in 0..1_000 {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("{prefix}-{}-{serial}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test directory {}: {error}", dir.display()),
+            }
+        }
+        panic!("could not allocate unique test directory for {prefix}");
     }
 
     #[test]
@@ -506,7 +575,9 @@ mod tests {
         let bytes = fs::read(fixtures().join("CURRENT-SNAPSHOT.expect.json")).unwrap();
         let snap = parse_expect_snapshot(&bytes).unwrap();
         assert_eq!(snap.provider, ProviderId::Codex);
-        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(snap.status, Availability::Stale);
+        assert_eq!(snap.freshness, quota_core::types::Freshness::Stale);
+        assert_eq!(snap.observed_at, Some(1_790_457_979));
         assert_eq!(snap.plan.as_deref(), Some("pro"));
         assert_eq!(snap.windows.len(), 1);
         let w = &snap.windows[0];
@@ -514,7 +585,8 @@ mod tests {
         assert_eq!(w.used_percent, Some(59.0));
         assert_eq!(w.remaining_percent, Some(41.0));
         assert_eq!(w.limit_window_seconds, Some(10_080 * 60));
-        assert_eq!(w.reset_at, Some(812_739_489));
+        assert_eq!(w.reset_at, Some(1_791_046_689));
+        assert_eq!(w.observed_at, snap.observed_at);
         assert!(snap.windows.iter().all(|x| x.kind != WindowKind::Session));
         assert!(w.remaining.is_none());
         assert_eq!(w.unit.as_deref(), Some("percent"));
@@ -532,6 +604,8 @@ mod tests {
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(snap.windows[0].kind, WindowKind::Weekly);
         assert_eq!(snap.source, Some(Source::Oauth));
+        assert_eq!(snap.status, Availability::Stale);
+        assert_eq!(snap.observed_at, Some(1_790_457_979));
         let credits = snap.credits.as_ref().unwrap();
         assert_eq!(credits.has_credits, Some(false));
         assert_eq!(credits.balance, Some(0.0));
@@ -570,15 +644,15 @@ mod tests {
     }
 
     #[test]
-    fn replay_pace_and_can_start_percent_only() {
+    fn stale_history_is_not_presented_as_current_capacity() {
         let rows = load_history_jsonl(&fixtures().join("usage-history.redacted.jsonl")).unwrap();
         let history = history_to_snapshots(&rows);
         let latest_prov = history.last().unwrap().by_id(ProviderId::Codex).unwrap();
+        assert_eq!(latest_prov.status, Availability::Stale);
         let report = pace_for(&history, latest_prov);
-        assert_eq!(report.window_kind, Some(WindowKind::Weekly));
-        assert_eq!(report.used_percent, Some(59.0));
-        assert!(report.samples >= 2);
-        assert!(report.burn_percent_per_hour.is_some());
+        assert!(report.window_kind.is_none());
+        assert!(report.burn_percent_per_hour.is_none());
+        assert!(report.explanation.contains("stale"));
 
         let now = latest_prov
             .windows
@@ -588,18 +662,17 @@ mod tests {
             - 86_400;
         let answer = can_start(latest_prov, &history, 50_000, None, now);
         assert!(!answer.ok);
-        assert_eq!(answer.basis, CanStartBasis::PercentOnly);
-        assert!(
-            answer.explanation.contains("Cannot map") || answer.explanation.contains("percent")
-        );
+        assert_eq!(answer.basis, CanStartBasis::Unavailable);
+        assert!(answer.explanation.contains("stale"));
 
         let exhausted_row = rows.iter().rev().find(|r| r.used_percent >= 100.0).unwrap();
         let exhausted = exhausted_row.to_snapshot();
         let p = exhausted.by_id(ProviderId::Codex).unwrap();
+        assert_eq!(p.status, Availability::Stale);
+        assert_eq!(p.exhausted_windows, ["weekly"]);
         let no = can_start(p, &[], 1, None, 1);
         assert!(!no.ok);
-        assert_eq!(no.basis, CanStartBasis::PercentOnly);
-        assert!(no.explanation.contains("exhausted"));
+        assert_eq!(no.basis, CanStartBasis::Unavailable);
     }
 
     #[test]
@@ -613,9 +686,46 @@ mod tests {
         let back_p = back_hist.last().unwrap().by_id(ProviderId::Codex).unwrap();
         let live_rep = pace_for(&live_hist, live_p);
         let back_rep = pace_for(&back_hist, back_p);
+        assert_eq!(live_rep.samples, 0);
+        assert_eq!(back_rep.samples, 0);
+        assert!(live_rep.burn_percent_per_hour.is_none());
+        assert_eq!(live_p.status, Availability::Stale);
+    }
+
+    #[test]
+    fn fresh_clock_live_and_backfill_keep_differentiated_burn() {
+        let rows = load_history_jsonl(&fixtures().join("usage-history.redacted.jsonl")).unwrap();
+        let mut live: Vec<_> = rows.iter().filter(|r| r.is_live()).cloned().collect();
+        let mut backfill: Vec<_> = rows.iter().filter(|r| r.is_backfill()).cloned().collect();
+        rebase_sample_times(&mut live);
+        rebase_sample_times(&mut backfill);
+
+        let live_hist = history_to_snapshots(&live);
+        let back_hist = history_to_snapshots(&backfill);
+        let live_p = live_hist.last().unwrap().by_id(ProviderId::Codex).unwrap();
+        let back_p = back_hist.last().unwrap().by_id(ProviderId::Codex).unwrap();
+        let live_rep = pace_for(&live_hist, live_p);
+        let back_rep = pace_for(&back_hist, back_p);
+
+        assert_eq!(live_p.status, Availability::Ok);
+        assert_eq!(back_p.status, Availability::Ok);
         assert_eq!(live_rep.samples, live.len() as u32);
         assert_eq!(back_rep.samples, backfill.len() as u32);
-        assert!(live_rep.burn_percent_per_hour.is_some());
+        let live_burn = live_rep.burn_percent_per_hour.unwrap();
+        let backfill_burn = back_rep.burn_percent_per_hour.unwrap();
+        assert!(live_burn > 0.0);
+        assert!(backfill_burn > 0.0);
+        assert_ne!(live_burn, backfill_burn);
+    }
+
+    fn rebase_sample_times(rows: &mut [HistoryRow]) {
+        let latest = rows.last().and_then(HistoryRow::fetched_at).unwrap();
+        let now = quota_core::timeutil::now_unix();
+        for row in rows {
+            let original = row.fetched_at().unwrap();
+            let age = latest.saturating_sub(original);
+            row.sampled_at = quota_core::timeutil::format_rfc3339(now.saturating_sub(age));
+        }
     }
 
     #[test]
@@ -630,15 +740,53 @@ mod tests {
     }
 
     #[test]
-    fn null_lane_object_is_skipped() {
-        assert!(lane_to_window("primary", None).is_none());
+    fn missing_lane_is_skipped_and_unreadable_lane_is_preserved() {
+        assert!(lane_to_window("primary", None, None).is_none());
         let empty = Lane {
             reset_description: None,
             resets_at: None,
             used_percent: None,
             window_minutes: Some(100),
+            updated_at: None,
         };
-        assert!(lane_to_window("primary", Some(&empty)).is_none());
+        let window = lane_to_window("primary", Some(&empty), None).unwrap();
+        assert_eq!(window.state, quota_core::types::WindowState::Unknown);
+        assert!(window.reading.is_none());
+    }
+
+    #[test]
+    fn lane_time_makes_the_provider_current_when_the_document_has_none() {
+        let now = quota_core::timeutil::now_unix();
+        let doc = format!(
+            r#"{{"provider":"codex","primary":{{"usedPercent":10,"windowMinutes":10080,"updatedAt":"{}"}}}}"#,
+            quota_core::timeutil::format_rfc3339(now - 5)
+        );
+        let snap = parse_expect_snapshot(doc.as_bytes()).unwrap();
+        assert_eq!(snap.observed_at, Some(now - 5));
+        assert_eq!(snap.freshness, quota_core::types::Freshness::Current);
+        assert_eq!(snap.status, Availability::Ok);
+    }
+
+    #[test]
+    fn a_lane_without_any_time_keeps_the_provider_stale() {
+        let now = quota_core::timeutil::now_unix();
+        let doc = format!(
+            r#"{{"provider":"codex","primary":{{"usedPercent":10,"windowMinutes":10080,"updatedAt":"{}"}},"secondary":{{"usedPercent":5,"windowMinutes":300}}}}"#,
+            quota_core::timeutil::format_rfc3339(now - 5)
+        );
+        let snap = parse_expect_snapshot(doc.as_bytes()).unwrap();
+        assert_eq!(snap.observed_at, None);
+        assert_ne!(snap.status, Availability::Ok);
+    }
+
+    #[test]
+    fn numeric_string_history_reset_is_unix_seconds() {
+        let row: HistoryRow = serde_json::from_str(
+            r#"{"accountKey":"a","provider":"codex","resetsAt":"1790000000","sampledAt":"1789990000","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#,
+        )
+        .unwrap();
+        assert_eq!(row.reset_at(), Some(1_790_000_000));
+        assert_eq!(row.fetched_at(), Some(1_789_990_000));
     }
 
     #[test]
@@ -648,8 +796,9 @@ mod tests {
             resets_at: None,
             used_percent: Some(59.0),
             window_minutes: Some(10_080),
+            updated_at: None,
         };
-        let w = lane_to_window("primary", Some(&lane)).unwrap();
+        let w = lane_to_window("primary", Some(&lane), None).unwrap();
         assert_eq!(w.kind, WindowKind::Weekly);
         assert_eq!(w.label, "weekly");
     }
@@ -679,12 +828,7 @@ mod tests {
 
     #[test]
     fn ignores_cursor_session_json() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-codexbar-skip-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-codexbar-skip");
         fs::write(
             dir.join("cursor-session.json"),
             r#"{"WorkosCursorSessionToken":"eyJhbGciOi.not-a-real-token"}"#,
@@ -696,12 +840,7 @@ mod tests {
 
     #[test]
     fn empty_or_malformed_history_falls_through() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("quota-jsonl-fallback-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("quota-jsonl-fallback");
         fs::write(dir.join("usage-history.jsonl"), "{not json}\n").unwrap();
         let good = r#"{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#;
         fs::write(
@@ -716,11 +855,8 @@ mod tests {
 
     #[test]
     fn truncated_last_jsonl_line_is_skipped() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("quota-jsonl-trunc-{stamp}.jsonl"));
+        let dir = unique_test_dir("quota-jsonl-trunc");
+        let path = dir.join("history.jsonl");
         let good = r#"{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":10.0,"windowKind":"secondary","windowMinutes":10080}"#;
         fs::write(&path, format!("{good}\n{{\"accountKey\":\"partial")).unwrap();
         let rows = load_history_jsonl(&path).unwrap();
@@ -731,16 +867,13 @@ mod tests {
         let tail_one = load_history_jsonl_tail(&path, 1).unwrap();
         assert_eq!(tail_one.len(), 1);
         assert_eq!(tail_one[0].used_percent, 10.0);
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn partial_tail_does_not_evict_valid_row() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("quota-jsonl-cap-{stamp}.jsonl"));
+        let dir = unique_test_dir("quota-jsonl-cap");
+        let path = dir.join("history.jsonl");
         let row = |pct: f64| {
             format!(
                 r#"{{"accountKey":"a","provider":"codex","resetsAt":"2026-10-03T17:00:00Z","sampledAt":"2026-09-27T12:00:00Z","source":"live","usedPercent":{pct},"windowKind":"secondary","windowMinutes":10080}}"#
@@ -756,7 +889,7 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].used_percent, 2.0);
         assert_eq!(tail[1].used_percent, 3.0);
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

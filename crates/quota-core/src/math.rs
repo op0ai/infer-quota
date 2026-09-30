@@ -3,9 +3,11 @@
 //! Inputs are whatever the adapters actually observed. If a source only
 //! publishes `used_percent`, we refuse to invent a token budget.
 
+use std::collections::HashSet;
+
 use crate::types::{
-    Availability, CanStartAnswer, CanStartBasis, PaceReport, ProviderId, ProviderSnapshot,
-    Snapshot, UsageWindow, WindowKind,
+    Availability, CanStartAnswer, CanStartBasis, Freshness, PaceReport, ProviderId,
+    ProviderSnapshot, Snapshot, UsageWindow, WindowKind, WindowState,
 };
 
 /// Drop samples that look like a window reset (used_percent fell by more than
@@ -52,37 +54,97 @@ pub fn eta_empty_secs(remaining_percent: f64, burn_per_sec: f64) -> Option<f64> 
     Some(remaining_percent / burn_per_sec)
 }
 
-fn binding_window(snap: &ProviderSnapshot) -> Option<&UsageWindow> {
-    // Tightest remaining percent among known windows; prefer session/5h over weekly.
-    let preferred = [
-        WindowKind::Session,
-        WindowKind::FiveHour,
-        WindowKind::Weekly,
-        WindowKind::Monthly,
-        WindowKind::Extra,
-    ];
-    for kind in preferred {
-        if let Some(w) = snap.windows.iter().find(|w| w.kind == kind) {
-            return Some(w);
-        }
+fn kind_rank(kind: &WindowKind) -> u8 {
+    match kind {
+        WindowKind::Session => 0,
+        WindowKind::FiveHour => 1,
+        WindowKind::Weekly => 2,
+        WindowKind::Monthly => 3,
+        WindowKind::Extra => 4,
     }
-    snap.windows.first()
 }
 
-fn samples_for<'a, I>(history: I, provider: ProviderId, kind: &WindowKind) -> Vec<(i64, f64)>
+fn remaining_share(window: &UsageWindow) -> Option<f64> {
+    window
+        .remaining_percent
+        .or_else(|| match (window.remaining, window.limit) {
+            (Some(remaining), Some(limit)) if limit > 0.0 => Some(remaining / limit * 100.0),
+            _ => None,
+        })
+}
+
+/// The readable window with the least capacity left. Kind order only breaks ties.
+fn binding_window(snap: &ProviderSnapshot) -> Option<&UsageWindow> {
+    let share = |w: &UsageWindow| remaining_share(w).unwrap_or(f64::INFINITY);
+    snap.windows
+        .iter()
+        .filter(|w| w.state != WindowState::Unknown)
+        .min_by(|a, b| {
+            share(a)
+                .total_cmp(&share(b))
+                .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
+        })
+}
+
+fn availability_message(snapshot: &ProviderSnapshot) -> String {
+    if snapshot.status == Availability::Stale {
+        return "provider observation is stale".to_string();
+    }
+    snapshot
+        .error
+        .as_ref()
+        .map(|e| e.message.clone())
+        .unwrap_or_else(|| "provider unavailable".to_string())
+}
+
+fn unavailable_answer(provider: ProviderId, explanation: String) -> CanStartAnswer {
+    CanStartAnswer {
+        provider,
+        ok: false,
+        basis: CanStartBasis::Unavailable,
+        explanation,
+        window_kind: None,
+        remaining_percent: None,
+        remaining_tokens: None,
+        reset_at: None,
+        eta_empty_secs: None,
+        burn_percent_per_hour: None,
+    }
+}
+
+/// Samples of `kind` from readings of the same provider account as `latest`.
+/// Another account's readings never feed this account's pace; a reading whose
+/// account is unknown matches only a latest reading whose account is unknown.
+/// `history` must hold only readings of the active quota account: an unknown
+/// provider account cannot tell two quota accounts apart.
+fn samples_for<'a, I>(history: I, latest: &ProviderSnapshot, kind: &WindowKind) -> Vec<(i64, f64)>
 where
     I: IntoIterator<Item = &'a Snapshot>,
 {
+    // A Snapshot can be appended when a different provider refreshes. Pace
+    // samples belong to the source observation, so use its evidence timestamp
+    // and count an unchanged timestamp/value pair only once. Different values
+    // observed in the same second remain visible, though they cannot imply a
+    // burn rate until time elapses.
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for snap in history {
-        if let Some(p) = snap.by_id(provider) {
+        if let Some(p) = snap
+            .by_id(latest.provider)
+            .filter(|p| p.account_digest == latest.account_digest)
+        {
             if let Some(w) = p.window(kind) {
-                if let Some(used) = w.used_percent {
-                    out.push((snap.fetched_at, used));
+                if let (Some(observed_at), Some(used)) =
+                    (w.observed_at.or(p.observed_at), w.used_percent)
+                {
+                    if seen.insert((observed_at, used.to_bits())) {
+                        out.push((observed_at, used));
+                    }
                 }
             }
         }
     }
+    out.sort_by_key(|sample| sample.0);
     out
 }
 
@@ -91,11 +153,7 @@ where
     I: IntoIterator<Item = &'a Snapshot>,
 {
     if latest.status != Availability::Ok {
-        let msg = latest
-            .error
-            .as_ref()
-            .map(|e| e.message.clone())
-            .unwrap_or_else(|| "provider unavailable".to_string());
+        let msg = availability_message(latest);
         return PaceReport {
             provider: latest.provider,
             window_kind: None,
@@ -118,10 +176,10 @@ where
             eta_empty_secs: None,
             reset_at: None,
             samples: 0,
-            explanation: "no usage windows in last snapshot".to_string(),
+            explanation: "no readable usage windows in last snapshot".to_string(),
         };
     };
-    let samples = samples_for(history, latest.provider, &window.kind);
+    let samples = samples_for(history, latest, &window.kind);
     let burn = burn_percent_per_sec(&samples);
     let burn_hour = burn.map(|b| b * 3600.0);
     let rem = window.remaining_percent.unwrap_or(0.0);
@@ -177,17 +235,15 @@ pub fn can_start<'a, I>(
 where
     I: IntoIterator<Item = &'a Snapshot>,
 {
-    if latest.status != Availability::Ok {
-        let msg = latest
-            .error
-            .as_ref()
-            .map(|e| e.message.clone())
-            .unwrap_or_else(|| "provider unavailable".to_string());
+    if latest.is_for_another_account() {
         return CanStartAnswer {
             provider: latest.provider,
             ok: false,
-            basis: CanStartBasis::Unavailable,
-            explanation: msg,
+            basis: CanStartBasis::AccountChanged,
+            explanation: format!(
+                "{} account changed since reading; its quota is unknown until a refresh",
+                latest.provider
+            ),
             window_kind: None,
             remaining_percent: None,
             remaining_tokens: None,
@@ -196,12 +252,48 @@ where
             burn_percent_per_hour: None,
         };
     }
+    if latest.status == Availability::Stale || latest.freshness == Freshness::Stale {
+        return unavailable_answer(latest.provider, availability_message(latest));
+    }
+    if latest.permission == crate::types::ProviderPermission::LimitReached {
+        return unavailable_answer(
+            latest.provider,
+            "provider permission is limit_reached".to_string(),
+        );
+    }
+    let unknown: Vec<&UsageWindow> = latest
+        .windows
+        .iter()
+        .filter(|w| w.state == WindowState::Unknown)
+        .collect();
+    if let Some(first) = unknown.first() {
+        let labels: Vec<&str> = unknown.iter().map(|w| w.label.as_str()).collect();
+        return CanStartAnswer {
+            provider: latest.provider,
+            ok: false,
+            basis: CanStartBasis::UnknownWindow,
+            explanation: format!(
+                "{} {} has no readable measurement and may be exhausted",
+                latest.provider,
+                labels.join(", ")
+            ),
+            window_kind: Some(first.kind.clone()),
+            remaining_percent: None,
+            remaining_tokens: None,
+            reset_at: first.reset_at,
+            eta_empty_secs: None,
+            burn_percent_per_hour: None,
+        };
+    }
+    if latest.status != Availability::Ok {
+        return unavailable_answer(latest.provider, availability_message(latest));
+    }
     let Some(window) = binding_window(latest) else {
         return CanStartAnswer {
             provider: latest.provider,
             ok: false,
             basis: CanStartBasis::Unavailable,
-            explanation: "no usage windows published".to_string(),
+            explanation: "no readable usage windows published".to_string(),
             window_kind: None,
             remaining_percent: None,
             remaining_tokens: None,
@@ -211,7 +303,7 @@ where
         };
     };
 
-    let samples = samples_for(history, latest.provider, &window.kind);
+    let samples = samples_for(history, latest, &window.kind);
     let burn = burn_percent_per_sec(&samples);
     let burn_hour = burn.map(|b| b * 3600.0);
     let rem_pct = window.remaining_percent;
@@ -354,23 +446,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AdapterError, Credits};
+    use crate::types::{AdapterError, Credits, ProviderId, ProviderObservation};
 
-    fn pct_window(used: f64, reset: Option<i64>) -> UsageWindow {
-        UsageWindow::from_percent(WindowKind::Session, "5h", used, reset, Some(18_000))
+    fn provider_at(provider: ProviderId, used: f64, observed_at: i64) -> ProviderSnapshot {
+        ProviderSnapshot::observed(ProviderObservation {
+            provider,
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![UsageWindow::from_percent_at(
+                WindowKind::Session,
+                "5h",
+                used,
+                Some(observed_at.saturating_add(100_000)),
+                Some(18_000),
+                Some(observed_at),
+                crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            )],
+            credits: None,
+            plan: Some("plus".into()),
+            credential_path: None,
+            observed_at: Some(observed_at),
+            max_age_secs: crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            permission: crate::types::ProviderPermission::Unknown,
+        })
     }
 
     fn ok_provider(used: f64) -> ProviderSnapshot {
-        ProviderSnapshot {
-            provider: ProviderId::Codex,
-            status: Availability::Ok,
-            source: Some(crate::types::Source::Oauth),
-            windows: vec![pct_window(used, Some(2_000))],
-            credits: None,
-            plan: Some("plus".into()),
-            error: None,
-            credential_path: None,
-        }
+        provider_at(ProviderId::Codex, used, crate::timeutil::now_unix())
     }
 
     #[test]
@@ -446,6 +547,82 @@ mod tests {
     }
 
     #[test]
+    fn provider_refusal_is_not_cleared_by_low_usage_percent() {
+        let mut p = ok_provider(1.0);
+        p.permission = crate::types::ProviderPermission::LimitReached;
+        let answer = can_start(&p, &[], 0, None, crate::timeutil::now_unix());
+        assert!(!answer.ok);
+        assert_eq!(answer.basis, CanStartBasis::Unavailable);
+        assert!(answer.explanation.contains("limit_reached"));
+    }
+
+    #[test]
+    fn unavailable_empty_response_preserves_provider_refusal_for_can_start() {
+        let mut p = ProviderSnapshot::unavailable(
+            ProviderId::Codex,
+            AdapterError::new("empty", "usage response had no windows"),
+        );
+        p.permission = crate::types::ProviderPermission::LimitReached;
+
+        let answer = can_start(&p, &[], 0, None, crate::timeutil::now_unix());
+
+        assert!(!answer.ok);
+        assert_eq!(answer.basis, CanStartBasis::Unavailable);
+        assert_eq!(answer.explanation, "provider permission is limit_reached");
+    }
+
+    #[test]
+    fn unknown_windows_remain_null_and_every_exhausted_window_is_named() {
+        let now = crate::timeutil::now_unix();
+        let windows = vec![
+            UsageWindow::from_percent_at(
+                WindowKind::Session,
+                "5h",
+                100.0,
+                None,
+                Some(18_000),
+                Some(now),
+                300,
+            ),
+            UsageWindow::from_percent_at(
+                WindowKind::Weekly,
+                "weekly",
+                100.0,
+                None,
+                Some(604_800),
+                Some(now),
+                300,
+            ),
+            UsageWindow::unreadable(WindowKind::Monthly, "monthly", None, None, Some(now), 300),
+        ];
+        let snapshot = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(crate::types::Source::Oauth),
+            windows,
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 300,
+            permission: crate::types::ProviderPermission::Unknown,
+        });
+        assert_eq!(snapshot.exhausted_windows, ["5h", "weekly"]);
+        assert_eq!(
+            snapshot.windows[2].state,
+            crate::types::WindowState::Unknown
+        );
+        assert!(snapshot.windows[2].reading.is_none());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["windows"][2]["reading"].is_null());
+        assert!(json["windows"][0]["observed_at"].is_number());
+        assert_eq!(json["windows"][0]["max_age_secs"], 300);
+        assert_eq!(
+            json["exhausted_windows"],
+            serde_json::json!(["5h", "weekly"])
+        );
+    }
+
+    #[test]
     fn pace_needs_samples() {
         let p = ok_provider(25.0);
         let snap = Snapshot::new(1_000, vec![p.clone()]);
@@ -456,16 +633,38 @@ mod tests {
 
     #[test]
     fn pace_computes_burn() {
-        let p1 = ok_provider(10.0);
-        let p2 = ok_provider(20.0);
+        let now = crate::timeutil::now_unix();
+        let p1 = provider_at(ProviderId::Codex, 10.0, now - 3_600);
+        let p2 = provider_at(ProviderId::Codex, 20.0, now);
         let h = vec![
-            Snapshot::new(1_000, vec![p1]),
-            Snapshot::new(1_000 + 3600, vec![p2.clone()]),
+            Snapshot::new(now - 3_600, vec![p1]),
+            Snapshot::new(now, vec![p2.clone()]),
         ];
         let report = pace_for(&h, &p2);
         assert_eq!(report.samples, 2);
         let burn = report.burn_percent_per_hour.unwrap();
         assert!((burn - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn other_provider_refresh_does_not_duplicate_pace_sample() {
+        let now = crate::timeutil::now_unix();
+        let codex_first = provider_at(ProviderId::Codex, 10.0, now - 100);
+        let claude_first = provider_at(ProviderId::Claude, 20.0, now - 100);
+        let codex_second = provider_at(ProviderId::Codex, 15.0, now - 50);
+        let claude_second = provider_at(ProviderId::Claude, 30.0, now);
+        let history = vec![
+            Snapshot::new(now - 100, vec![codex_first, claude_first.clone()]),
+            Snapshot::new(now - 50, vec![codex_second.clone(), claude_first]),
+            // Claude refreshes and causes a new daemon Snapshot. Codex's
+            // unchanged provider evidence must not become another sample.
+            Snapshot::new(now, vec![codex_second.clone(), claude_second]),
+        ];
+
+        let report = pace_for(&history, &codex_second);
+
+        assert_eq!(report.samples, 2);
+        assert!((report.burn_percent_per_hour.unwrap() - 360.0).abs() < 1e-6);
     }
 
     #[test]
@@ -492,13 +691,14 @@ mod tests {
 
     #[test]
     fn can_start_percent_only_notes_burn_before_deadline() {
-        let p1 = ok_provider(10.0);
-        let p2 = ok_provider(90.0);
+        let now = crate::timeutil::now_unix();
+        let p1 = provider_at(ProviderId::Codex, 10.0, now - 100);
+        let p2 = provider_at(ProviderId::Codex, 90.0, now);
         let history = vec![
-            Snapshot::new(1_000, vec![p1]),
-            Snapshot::new(1_100, vec![p2.clone()]),
+            Snapshot::new(now - 100, vec![p1]),
+            Snapshot::new(now, vec![p2.clone()]),
         ];
-        let a = can_start(&p2, &history, 50_000, Some(10_000), 1_100);
+        let a = can_start(&p2, &history, 50_000, Some(now + 8_900), now);
         assert!(!a.ok);
         assert_eq!(a.basis, CanStartBasis::PercentOnly);
         assert!(a.explanation.contains("Current burn would empty"));
@@ -511,7 +711,7 @@ mod tests {
         let a = can_start(&p, &[], 1, None, 1);
         assert!(!a.ok);
         assert_eq!(a.basis, CanStartBasis::Unavailable);
-        assert!(a.explanation.contains("no usage windows"));
+        assert!(a.explanation.contains("no readable usage windows"));
     }
 
     #[test]
@@ -529,6 +729,62 @@ mod tests {
     }
 
     #[test]
+    fn greptile_2_unreadable_short_window_blocks_zero_token_start() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Codex, 10.0, now);
+        p.windows[0] = UsageWindow::unreadable(
+            WindowKind::Session,
+            "5h",
+            Some(now + 3_600),
+            Some(18_000),
+            Some(now),
+            crate::types::DEFAULT_READING_MAX_AGE_SECS,
+        );
+        p.windows.push(UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            10.0,
+            None,
+            Some(604_800),
+            Some(now),
+            crate::types::DEFAULT_READING_MAX_AGE_SECS,
+        ));
+        p.refresh_freshness(now);
+        assert_eq!(p.status, Availability::Ok);
+
+        let a = can_start(&p, &[], 0, None, now);
+
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::UnknownWindow);
+        assert_eq!(a.window_kind, Some(WindowKind::Session));
+        assert!(a.explanation.contains("5h"), "{}", a.explanation);
+    }
+
+    #[test]
+    fn greptile_2_tightest_readable_window_binds_not_kind_order() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Codex, 20.0, now);
+        p.windows.push(UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            100.0,
+            None,
+            Some(604_800),
+            Some(now),
+            crate::types::DEFAULT_READING_MAX_AGE_SECS,
+        ));
+        p.refresh_freshness(now);
+
+        let a = can_start(&p, &[], 0, None, now);
+
+        assert!(!a.ok);
+        assert_eq!(a.window_kind, Some(WindowKind::Weekly));
+        assert!(a.explanation.contains("exhausted"), "{}", a.explanation);
+        let pace = pace_for(&[Snapshot::new(now, vec![p.clone()])], &p);
+        assert_eq!(pace.window_kind, Some(WindowKind::Weekly));
+    }
+
+    #[test]
     fn can_start_credits_unit_is_token_budget() {
         let mut p = ok_provider(20.0);
         p.windows[0].remaining = Some(12.0);
@@ -541,5 +797,188 @@ mod tests {
         assert_eq!(a.basis, CanStartBasis::TokenBudget);
         let b = can_start(&p, &[], 13, None, 1_000);
         assert!(!b.ok);
+    }
+
+    #[test]
+    fn review_r2_pace_history_spanning_two_account_digests_uses_only_the_active_account() {
+        let now = crate::timeutil::now_unix();
+        let reading = |digest: Option<&str>, used, observed_at| {
+            let mut p = provider_at(ProviderId::Codex, used, observed_at);
+            p.account_digest = digest.map(str::to_string);
+            p
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let b_first = reading(Some(&b), 65.0, now - 50);
+        let b_latest = reading(Some(&b), 70.0, now);
+        let unknown = reading(None, 20.0, now - 150);
+        let history: Vec<Snapshot> = [
+            reading(Some(&a), 10.0, now - 200),
+            unknown.clone(),
+            reading(Some(&a), 60.0, now - 100),
+            b_first,
+            b_latest.clone(),
+        ]
+        .into_iter()
+        .map(|p| Snapshot::new(p.observed_at.unwrap(), vec![p]))
+        .collect();
+
+        let pace = pace_for(&history, &b_latest);
+        assert_eq!(pace.samples, 2);
+        assert!((pace.burn_percent_per_hour.unwrap() - 360.0).abs() < 1e-6);
+        let answer = can_start(&b_latest, &history, 1, None, now);
+        assert_eq!(answer.burn_percent_per_hour, pace.burn_percent_per_hour);
+
+        assert_eq!(pace_for(&history, &unknown).samples, 1);
+    }
+
+    #[test]
+    fn round4_a_reading_for_another_account_refuses_admission_and_pace() {
+        let now = crate::timeutil::now_unix();
+        let mut reading = provider_at(ProviderId::Codex, 10.0, now);
+        reading.account_digest = Some("a".repeat(64));
+        let history = [Snapshot::new(now, vec![reading.clone()])];
+        assert!(can_start(&reading, &history, 0, None, now).ok);
+
+        let elsewhere = reading.for_another_account();
+        assert_eq!(elsewhere.account_digest, reading.account_digest);
+        for tokens in [0, 1_000] {
+            let answer = can_start(&elsewhere, &history, tokens, None, now);
+            assert!(!answer.ok);
+            assert_eq!(answer.basis, CanStartBasis::AccountChanged);
+            assert!(answer.explanation.contains("account changed since reading"));
+            assert_eq!(answer.remaining_percent, None);
+        }
+        let pace = pace_for(&history, &elsewhere);
+        assert_eq!(pace.samples, 0);
+        assert_eq!(pace.used_percent, None);
+        assert!(pace.explanation.contains("account changed since reading"));
+    }
+
+    #[test]
+    fn round6_an_all_unreadable_snapshot_answers_unknown_window_not_unavailable() {
+        let now = crate::timeutil::now_unix();
+        let unreadable = |kind, label| {
+            UsageWindow::unreadable(
+                kind,
+                label,
+                Some(now + 3_600),
+                None,
+                Some(now),
+                crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            )
+        };
+        let p = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![
+                unreadable(WindowKind::Session, "5h"),
+                unreadable(WindowKind::Weekly, "weekly"),
+            ],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            permission: crate::types::ProviderPermission::Unknown,
+        });
+        assert_eq!(p.status, Availability::Unavailable);
+
+        for tokens in [0, 1_000] {
+            let a = can_start(&p, &[], tokens, None, now);
+            assert!(!a.ok);
+            assert_eq!(a.basis, CanStartBasis::UnknownWindow);
+            assert_eq!(a.window_kind, Some(WindowKind::Session));
+            assert!(a.explanation.contains("5h, weekly"), "{}", a.explanation);
+        }
+    }
+
+    fn unreadable_window(now: i64, observed_at: i64) -> UsageWindow {
+        UsageWindow::unreadable(
+            WindowKind::Session,
+            "5h",
+            Some(now + 3_600),
+            None,
+            Some(observed_at),
+            crate::types::DEFAULT_READING_MAX_AGE_SECS,
+        )
+    }
+
+    fn observed_with(
+        window: UsageWindow,
+        observed_at: i64,
+        permission: crate::types::ProviderPermission,
+    ) -> ProviderSnapshot {
+        ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Codex,
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![window],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(observed_at),
+            max_age_secs: crate::types::DEFAULT_READING_MAX_AGE_SECS,
+            permission,
+        })
+    }
+
+    #[test]
+    fn greptile_7_a_stale_reading_with_an_unreadable_window_is_unavailable_not_a_veto() {
+        let now = crate::timeutil::now_unix();
+        let long_ago = now - 10 * crate::types::DEFAULT_READING_MAX_AGE_SECS as i64;
+        let mut mixed = provider_at(ProviderId::Codex, 10.0, long_ago);
+        mixed.windows[0] = unreadable_window(now, long_ago);
+        mixed.refresh_freshness(now);
+        assert_eq!(mixed.status, Availability::Stale);
+
+        let mut all_unreadable = observed_with(
+            unreadable_window(now, long_ago),
+            long_ago,
+            crate::types::ProviderPermission::Unknown,
+        );
+        all_unreadable.refresh_freshness(now);
+        assert_eq!(all_unreadable.status, Availability::Unavailable);
+        assert_eq!(all_unreadable.freshness, Freshness::Stale);
+
+        for stale in [&mixed, &all_unreadable] {
+            for tokens in [0, 1_000] {
+                let a = can_start(stale, &[], tokens, None, now);
+                assert!(!a.ok);
+                assert_eq!(a.basis, CanStartBasis::Unavailable, "{}", a.explanation);
+            }
+        }
+    }
+
+    #[test]
+    fn greptile_7_a_current_unreadable_window_still_answers_unknown_window() {
+        let now = crate::timeutil::now_unix();
+        let mixed = observed_with(
+            unreadable_window(now, now),
+            now,
+            crate::types::ProviderPermission::Allowed,
+        );
+        let a = can_start(&mixed, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::UnknownWindow);
+    }
+
+    #[test]
+    fn greptile_7_an_explicit_refusal_is_named_even_beside_an_unreadable_window() {
+        let now = crate::timeutil::now_unix();
+        let refused = observed_with(
+            unreadable_window(now, now),
+            now,
+            crate::types::ProviderPermission::LimitReached,
+        );
+        let a = can_start(&refused, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+        assert!(a.explanation.contains("limit_reached"), "{}", a.explanation);
+
+        let mut low_usage = provider_at(ProviderId::Codex, 1.0, now);
+        low_usage.permission = crate::types::ProviderPermission::LimitReached;
+        let a = can_start(&low_usage, &[], 0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+        assert!(a.explanation.contains("limit_reached"), "{}", a.explanation);
     }
 }

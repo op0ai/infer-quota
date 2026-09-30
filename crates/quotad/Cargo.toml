@@ -21,3 +21,5 @@ tokio.workspace = true
 [dev-dependencies]
 quota-core.workspace = true
 serde_json.workspace = true
+# Already present in Cargo.lock; TempDir isolates simultaneous hotpath processes.
+tempfile = "3.27.0"

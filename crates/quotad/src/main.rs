@@ -1,7 +1,8 @@
 //! `quotad` — foreground inference-quota daemon.
 //!
-//! Runtime: Tokio `current_thread` (no multi-worker pool). HTTP probes run in
-//! `spawn_blocking` so a slow provider cannot stall socket accept.
+//! Runtime: Tokio `current_thread` (no multi-worker pool). Synchronous HTTP
+//! probes run on detached threads so a slow provider cannot stall socket
+//! accept or hold runtime shutdown open.
 
 #![forbid(unsafe_code)]
 
@@ -39,9 +40,16 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut cfg = match cli.config {
-        Some(p) => Config::load_path(&p),
+    let cfg = match cli.config {
+        Some(p) => Config::load_explicit(&p),
         None => Config::load_default(),
+    };
+    let mut cfg = match cfg {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("quotad: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     if let Some(sock) = cli.socket {
         cfg.socket = Some(sock);

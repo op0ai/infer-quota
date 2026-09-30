@@ -88,16 +88,15 @@ impl From<ProviderArg> for ProviderFilter {
     }
 }
 
-fn socket_path(cli: &Cli) -> PathBuf {
-    if let Some(p) = &cli.socket {
-        return p.clone();
-    }
-    Config::load_default().socket_path()
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let sock = socket_path(&cli);
+    let sock = match Config::client_socket_path(cli.socket.as_deref()) {
+        Ok(sock) => sock,
+        Err(e) => {
+            eprintln!("quota: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&cli, &sock) {
         Ok(code) => code,
         Err(e) => {

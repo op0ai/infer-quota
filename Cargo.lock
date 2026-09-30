@@ -811,6 +811,7 @@ dependencies = [
  "clap",
  "quota-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -821,6 +822,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "webpki-roots",
 ]
@@ -881,6 +883,7 @@ dependencies = [
  "quota-core",
  "rustix",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

@@ -12,5 +12,7 @@ quota-core.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Account digests (sha256 of a provider account id). Already in Cargo.lock.
+sha2 = { version = "=0.10.9", default-features = false }
 thiserror.workspace = true
 webpki-roots.workspace = true

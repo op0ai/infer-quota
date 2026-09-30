@@ -20,7 +20,7 @@ pub mod types;
 pub mod windows;
 
 pub use accounts::{AccountBook, AccountRecord, SecretRef};
-pub use config::Config;
+pub use config::{Config, ConfigError};
 pub use framing::{decode_len, encode_frame, FrameError, MAX_FRAME_BYTES};
 pub use fsutil::{
     chmod_private_file, create_private_file, ensure_private_dir, open_private_append,
@@ -40,8 +40,9 @@ pub use protocol::{
     METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH, PROTOCOL_VERSION,
 };
 pub use types::{
-    AdapterError, Availability, CanStartAnswer, CanStartBasis, Credits, PaceReport, ProviderId,
-    ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind, PACKAGE_VERSION,
+    AdapterError, Availability, CanStartAnswer, CanStartBasis, Credits, Freshness, PaceReport,
+    ProviderId, ProviderPermission, ProviderSnapshot, Snapshot, Source, UsageWindow, WindowKind,
+    WindowReading, WindowState, DEFAULT_READING_MAX_AGE_SECS, PACKAGE_VERSION,
 };
 pub use windows::{
     classify_codex_window, FIVE_HOUR_MINUTES, FIVE_HOUR_SECS, WEEK_MINUTES, WEEK_SECS,

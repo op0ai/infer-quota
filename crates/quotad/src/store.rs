@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use quota_core::types::Snapshot;
+use quota_core::types::{ProviderId, Snapshot};
 use quota_core::Config;
 
 pub struct Store {
@@ -40,6 +40,14 @@ impl Store {
         self.ring.push_back(snap);
     }
 
+    /// Drop every in-memory reading of `provider`, so no later pace or
+    /// `can_start` answer samples it. The JSONL trail is left as written.
+    pub fn forget(&mut self, provider: ProviderId) {
+        for snap in &mut self.ring {
+            snap.providers.retain(|p| p.provider != provider);
+        }
+    }
+
     pub fn latest(&self) -> Option<&Snapshot> {
         self.ring.back()
     }
@@ -64,7 +72,7 @@ fn append_jsonl(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quota_core::types::{AdapterError, ProviderId, ProviderSnapshot};
+    use quota_core::types::{AdapterError, ProviderSnapshot};
 
     #[test]
     fn ring_drops_oldest() {
