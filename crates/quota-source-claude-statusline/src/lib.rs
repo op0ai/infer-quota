@@ -168,7 +168,7 @@ impl Statusline {
                         .to_string()
                 }
                 _ => match window.used_percent {
-                    Some(used) => format!("{name} {:.0}%", used.min(100.0)),
+                    Some(used) => format!("{name} {:.0}%", used),
                     None => format!("{name} ?"),
                 },
             };
@@ -324,11 +324,19 @@ mod tests {
     }
 
     #[test]
-    fn segment_drops_elapsed_resets_and_clamps_over_100() {
+    fn segment_drops_elapsed_resets_and_preserves_overage() {
         let parsed =
             parse(br#"{"rate_limits":{"five_hour":{"used_percentage":130.0,"resets_at":100}}}"#)
                 .unwrap();
-        assert_eq!(parsed.segment(NOW), "5h 100%");
+        assert_eq!(parsed.segment(NOW), "5h 130%");
+    }
+
+    #[test]
+    fn spend_percentage_above_one_hundred_is_not_hidden() {
+        let parsed =
+            parse(br#"{"rate_limits":{"spend_limit":{"used_percentage":135.0,"resets_at":100}}}"#)
+                .unwrap();
+        assert_eq!(parsed.segment(NOW), "spend 135%");
     }
 
     #[test]

@@ -29,6 +29,11 @@ Stale sockets (connect fails) are unlinked. Concurrent clients are capped
 (64). The socket is a **same-UID** trust boundary — there is no extra
 peer-credential handshake.
 
+The daemon starts accepting socket requests before the initial provider
+refresh finishes. Claude's first macOS Keychain read may wait for the OS
+approval prompt; that wait stays in the background refresh task and does not
+hold up socket startup or reads from other providers.
+
 ## Framing
 
 Length-prefixed JSON, little-endian:
@@ -167,6 +172,13 @@ A passive source pushes a reading instead of being polled. Today that is
   (`unsupported_schema`); the daemon never guesses at fields.
 - Only `source: "statusline"` for `provider: "claude"` may push
   (`unsupported_source`, `unsupported_provider`). 1-8 windows.
+- A statusline reading has no account identifier. It is accepted only when no
+  Claude quota account is explicitly selected; otherwise the daemon returns
+  `account_scope` and keeps the existing reading and poll schedule unchanged.
+- When a current Claude OAuth reading contains windows the statusline does not
+  report (including separate `opus weekly` and `sonnet weekly` limits), those
+  windows are retained in the pushed snapshot. Percent admission still checks
+  every retained readable window.
 - There is **no client timestamp**. The daemon stamps `observed_at` with its
   own clock at receipt, so the normal evidence-age rules apply and a client
   cannot backdate or future-date a reading.
@@ -192,6 +204,20 @@ Windows of kind `spend` (Cursor included usage and on-demand, Claude
 `spend_limit`) appear in `status` with `unit: "usd"` and `used_usd` whenever
 the source gave dollars, plus `limit_usd`, `limit` and `remaining` when it gave
 a positive cap. The same fields are on the window's `reading`.
+
+Each `CanStartAnswer` names its `basis`:
+
+| `basis` | Meaning |
+|---|---|
+| `token_budget` | The window publishes a token budget, and the answer uses it. |
+| `percent_only` | The window publishes only a percentage, so a token request cannot be mapped (`ok: false` unless exhausted). |
+| `unavailable` | The provider has no current reading. |
+| `unknown_window` | The provider reported a window whose measurement could not be read, so that limit may already be exhausted. Refuses. |
+| `account_changed` | The reading was taken for a provider account other than the one the credentials name now. It is checked at every use, not only at publication. Refuses. |
+
+When more than one basis applies, `can_start` answers with the first of `account_changed`, a stale reading (`unavailable`), the provider's own `limit_reached` refusal (`unavailable`, worded as a refusal), `unknown_window`, any other `unavailable`, then the headroom bases. A stale reading never answers `unknown_window`: it has no current reading, so an all-provider answer leaves it out like any other `unavailable` one. Every reading is attributed at use, an error reading included, unless it names no account and holds no quota evidence.
+
+The credentials' account is `named`, `unnamed` (credentials load but name no account; every Claude credential) or `absent` (none load): unless the reading and the credentials name the same account, the reading answers only while exactly one account is known across it, the credentials and the provider's other local sources such as CodexBar, and some credential or local source is present, so a reading whose credentials were removed with no other source refuses with `account_changed`.
 
 `watch` keeps the connection open. After the first snapshot, each daemon
 refresh sends another `Response` with the same `id`. A later `ping` on that

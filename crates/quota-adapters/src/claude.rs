@@ -23,8 +23,8 @@
 use std::path::Path;
 
 use quota_core::types::{
-    AdapterError, Credits, ProviderId, ProviderObservation, ProviderPermission, ProviderSnapshot,
-    Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
+    ActiveIdentity, AdapterError, Credits, ProviderId, ProviderObservation, ProviderPermission,
+    ProviderSnapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 
 use quota_secrets::claude_code::keychain_disabled;
@@ -36,6 +36,7 @@ use crate::provider::{ProbeCtx, Provider};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+const CLAUDE_KEYCHAIN_PATH: &str = "keychain:Claude Code-credentials";
 
 #[derive(Default)]
 pub struct ClaudeAdapter {
@@ -50,8 +51,8 @@ impl ClaudeAdapter {
     /// an explicit home, `CLAUDE_CONFIG_DIR`, other platforms, or
     /// `QUOTA_NO_KEYCHAIN=1` keep to the file.
     pub fn for_account(config_dir: Option<std::path::PathBuf>) -> Self {
-        let isolated = config_dir.is_some()
-            || std::env::var("CLAUDE_CONFIG_DIR").is_ok_and(|dir| !dir.trim().is_empty());
+        let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let isolated = Self::has_isolated_config(config_dir.as_deref(), env_config_dir.as_deref());
         let keychain: Option<Box<dyn SecretsBackend>> =
             if cfg!(target_os = "macos") && !isolated && !keychain_disabled() {
                 Some(Box::new(ClaudeCodeKeychain))
@@ -62,6 +63,13 @@ impl ClaudeAdapter {
             config_dir,
             keychain,
         }
+    }
+
+    /// Whether an explicit home or environment-selected Claude config is in
+    /// use. Kept pure with the environment value supplied by callers so push
+    /// acceptance can test isolation without mutating process environment.
+    pub fn has_isolated_config(config_dir: Option<&Path>, env_config_dir: Option<&str>) -> bool {
+        config_dir.is_some() || env_config_dir.is_some_and(|dir| !dir.trim().is_empty())
     }
 
     fn load_creds(&self) -> (Result<ClaudeCreds, CredsError>, Option<String>) {
@@ -83,6 +91,32 @@ impl ClaudeAdapter {
             }
         }
         (load_claude_creds(self.config_dir.as_deref()), keychain_note)
+    }
+}
+
+impl ClaudeAdapter {
+    /// Claude credentials carry no account id, so the account is `Unnamed`
+    /// while they load and `Absent` otherwise. This method stays file-only so
+    /// status and admission never trigger a Keychain approval prompt.
+    pub fn active_identity(&self) -> ActiveIdentity {
+        self.active_identity_for(None)
+    }
+
+    /// Check the local file, or accept the exact Keychain path from a current
+    /// OAuth reading. The latter is a receipt from the probe's successful
+    /// Keychain read; checking it again here could block an RPC on native UI.
+    pub fn active_identity_for(&self, verified_credential_path: Option<&str>) -> ActiveIdentity {
+        match load_claude_creds(self.config_dir.as_deref()) {
+            Ok(_) => ActiveIdentity::Unnamed,
+            Err(_)
+                if self.keychain.is_some()
+                    && !keychain_disabled()
+                    && verified_credential_path == Some(CLAUDE_KEYCHAIN_PATH) =>
+            {
+                ActiveIdentity::Unnamed
+            }
+            Err(_) => ActiveIdentity::Absent,
+        }
     }
 }
 
@@ -570,6 +604,34 @@ mod tests {
             Some("keychain:Claude Code-credentials")
         );
         assert!(!serde_json::to_string(&snap).unwrap().contains("kc-token"));
+    }
+
+    #[test]
+    fn keychain_only_probe_receipt_answers_without_a_second_keychain_read() {
+        let adapter = adapter_with(FakeKeychain::Found("keychain-only-fixture"));
+        let transport = MockTransport::ok_json(200, FIXTURE);
+        let ctx = crate::provider::ProbeCtx {
+            transport: &transport,
+            now: quota_core::timeutil::now_unix(),
+        };
+        let snapshot = adapter.probe(&ctx);
+        assert_eq!(snapshot.status, Availability::Ok);
+        assert_eq!(
+            snapshot.credential_path.as_deref(),
+            Some(CLAUDE_KEYCHAIN_PATH)
+        );
+
+        let active = adapter.active_identity_for(snapshot.credential_path.as_deref());
+        if keychain_disabled() {
+            assert_eq!(active, ActiveIdentity::Absent);
+        } else {
+            assert_eq!(active, ActiveIdentity::Unnamed);
+            assert!(quota_core::types::reading_answers_for_active_account(
+                snapshot.account_digest.as_deref(),
+                &active,
+                Vec::new,
+            ));
+        }
     }
 
     #[test]

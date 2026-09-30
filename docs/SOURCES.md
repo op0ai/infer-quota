@@ -211,7 +211,7 @@ The dashboard session cookie `WorkosCursorSessionToken`: either the bare value
 request. We do **not** read a browser cookie store: you copy the
 value once. It is looked up through `quota-secrets` at `cursor_secret_path`
 (default `cursor/session`), first hit wins
-(`quota_secrets::keychain_first_from_env`):
+(`quota_secrets::keychain_first_from_env_for_path`):
 
 1. OS keychain: `QUOTA_CURSOR_SESSION=<value> quota-ctl secret put cursor/session --from-env QUOTA_CURSOR_SESSION`
 2. OpenBao (quotad built with `--features openbao`, `QUOTA_OPENBAO_*` set)
@@ -222,7 +222,10 @@ This order is Cursor's own. The default chain (`quota_secrets::from_env`,
 OpenBao first; see [SECRETS.md](SECRETS.md)) is unchanged, and it is what
 `quota-ctl secret` uses: `put` writes to its first writable backend, so with
 OpenBao configured the cookie lands in OpenBao, and a keychain copy of
-`cursor/session`, if one exists, is read before it.
+the configured path, if one exists, is read before it. `QUOTA_NO_KEYCHAIN=1`
+skips that lookup, and a malformed OpenBao configuration does not prevent the
+local keychain or cookie file from satisfying the read. The cookie file also
+works when `cursor_secret_path` is custom.
 
 The value goes into one `Cookie` header. It is never logged and never appears
 in an error or a snapshot. A value with control or non-ASCII characters is

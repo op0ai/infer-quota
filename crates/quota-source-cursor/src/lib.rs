@@ -78,8 +78,11 @@ impl CursorAdapter {
     /// Looks the cookie up in the OS keychain, then OpenBao (built with the
     /// `openbao` feature and configured), then the read-only cookie file.
     pub fn from_keychain_first_chain(secret_path: impl Into<String>) -> Result<Self, SecretsError> {
+        let secret_path = secret_path.into();
         Ok(Self::new(
-            Box::new(quota_secrets::keychain_first_from_env()?),
+            Box::new(quota_secrets::keychain_first_from_env_for_path(
+                secret_path.clone(),
+            )?),
             secret_path,
         ))
     }
@@ -336,28 +339,37 @@ fn window(
     let percent = bucket
         .total_percent_used
         .filter(|p| percent_fallback && p.is_finite() && *p >= 0.0);
-    match (bucket.used, percent) {
-        (Some(used), _) => match cents_to_usd(used) {
-            Some(used_usd) => UsageWindow::from_spend_at(
+    let used_usd = bucket.used.and_then(cents_to_usd);
+    match (used_usd, percent, limit_usd) {
+        (Some(used_usd), _, Some(limit_usd)) => UsageWindow::from_spend_at(
+            WindowKind::Spend,
+            label,
+            used_usd,
+            Some(limit_usd),
+            reset,
+            cycle_secs,
+            observed,
+            EVIDENCE_MAX_AGE_SECS,
+        ),
+        (Some(used_usd), Some(percent), None) => {
+            let mut window = UsageWindow::from_percent_at(
                 WindowKind::Spend,
                 label,
-                used_usd,
-                limit_usd,
+                percent,
                 reset,
                 cycle_secs,
                 observed,
                 EVIDENCE_MAX_AGE_SECS,
-            ),
-            None => UsageWindow::unreadable(
-                WindowKind::Spend,
-                label,
-                reset,
-                cycle_secs,
-                observed,
-                EVIDENCE_MAX_AGE_SECS,
-            ),
-        },
-        (None, Some(percent)) => UsageWindow::from_percent_at(
+            );
+            window.unit = Some("usd".to_string());
+            window.used_usd = Some(used_usd);
+            if let Some(reading) = window.reading.as_mut() {
+                reading.unit = Some("usd".to_string());
+                reading.used_usd = Some(used_usd);
+            }
+            window
+        }
+        (_, Some(percent), _) => UsageWindow::from_percent_at(
             WindowKind::Spend,
             label,
             percent,
@@ -366,7 +378,17 @@ fn window(
             observed,
             EVIDENCE_MAX_AGE_SECS,
         ),
-        (None, None) => UsageWindow::unreadable(
+        (Some(used_usd), None, None) => UsageWindow::from_spend_at(
+            WindowKind::Spend,
+            label,
+            used_usd,
+            None,
+            reset,
+            cycle_secs,
+            observed,
+            EVIDENCE_MAX_AGE_SECS,
+        ),
+        (None, None, _) => UsageWindow::unreadable(
             WindowKind::Spend,
             label,
             reset,
@@ -491,6 +513,24 @@ mod tests {
     }
 
     #[test]
+    fn published_plan_percent_survives_when_used_cents_have_no_limit() {
+        let body = br#"{"individualUsage":{"plan":{"used":1250,"totalPercentUsed":135}}}"#;
+        let snap = probe(
+            &adapter_with(Some("test-session")),
+            &Recording::ok(200, body.to_vec()),
+        );
+        let included = &snap.windows[0];
+        assert_eq!(included.used_percent, Some(135.0));
+        assert_eq!(included.remaining_percent, Some(0.0));
+        assert_eq!(included.used_usd, Some(12.5));
+        assert_eq!(included.limit_usd, None);
+
+        let answer = can_start_percent(&snap, &[], 1.0, 2.0, None, snap.observed_at.unwrap());
+        assert!(!answer.ok);
+        assert_eq!(answer.basis, CanStartBasis::PercentBudget);
+    }
+
+    #[test]
     fn unlimited_plan_without_windows_is_credits_not_an_error() {
         let summary = parse_usage_summary(&fixture("usage-summary.unlimited.json"), NOW).unwrap();
         assert!(summary.unlimited && summary.windows.is_empty());
@@ -575,11 +615,11 @@ mod tests {
         assert_eq!(snap.status, Availability::Ok);
         let answer = can_start_percent(&snap, &[], 1.0, 2.0, None, snap.observed_at.unwrap());
         assert!(!answer.ok, "{}", answer.explanation);
-        assert_eq!(answer.basis, CanStartBasis::Unavailable);
+        assert_eq!(answer.basis, CanStartBasis::UnknownWindow);
         assert!(
             answer
                 .explanation
-                .contains("on-demand is reported but unreadable"),
+                .contains("on-demand has no readable measurement"),
             "{}",
             answer.explanation
         );

@@ -23,7 +23,10 @@ pub mod memory;
 pub mod openbao;
 pub mod types;
 
-pub use chain::{from_env, keychain_first, keychain_first_from_env, SecretChain};
+pub use chain::{
+    from_env, keychain_first, keychain_first_from_env, keychain_first_from_env_for_path,
+    SecretChain,
+};
 pub use claude_code::ClaudeCodeKeychain;
 pub use file::FileOauthBackend;
 pub use keychain::KeychainBackend;

@@ -144,23 +144,16 @@ impl From<ProviderIdArg> for ProviderId {
     }
 }
 
-fn socket_path(cli: &Cli) -> Result<PathBuf, quota_core::ConfigError> {
-    if let Some(p) = &cli.socket {
-        return Ok(p.clone());
-    }
-    Ok(Config::load_default()?.socket_path())
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let sock = match socket_path(&cli) {
-        Ok(sock) => sock,
-        Err(e) => {
-            eprintln!("quota-ctl: {e}");
-            return ExitCode::FAILURE;
-        }
+    let outcome = match &cli.command {
+        Command::Secret { action } => run_secret(action),
+        _ => match Config::client_socket_path(cli.socket.as_deref()) {
+            Ok(sock) => run(&cli, &sock),
+            Err(e) => Err(e.into()),
+        },
     };
-    match run(&cli, &sock) {
+    match outcome {
         Ok(code) => code,
         Err(e) => {
             eprintln!("quota-ctl: {e}");
@@ -267,41 +260,46 @@ fn run(cli: &Cli, sock: &std::path::Path) -> Result<ExitCode, Box<dyn std::error
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Command::Secret { action } => match action {
-            SecretCmd::Backends => {
-                let chain = from_env()?;
-                println!("{}", chain.backend_names().join(" "));
-                Ok(ExitCode::SUCCESS)
-            }
-            SecretCmd::Get { path } => {
-                let chain = from_env()?;
-                match chain.get(path)? {
-                    Some(rec) => {
-                        println!(
-                            "{}",
-                            quota_ctl::format_secret_presence(rec.backend, &rec.path)
-                        );
-                        Ok(ExitCode::SUCCESS)
-                    }
-                    None => {
-                        eprintln!("quota-ctl: secret not found");
-                        Ok(ExitCode::from(2))
-                    }
+        Command::Secret { action } => run_secret(action),
+    }
+}
+
+/// Local secrets chain only. Never needs the daemon, its socket or its config.
+fn run_secret(action: &SecretCmd) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match action {
+        SecretCmd::Backends => {
+            let chain = from_env()?;
+            println!("{}", chain.backend_names().join(" "));
+            Ok(ExitCode::SUCCESS)
+        }
+        SecretCmd::Get { path } => {
+            let chain = from_env()?;
+            match chain.get(path)? {
+                Some(rec) => {
+                    println!(
+                        "{}",
+                        quota_ctl::format_secret_presence(rec.backend, &rec.path)
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                None => {
+                    eprintln!("quota-ctl: secret not found");
+                    Ok(ExitCode::from(2))
                 }
             }
-            SecretCmd::Put {
-                path,
-                from_env: var,
-            } => {
-                let value = std::env::var(var).map_err(|_| {
-                    format!("environment variable {var} is unset (refusing empty secret)")
-                })?;
-                quota_ctl::require_secret_material(&value)?;
-                let chain = from_env()?;
-                chain.put(path, &value)?;
-                println!("stored path={path} (value not printed)");
-                Ok(ExitCode::SUCCESS)
-            }
-        },
+        }
+        SecretCmd::Put {
+            path,
+            from_env: var,
+        } => {
+            let value = std::env::var(var).map_err(|_| {
+                format!("environment variable {var} is unset (refusing empty secret)")
+            })?;
+            quota_ctl::require_secret_material(&value)?;
+            let chain = from_env()?;
+            chain.put(path, &value)?;
+            println!("stored path={path} (value not printed)");
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }

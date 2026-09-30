@@ -40,6 +40,15 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn spawn_daemon(enable_codexbar: bool) -> Daemon {
+    spawn_daemon_with_claude_config_dir(enable_codexbar, None)
+}
+
+/// Spawn with an optional fixture-only Claude config override. The default
+/// hotpath child never inherits the caller's `CLAUDE_CONFIG_DIR`.
+fn spawn_daemon_with_claude_config_dir(
+    enable_codexbar: bool,
+    claude_config_dir: Option<&Path>,
+) -> Daemon {
     let temp_dir = tempfile::tempdir().expect("unique hotpath test directory");
     let dir = temp_dir.path();
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -66,7 +75,8 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
     fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_quotad");
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("--config")
         .arg(&cfg_path)
         .arg("--socket")
@@ -74,7 +84,7 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .arg("run")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join("no-codex"))
-        .env("CLAUDE_CONFIG_DIR", home.join("no-claude"))
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg-config"))
         .env("XDG_STATE_HOME", home.join("xdg-state"))
         .env("XDG_RUNTIME_DIR", dir)
@@ -83,9 +93,11 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .env("QUOTA_WATCH_IDLE_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn quotad");
+        .stderr(Stdio::null());
+    if let Some(claude_config_dir) = claude_config_dir {
+        command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
+    }
+    let child = command.spawn().expect("spawn quotad");
 
     let daemon = Daemon {
         child,
@@ -217,9 +229,20 @@ fn concurrent_clients_ping_and_status() {
 #[test]
 fn fixture_ingest_and_percent_only_can_start() {
     let d = spawn_daemon(true);
-    let status = rpc(&d.socket, 1, METHOD_STATUS, serde_json::json!({}));
-    let result: StatusResult =
-        serde_json::from_value(status.result.clone().expect("status result")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (status, result) = loop {
+        let status = rpc(&d.socket, 1, METHOD_STATUS, serde_json::json!({}));
+        let result: StatusResult =
+            serde_json::from_value(status.result.clone().expect("status result")).unwrap();
+        if result.snapshot.by_id(ProviderId::Claude).is_some() {
+            break (status, result);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial refresh did not publish Claude's unavailable result"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
     let codex = result
         .snapshot
         .by_id(ProviderId::Codex)
@@ -315,6 +338,20 @@ fn statusline_push_becomes_current_claude_evidence_and_survives_a_refresh() {
     assert_eq!(after.status, Availability::Ok);
     assert_eq!(after.source, Some(Source::Statusline));
     assert_no_secrets(&serde_json::to_string(&pushed).unwrap());
+}
+
+#[test]
+fn fixture_claude_config_override_keeps_statusline_push_out_of_isolated_account() {
+    let claude_config = tempfile::tempdir().expect("fixture-only Claude config directory");
+    let d = spawn_daemon_with_claude_config_dir(false, Some(claude_config.path()));
+    let response = rpc(&d.socket, 1, METHOD_OBSERVE, observe_params(34.0));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().code, "account_scope");
+    assert_eq!(
+        claude_of(&d.socket).status,
+        Availability::Unavailable,
+        "the isolated fixture account must not receive an unscoped push"
+    );
 }
 
 #[test]
@@ -474,6 +511,8 @@ fn sigterm_during_startup_probe_removes_socket_and_lock() {
         _temp_dir: temp_dir,
         socket: socket.clone(),
     };
+    wait_ping(&socket, Duration::from_secs(8))
+        .expect("quotad did not accept requests during the initial provider probe");
     connected_rx
         .recv_timeout(Duration::from_secs(8))
         .expect("initial provider probe did not connect to local stall server");

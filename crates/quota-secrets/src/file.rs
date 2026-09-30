@@ -13,13 +13,44 @@ const MAX_CRED_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Default)]
 pub struct FileOauthBackend {
     pub codex_home: Option<PathBuf>,
+    cursor_secret_path: Option<String>,
+    cursor_cookie_file: Option<PathBuf>,
+    #[cfg(test)]
+    claude_credentials_file: Option<PathBuf>,
 }
 
 impl FileOauthBackend {
     pub fn with_codex_home(path: PathBuf) -> Self {
         Self {
             codex_home: Some(path),
+            ..Self::default()
         }
+    }
+
+    /// Also serve the Cursor cookie file for the configured logical path.
+    pub fn with_cursor_secret_path(mut self, path: impl Into<String>) -> Self {
+        self.cursor_secret_path = Some(path.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cursor_cookie_file(mut self, path: PathBuf) -> Self {
+        self.cursor_cookie_file = Some(path);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_claude_credentials_file(mut self, path: PathBuf) -> Self {
+        self.claude_credentials_file = Some(path);
+        self
+    }
+
+    fn claude_candidate_paths(&self) -> Vec<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.claude_credentials_file {
+            return vec![path.clone()];
+        }
+        claude_candidates()
     }
 }
 
@@ -122,8 +153,12 @@ fn reject_open_permissions(path: &Path) -> Result<(), SecretsError> {
     Ok(())
 }
 
-fn read_cursor_cookie_file() -> Result<Option<SecretRecord>, SecretsError> {
-    for path in cursor_cookie_candidates() {
+fn read_cursor_cookie_file(
+    configured_file: Option<&Path>,
+) -> Result<Option<SecretRecord>, SecretsError> {
+    let candidates =
+        configured_file.map_or_else(cursor_cookie_candidates, |path| vec![path.to_path_buf()]);
+    for path in candidates {
         match read_capped(&path) {
             Ok(bytes) => {
                 #[cfg(unix)]
@@ -154,15 +189,26 @@ impl SecretsBackend for FileOauthBackend {
 
     fn get(&self, path: &str) -> Result<Option<SecretRecord>, SecretsError> {
         let key = path.trim().trim_start_matches("file:");
+        let configured_cursor_path = self
+            .cursor_secret_path
+            .as_deref()
+            .map(|configured| configured.trim().trim_start_matches("file:"));
+        if configured_cursor_path == Some(key) {
+            return read_cursor_cookie_file(self.cursor_cookie_file.as_deref());
+        }
         let (candidates, extract): (Vec<PathBuf>, TokenExtract) = match key {
             "codex" | "codex/access_token" | "oauth/codex" => (
                 codex_candidates(self.codex_home.as_deref()),
                 extract_codex_token,
             ),
             "claude" | "claude/access_token" | "oauth/claude" => {
-                (claude_candidates(), extract_claude_token)
+                (self.claude_candidate_paths(), extract_claude_token)
             }
-            "cursor" | "cursor/session" => return read_cursor_cookie_file(),
+            "cursor" | "cursor/session"
+                if configured_cursor_path.is_none_or(|configured| configured == key) =>
+            {
+                return read_cursor_cookie_file(self.cursor_cookie_file.as_deref());
+            }
             other => {
                 return Err(SecretsError::NotFound(format!(
                     "unknown file secret path {other} (try file:codex, file:claude or file:cursor)"
@@ -220,6 +266,82 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(super::reject_open_permissions(&file).is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_cursor_logical_path_reads_only_the_injected_cookie_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-secrets-cursor-custom-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session");
+        fs::write(&file, "WorkosCursorSessionToken=test-session\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let backend = FileOauthBackend::default()
+            .with_cursor_secret_path("workspace/custom")
+            .with_cursor_cookie_file(file);
+        let record = backend.get("workspace/custom").unwrap().unwrap();
+        assert_eq!(record.value, "WorkosCursorSessionToken=test-session");
+        assert!(matches!(
+            backend.get("cursor/session"),
+            Err(SecretsError::NotFound(_))
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_cursor_path_takes_precedence_over_oauth_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quota-secrets-cursor-collision-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join("session");
+        let claude = dir.join("claude.json");
+        let codex = dir.join("codex");
+        fs::write(&cookie, "WorkosCursorSessionToken=cursor-fixture\n").unwrap();
+        fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &claude,
+            r#"{"claudeAiOauth":{"accessToken":"claude-fixture"}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("auth.json"),
+            r#"{"access_token":"codex-fixture"}"#,
+        )
+        .unwrap();
+
+        let claude_path = FileOauthBackend::default()
+            .with_cursor_secret_path("claude")
+            .with_cursor_cookie_file(cookie.clone())
+            .with_claude_credentials_file(claude);
+        assert_eq!(
+            claude_path.get("claude").unwrap().unwrap().value,
+            "WorkosCursorSessionToken=cursor-fixture"
+        );
+
+        let codex_path = FileOauthBackend::with_codex_home(codex)
+            .with_cursor_secret_path("oauth/codex")
+            .with_cursor_cookie_file(cookie)
+            .with_claude_credentials_file(dir.join("absent-claude.json"));
+        assert_eq!(
+            codex_path.get("oauth/codex").unwrap().unwrap().value,
+            "WorkosCursorSessionToken=cursor-fixture"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

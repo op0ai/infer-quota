@@ -12,7 +12,11 @@ This is the default chain, `quota_secrets::from_env`, used by `quota-ctl`.
 The Cursor session cookie has its own order,
 `quota_secrets::keychain_first_from_env`: **OS keychain**, then **OpenBao**
 (when configured), then the read-only cookie file below. Claude Code's item is
-not in that chain.
+not in that chain. `QUOTA_NO_KEYCHAIN=1` omits the OS keychain from both Cursor
+and the default lookup chain. If OpenBao configuration is incomplete, the
+Cursor chain tries local keychain and cookie-file fallbacks before returning
+the configuration error. A configured `cursor_secret_path` is also recognized
+by the file backend, so the fallback works with a custom logical path.
 
 1. **OpenBao** (feature `openbao`) — KV v2. `quota-ctl` enables the feature.
    Building `quota-secrets` without it omits the HTTP client and rustls.
@@ -30,8 +34,9 @@ not in that chain.
      it. This is not a silent success.
    Then, macOS only and read-only, **Claude Code's own item** (service
    `Claude Code-credentials`), served for the logical path `claude` alone.
-   macOS prompts on the first read from a new binary. `QUOTA_NO_KEYCHAIN=1`
-   skips it.
+   macOS may prompt on the first read from a new binary. `QUOTA_NO_KEYCHAIN=1`
+   skips both keychain backends. `quotad` runs the first provider refresh in
+   the background, so a Keychain approval wait does not delay socket startup.
 3. **CLI files** (read-only, last resort) — the same paths `quota-adapters`
    already consult:
    - `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
@@ -78,9 +83,10 @@ quota-ctl secret put codex/work --from-env QUOTA_PUT
 quota-ctl secret get codex/work    # backend= path= present=true
 ```
 
-OpenBao joins the chain only when `QUOTA_OPENBAO_ADDR` and
-`QUOTA_OPENBAO_TOKEN` are both set and non-empty. Address without a token
-is a config error on `secret backends`, `secret get`, and `secret put`.
+OpenBao joins the default chain only when `QUOTA_OPENBAO_ADDR` and
+`QUOTA_OPENBAO_TOKEN` are both set and non-empty. Address without a token is a
+config error on `secret backends`, `secret get`, and `secret put`. The Cursor
+read-only chain defers that config error until its local fallbacks are checked.
 
 ### TLS
 
@@ -97,8 +103,8 @@ Default port for `https://` with no port is 443.
 `cargo test --workspace` does **not** start Docker and does **not** dial
 `:8200`. OpenBao tests use an in-process TCP listener (plain HTTP) and an
 in-process rustls listener with a throwaway CA and leaf embedded in the
-test. Keychain tests skip
-cleanly when the session bus (or macOS keychain) is unavailable.
+test. Keychain unit tests use an in-memory test platform and never access the
+user's OS keychain.
 
 `quotad` does call this crate, read-only, through two collectors: the Claude
 OAuth adapter reads Claude Code's own Keychain item (macOS) before the
