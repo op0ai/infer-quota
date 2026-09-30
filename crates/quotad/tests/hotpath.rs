@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 use quota_core::framing::{decode_len, encode_frame, read_frame, write_frame, MAX_FRAME_BYTES};
 use quota_core::protocol::{
     CanStartResult, Request, Response, StatusResult, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST,
-    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_STATUS, METHOD_WATCH,
+    METHOD_CAN_START, METHOD_OBSERVE, METHOD_PACE, METHOD_PING, METHOD_REFRESH, METHOD_STATUS,
+    METHOD_WATCH,
 };
-use quota_core::types::{Availability, CanStartBasis, Freshness, ProviderId};
+use quota_core::types::{Availability, CanStartBasis, Freshness, ProviderId, Source};
 
 struct Daemon {
     child: Child,
@@ -39,6 +40,15 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn spawn_daemon(enable_codexbar: bool) -> Daemon {
+    spawn_daemon_with_claude_config_dir(enable_codexbar, None)
+}
+
+/// Spawn with an optional fixture-only Claude config override. The default
+/// hotpath child never inherits the caller's `CLAUDE_CONFIG_DIR`.
+fn spawn_daemon_with_claude_config_dir(
+    enable_codexbar: bool,
+    claude_config_dir: Option<&Path>,
+) -> Daemon {
     let temp_dir = tempfile::tempdir().expect("unique hotpath test directory");
     let dir = temp_dir.path();
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -65,7 +75,8 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
     fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_quotad");
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("--config")
         .arg(&cfg_path)
         .arg("--socket")
@@ -73,17 +84,20 @@ fn spawn_daemon(enable_codexbar: bool) -> Daemon {
         .arg("run")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join("no-codex"))
-        .env("CLAUDE_CONFIG_DIR", home.join("no-claude"))
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("XDG_CONFIG_HOME", home.join("xdg-config"))
         .env("XDG_STATE_HOME", home.join("xdg-state"))
         .env("XDG_RUNTIME_DIR", dir)
         .env_remove("QUOTA_SOCKET")
+        .env("QUOTA_NO_KEYCHAIN", "1")
         .env("QUOTA_WATCH_IDLE_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn quotad");
+        .stderr(Stdio::null());
+    if let Some(claude_config_dir) = claude_config_dir {
+        command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
+    }
+    let child = command.spawn().expect("spawn quotad");
 
     let daemon = Daemon {
         child,
@@ -215,9 +229,20 @@ fn concurrent_clients_ping_and_status() {
 #[test]
 fn fixture_ingest_and_percent_only_can_start() {
     let d = spawn_daemon(true);
-    let status = rpc(&d.socket, 1, METHOD_STATUS, serde_json::json!({}));
-    let result: StatusResult =
-        serde_json::from_value(status.result.clone().expect("status result")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (status, result) = loop {
+        let status = rpc(&d.socket, 1, METHOD_STATUS, serde_json::json!({}));
+        let result: StatusResult =
+            serde_json::from_value(status.result.clone().expect("status result")).unwrap();
+        if result.snapshot.by_id(ProviderId::Claude).is_some() {
+            break (status, result);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial refresh did not publish Claude's unavailable result"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
     let codex = result
         .snapshot
         .by_id(ProviderId::Codex)
@@ -255,6 +280,125 @@ fn fixture_ingest_and_percent_only_can_start() {
     assert_no_secrets(&serde_json::to_string(&status).unwrap());
     assert_no_secrets(&serde_json::to_string(&can).unwrap());
     assert_no_secrets(&serde_json::to_string(&pace).unwrap());
+}
+
+fn observe_params(used: f64) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "provider": "claude",
+        "source": "statusline",
+        "windows": [
+            {"kind": "five_hour", "label": "5h", "used_percent": used,
+             "reset_at": quota_core::timeutil::now_unix() + 7_200, "limit_window_seconds": 18_000},
+            {"kind": "weekly", "label": "weekly", "used_percent": 12.0,
+             "reset_at": quota_core::timeutil::now_unix() + 200_000, "limit_window_seconds": 604_800}
+        ]
+    })
+}
+
+fn claude_of(socket: &Path) -> quota_core::types::ProviderSnapshot {
+    let status = rpc(
+        socket,
+        90,
+        METHOD_STATUS,
+        serde_json::json!({"provider": "claude"}),
+    );
+    let result: StatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+    result
+        .snapshot
+        .by_id(ProviderId::Claude)
+        .cloned()
+        .expect("claude present")
+}
+
+#[test]
+fn statusline_push_becomes_current_claude_evidence_and_survives_a_refresh() {
+    let d = spawn_daemon(false);
+    assert_eq!(claude_of(&d.socket).status, Availability::Unavailable);
+
+    let pushed = rpc(&d.socket, 1, METHOD_OBSERVE, observe_params(34.0));
+    assert!(pushed.ok, "{pushed:?}");
+    let claude = claude_of(&d.socket);
+    assert_eq!(claude.status, Availability::Ok);
+    assert_eq!(claude.source, Some(Source::Statusline));
+    assert_eq!(claude.freshness, Freshness::Current);
+    assert_eq!(claude.windows[0].used_percent, Some(34.0));
+    assert!(claude.observed_at.is_some());
+
+    // The daemon's own OAuth poll has no credentials here. It must not be
+    // allowed to replace a current push with `no_credentials`.
+    let refreshed = rpc(
+        &d.socket,
+        2,
+        METHOD_REFRESH,
+        serde_json::json!({"provider": "claude"}),
+    );
+    assert!(refreshed.ok);
+    let after = claude_of(&d.socket);
+    assert_eq!(after.status, Availability::Ok);
+    assert_eq!(after.source, Some(Source::Statusline));
+    assert_no_secrets(&serde_json::to_string(&pushed).unwrap());
+}
+
+#[test]
+fn fixture_claude_config_override_keeps_statusline_push_out_of_isolated_account() {
+    let claude_config = tempfile::tempdir().expect("fixture-only Claude config directory");
+    let d = spawn_daemon_with_claude_config_dir(false, Some(claude_config.path()));
+    let response = rpc(&d.socket, 1, METHOD_OBSERVE, observe_params(34.0));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().code, "account_scope");
+    assert_eq!(
+        claude_of(&d.socket).status,
+        Availability::Unavailable,
+        "the isolated fixture account must not receive an unscoped push"
+    );
+}
+
+#[test]
+fn percent_admission_answers_from_pushed_evidence_and_explains_itself() {
+    let d = spawn_daemon(false);
+    assert!(rpc(&d.socket, 1, METHOD_OBSERVE, observe_params(34.0)).ok);
+    let can = rpc(
+        &d.socket,
+        2,
+        METHOD_CAN_START,
+        serde_json::json!({"percent": 10.0, "provider": "claude"}),
+    );
+    let result: CanStartResult = serde_json::from_value(can.result.unwrap()).unwrap();
+    assert!(result.ok, "{result:?}");
+    let answer = &result.answers[0];
+    assert_eq!(answer.basis, CanStartBasis::PercentBudget);
+    let admission = answer.admission.as_ref().unwrap();
+    assert!(admission.headroom_ok && admission.pace_ok);
+    assert_eq!(admission.reserve_percent, 2.0);
+
+    let refused = rpc(
+        &d.socket,
+        3,
+        METHOD_CAN_START,
+        serde_json::json!({"percent": 70.0, "provider": "claude"}),
+    );
+    let result: CanStartResult = serde_json::from_value(refused.result.unwrap()).unwrap();
+    assert!(!result.ok);
+    assert!(!result.answers[0].admission.as_ref().unwrap().headroom_ok);
+
+    let both = rpc(
+        &d.socket,
+        4,
+        METHOD_CAN_START,
+        serde_json::json!({"percent": 5.0, "tokens": 10, "provider": "claude"}),
+    );
+    assert_eq!(both.error.unwrap().code, "bad_params");
+}
+
+#[test]
+fn a_push_with_an_unknown_schema_is_refused_and_stores_nothing() {
+    let d = spawn_daemon(false);
+    let mut params = observe_params(50.0);
+    params["schema"] = serde_json::json!(2);
+    let refused = rpc(&d.socket, 1, METHOD_OBSERVE, params);
+    assert_eq!(refused.error.unwrap().code, "unsupported_schema");
+    assert_eq!(claude_of(&d.socket).status, Availability::Unavailable);
 }
 
 #[test]
@@ -367,6 +511,8 @@ fn sigterm_during_startup_probe_removes_socket_and_lock() {
         _temp_dir: temp_dir,
         socket: socket.clone(),
     };
+    wait_ping(&socket, Duration::from_secs(8))
+        .expect("quotad did not accept requests during the initial provider probe");
     connected_rx
         .recv_timeout(Duration::from_secs(8))
         .expect("initial provider probe did not connect to local stall server");

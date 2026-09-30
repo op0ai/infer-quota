@@ -16,6 +16,7 @@ pub const DEFAULT_RING_CAPACITY: usize = 128;
 pub const DEFAULT_REFRESH_MIN_SECS: u64 = 30;
 pub const DEFAULT_REFRESH_MAX_SECS: u64 = 300;
 pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_CURSOR_SECRET_PATH: &str = "cursor/session";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -50,6 +51,13 @@ pub struct Config {
     /// Probe Claude when true (default).
     #[serde(default = "default_true")]
     pub enable_claude: bool,
+    /// Probe Cursor when true. Off by default: it needs a session credential
+    /// the user has stored through `quota-secrets`.
+    #[serde(default)]
+    pub enable_cursor: bool,
+    /// Logical `quota-secrets` path holding the Cursor session cookie.
+    #[serde(default = "default_cursor_secret_path")]
+    pub cursor_secret_path: String,
     /// Override path for the account-metadata book (no secrets).
     #[serde(default)]
     pub accounts_path: Option<PathBuf>,
@@ -76,6 +84,9 @@ fn default_http_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_cursor_secret_path() -> String {
+    DEFAULT_CURSOR_SECRET_PATH.to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -89,6 +100,8 @@ impl Default for Config {
             http_timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
             enable_codex: true,
             enable_claude: true,
+            enable_cursor: false,
+            cursor_secret_path: DEFAULT_CURSOR_SECRET_PATH.to_string(),
             accounts_path: None,
             enable_codexbar_files: true,
             codexbar_dir: None,
@@ -138,6 +151,15 @@ impl Config {
         if self.refresh_max_secs < self.refresh_min_secs || self.refresh_max_secs > 86_400 {
             return Err(ConfigError::Invalid(
                 "refresh_max_secs must be at least refresh_min_secs and at most 86400".into(),
+            ));
+        }
+        let secret_path = self.cursor_secret_path.trim();
+        if secret_path.is_empty()
+            || secret_path.len() > 256
+            || secret_path.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Invalid(
+                "cursor_secret_path must be 1..=256 printable bytes".into(),
             ));
         }
         if !(1..=120).contains(&self.http_timeout_secs) {
@@ -236,6 +258,18 @@ mod tests {
     fn missing_file_is_default() {
         let c = Config::load_path(Path::new("/no/such/quota-config-xyz.json")).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn cursor_is_opt_in_and_its_secret_path_is_validated() {
+        let c = Config::default();
+        assert!(!c.enable_cursor);
+        assert_eq!(c.cursor_secret_path, "cursor/session");
+        let bad = Config {
+            cursor_secret_path: "  ".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
     }
 
     #[test]

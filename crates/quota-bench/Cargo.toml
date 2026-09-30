@@ -11,4 +11,6 @@ readme = false
 [dependencies]
 quota-adapters.workspace = true
 quota-core.workspace = true
+# Reuse the statusline parser so the benchmark pushes exactly what the CLI pushes.
+quota-source-claude-statusline.workspace = true
 serde_json.workspace = true

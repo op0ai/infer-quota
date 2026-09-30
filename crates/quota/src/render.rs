@@ -1,5 +1,7 @@
 use quota_core::protocol::CanStartResult;
-use quota_core::types::{Availability, PaceReport, ProviderPermission, ProviderSnapshot, Snapshot};
+use quota_core::types::{
+    Availability, PaceReport, ProviderPermission, ProviderSnapshot, Snapshot, UsageWindow,
+};
 
 fn permission_label(permission: ProviderPermission) -> &'static str {
     match permission {
@@ -27,6 +29,15 @@ fn retry_after_line(p: &ProviderSnapshot) -> Option<String> {
         None => p.retry_after_secs?,
     };
     (remaining > 0).then(|| format!("retry-after {remaining}s"))
+}
+
+/// Dollar windows read as money first; the percent still shows in the next column.
+fn money_used(w: &UsageWindow) -> Option<String> {
+    match (w.used_usd, w.limit_usd) {
+        (Some(used), Some(limit)) => Some(format!("${used:.2}/${limit:.2}")),
+        (Some(used), None) => Some(format!("${used:.2} uncapped")),
+        _ => None,
+    }
 }
 
 pub fn print_status(snap: &Snapshot) {
@@ -62,10 +73,11 @@ pub fn print_status(snap: &Snapshot) {
                     println!("         (no windows)");
                 }
                 for w in &p.windows {
-                    let used = w
-                        .used_percent
-                        .map(|n| format!("{n:.1}% used"))
-                        .unwrap_or_else(|| "used n/a".into());
+                    let used = money_used(w).unwrap_or_else(|| {
+                        w.used_percent
+                            .map(|n| format!("{n:.1}% used"))
+                            .unwrap_or_else(|| "used n/a".into())
+                    });
                     let rem = w
                         .remaining_percent
                         .map(|n| format!("{n:.1}% left"))
@@ -156,6 +168,43 @@ mod tests {
 
         assert!(line.contains("unavailable"));
         assert!(line.contains("permission=limit_reached"));
+    }
+
+    #[test]
+    fn dollar_windows_show_money_and_uncapped_spend_says_so() {
+        let now = quota_core::timeutil::now_unix();
+        let capped = UsageWindow::from_spend_at(
+            quota_core::types::WindowKind::Spend,
+            "included",
+            42.5,
+            Some(60.0),
+            None,
+            None,
+            Some(now),
+            900,
+        );
+        assert_eq!(money_used(&capped).as_deref(), Some("$42.50/$60.00"));
+        let uncapped = UsageWindow::from_spend_at(
+            quota_core::types::WindowKind::Spend,
+            "on-demand",
+            7.25,
+            None,
+            None,
+            None,
+            Some(now),
+            900,
+        );
+        assert_eq!(money_used(&uncapped).as_deref(), Some("$7.25 uncapped"));
+        let percent = UsageWindow::from_percent_at(
+            quota_core::types::WindowKind::Weekly,
+            "weekly",
+            10.0,
+            None,
+            None,
+            Some(now),
+            300,
+        );
+        assert_eq!(money_used(&percent), None);
     }
 
     #[test]

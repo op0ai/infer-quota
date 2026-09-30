@@ -40,6 +40,16 @@ impl Store {
         self.ring.push_back(snap);
     }
 
+    /// Overwrite the newest entry instead of growing the ring. A passive
+    /// source re-confirming the same numbers must not evict other providers'
+    /// history.
+    pub fn replace_latest(&mut self, snap: Snapshot) {
+        match self.ring.back_mut() {
+            Some(last) => *last = snap,
+            None => self.push_memory(snap),
+        }
+    }
+
     /// Drop every in-memory reading of `provider`, so no later pace or
     /// `can_start` answer samples it. The JSONL trail is left as written.
     pub fn forget(&mut self, provider: ProviderId) {

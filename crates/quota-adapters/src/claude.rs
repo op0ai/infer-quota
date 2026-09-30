@@ -8,9 +8,14 @@
 //! `Authorization: Bearer <claudeAiOauth.accessToken>` and
 //! `anthropic-beta: oauth-2025-04-20`.
 //!
-//! We only implement the file-based path. We do not talk to Keychain in v0
-//! (document it). We never write the credentials file. API-key mode cannot
-//! use this endpoint — we report `unavailable`, not fake percents.
+//! On macOS the default account reads the Keychain item first (through
+//! `quota-secrets`), because the file there goes stale. An isolated config dir
+//! (`CLAUDE_CONFIG_DIR` or an account `home_path`) reads only its own file.
+//! We never write either. API-key mode cannot use this endpoint — we report
+//! `unavailable`, not fake percents.
+//!
+//! A fresh statusline push (see the `quota-source-claude-statusline` crate)
+//! outranks this poll; the daemon skips the poll while a push is current.
 //!
 //! This endpoint is widely reported as aggressively rate-limited. The daemon
 //! backs off; a 429 is `unavailable`, never a guessed number.
@@ -22,25 +27,94 @@ use quota_core::types::{
     ProviderSnapshot, Source, UsageWindow, WindowKind, DEFAULT_READING_MAX_AGE_SECS,
 };
 
+use quota_secrets::claude_code::keychain_disabled;
+use quota_secrets::{ClaudeCodeKeychain, SecretsBackend};
+
 use crate::creds::{load_claude_creds, ClaudeCreds, CredsError};
 use crate::http::Transport;
 use crate::provider::{ProbeCtx, Provider};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+const CLAUDE_KEYCHAIN_PATH: &str = "keychain:Claude Code-credentials";
 
 #[derive(Default)]
 pub struct ClaudeAdapter {
     /// When set, only this Claude config dir is consulted (`home_path` isolation).
     pub config_dir: Option<std::path::PathBuf>,
+    /// Consulted before the credentials file. Left `None` for isolated homes.
+    pub keychain: Option<Box<dyn SecretsBackend>>,
+}
+
+impl ClaudeAdapter {
+    /// The default account on macOS reads Claude Code's Keychain item first;
+    /// an explicit home, `CLAUDE_CONFIG_DIR`, other platforms, or
+    /// `QUOTA_NO_KEYCHAIN=1` keep to the file.
+    pub fn for_account(config_dir: Option<std::path::PathBuf>) -> Self {
+        let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let isolated = Self::has_isolated_config(config_dir.as_deref(), env_config_dir.as_deref());
+        let keychain: Option<Box<dyn SecretsBackend>> =
+            if cfg!(target_os = "macos") && !isolated && !keychain_disabled() {
+                Some(Box::new(ClaudeCodeKeychain))
+            } else {
+                None
+            };
+        Self {
+            config_dir,
+            keychain,
+        }
+    }
+
+    /// Whether an explicit home or environment-selected Claude config is in
+    /// use. Kept pure with the environment value supplied by callers so push
+    /// acceptance can test isolation without mutating process environment.
+    pub fn has_isolated_config(config_dir: Option<&Path>, env_config_dir: Option<&str>) -> bool {
+        config_dir.is_some() || env_config_dir.is_some_and(|dir| !dir.trim().is_empty())
+    }
+
+    fn load_creds(&self) -> (Result<ClaudeCreds, CredsError>, Option<String>) {
+        let mut keychain_note = None;
+        if let Some(keychain) = &self.keychain {
+            match keychain.get("claude") {
+                Ok(Some(record)) => {
+                    return (
+                        Ok(ClaudeCreds {
+                            access_token: record.value,
+                            path: std::path::PathBuf::from(record.path),
+                            expires_at: None,
+                        }),
+                        None,
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => keychain_note = Some(format!("keychain: {e}")),
+            }
+        }
+        (load_claude_creds(self.config_dir.as_deref()), keychain_note)
+    }
 }
 
 impl ClaudeAdapter {
     /// Claude credentials carry no account id, so the account is `Unnamed`
-    /// while they load and `Absent` otherwise. Reads only the local file.
+    /// while they load and `Absent` otherwise. This method stays file-only so
+    /// status and admission never trigger a Keychain approval prompt.
     pub fn active_identity(&self) -> ActiveIdentity {
+        self.active_identity_for(None)
+    }
+
+    /// Check the local file, or accept the exact Keychain path from a current
+    /// OAuth reading. The latter is a receipt from the probe's successful
+    /// Keychain read; checking it again here could block an RPC on native UI.
+    pub fn active_identity_for(&self, verified_credential_path: Option<&str>) -> ActiveIdentity {
         match load_claude_creds(self.config_dir.as_deref()) {
             Ok(_) => ActiveIdentity::Unnamed,
+            Err(_)
+                if self.keychain.is_some()
+                    && !keychain_disabled()
+                    && verified_credential_path == Some(CLAUDE_KEYCHAIN_PATH) =>
+            {
+                ActiveIdentity::Unnamed
+            }
             Err(_) => ActiveIdentity::Absent,
         }
     }
@@ -52,12 +126,16 @@ impl Provider for ClaudeAdapter {
     }
 
     fn probe(&self, ctx: &ProbeCtx<'_>) -> ProviderSnapshot {
-        match load_claude_creds(self.config_dir.as_deref()) {
-            Ok(creds) => fetch_usage(ctx.transport, &creds, ctx.now),
-            Err(e) => {
+        match self.load_creds() {
+            (Ok(creds), _) => fetch_usage(ctx.transport, &creds, ctx.now),
+            (Err(e), keychain_note) => {
+                let message = match keychain_note {
+                    Some(note) => format!("{e} ({note})"),
+                    None => e.to_string(),
+                };
                 let mut snap = ProviderSnapshot::unavailable(
                     ProviderId::Claude,
-                    AdapterError::new(creds_code(&e), e.to_string()),
+                    AdapterError::new(creds_code(&e), message),
                 );
                 snap.source = Some(Source::Oauth);
                 snap.credential_path = match &e {
@@ -350,6 +428,7 @@ mod tests {
     use super::*;
     use crate::http::{MockTransport, TransportError};
     use quota_core::types::Availability;
+    use quota_secrets::SecretsError;
     use std::path::PathBuf;
 
     const FIXTURE: &str = r#"{
@@ -466,6 +545,7 @@ mod tests {
         };
         let adapter = ClaudeAdapter {
             config_dir: Some(PathBuf::from("/no/such/claude-home-quota-test")),
+            keychain: None,
         };
         let ctx = crate::provider::ProbeCtx {
             transport: &t,
@@ -474,6 +554,106 @@ mod tests {
         let snap = adapter.probe(&ctx);
         assert_eq!(snap.status, Availability::Unavailable);
         assert_eq!(snap.error.as_ref().unwrap().code, "no_credentials");
+    }
+
+    enum FakeKeychain {
+        Found(&'static str),
+        Fails(&'static str),
+    }
+
+    impl SecretsBackend for FakeKeychain {
+        fn name(&self) -> &'static str {
+            "fake-keychain"
+        }
+        fn get(&self, _path: &str) -> Result<Option<quota_secrets::SecretRecord>, SecretsError> {
+            match self {
+                Self::Found(value) => Ok(Some(quota_secrets::SecretRecord {
+                    backend: "fake-keychain",
+                    path: "keychain:Claude Code-credentials".into(),
+                    value: (*value).into(),
+                })),
+                Self::Fails(reason) => Err(SecretsError::Unavailable((*reason).into())),
+            }
+        }
+        fn put(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::ReadOnly)
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::ReadOnly)
+        }
+    }
+
+    fn adapter_with(keychain: FakeKeychain) -> ClaudeAdapter {
+        ClaudeAdapter {
+            config_dir: Some(PathBuf::from("/no/such/claude-home-quota-test")),
+            keychain: Some(Box::new(keychain)),
+        }
+    }
+
+    #[test]
+    fn keychain_token_is_used_before_the_file_and_is_what_gets_sent() {
+        let t = MockTransport::ok_json(200, FIXTURE);
+        let ctx = crate::provider::ProbeCtx {
+            transport: &t,
+            now: quota_core::timeutil::now_unix(),
+        };
+        let snap = adapter_with(FakeKeychain::Found("kc-token")).probe(&ctx);
+        assert_eq!(snap.status, Availability::Ok);
+        assert_eq!(
+            snap.credential_path.as_deref(),
+            Some("keychain:Claude Code-credentials")
+        );
+        assert!(!serde_json::to_string(&snap).unwrap().contains("kc-token"));
+    }
+
+    #[test]
+    fn keychain_only_probe_receipt_answers_without_a_second_keychain_read() {
+        let adapter = adapter_with(FakeKeychain::Found("keychain-only-fixture"));
+        let transport = MockTransport::ok_json(200, FIXTURE);
+        let ctx = crate::provider::ProbeCtx {
+            transport: &transport,
+            now: quota_core::timeutil::now_unix(),
+        };
+        let snapshot = adapter.probe(&ctx);
+        assert_eq!(snapshot.status, Availability::Ok);
+        assert_eq!(
+            snapshot.credential_path.as_deref(),
+            Some(CLAUDE_KEYCHAIN_PATH)
+        );
+
+        let active = adapter.active_identity_for(snapshot.credential_path.as_deref());
+        if keychain_disabled() {
+            assert_eq!(active, ActiveIdentity::Absent);
+        } else {
+            assert_eq!(active, ActiveIdentity::Unnamed);
+            assert!(quota_core::types::reading_answers_for_active_account(
+                snapshot.account_digest.as_deref(),
+                &active,
+                Vec::new,
+            ));
+        }
+    }
+
+    #[test]
+    fn keychain_failure_is_named_when_the_file_fallback_is_missing_too() {
+        let t = MockTransport {
+            next: None,
+            last_url: std::sync::Mutex::new(None),
+        };
+        let ctx = crate::provider::ProbeCtx {
+            transport: &t,
+            now: 1,
+        };
+        let snap = adapter_with(FakeKeychain::Fails("keychain error -128")).probe(&ctx);
+        let error = snap.error.unwrap();
+        assert_eq!(error.code, "no_credentials");
+        assert!(error.message.contains("keychain error -128"));
+    }
+
+    #[test]
+    fn isolated_accounts_never_get_a_keychain_reader() {
+        let adapter = ClaudeAdapter::for_account(Some(PathBuf::from("/some/home")));
+        assert!(adapter.keychain.is_none());
     }
 
     #[test]

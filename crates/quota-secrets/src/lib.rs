@@ -1,9 +1,13 @@
 //! Unified secrets backends for `quota-ctl`.
 //!
-//! Lookup order (first hit wins):
+//! Lookup order of [`from_env`] (first hit wins):
 //! 1. OpenBao KV (feature `openbao`; env-configured; rustls for `https://`)
-//! 2. OS keychain (Linux secret-service, macOS Security.framework)
+//! 2. OS keychain (Linux secret-service, macOS Security.framework), then
+//!    Claude Code's own Keychain item (macOS, read-only, `claude` only)
 //! 3. Existing CLI OAuth files (read-only)
+//!
+//! [`keychain_first_from_env`], for the Cursor session cookie: OS keychain,
+//! then OpenBao, then the private read-only cookie file.
 //!
 //! `cargo test` never dials a live OpenBao. Plain-HTTP and TLS tests use an
 //! in-process listener.
@@ -11,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chain;
+pub mod claude_code;
 pub mod file;
 pub mod keychain;
 pub mod memory;
@@ -18,7 +23,11 @@ pub mod memory;
 pub mod openbao;
 pub mod types;
 
-pub use chain::{from_env, SecretChain};
+pub use chain::{
+    from_env, keychain_first, keychain_first_from_env, keychain_first_from_env_for_path,
+    SecretChain,
+};
+pub use claude_code::ClaudeCodeKeychain;
 pub use file::FileOauthBackend;
 pub use keychain::KeychainBackend;
 pub use memory::MemoryBackend;

@@ -4,6 +4,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -35,6 +36,40 @@ pub fn rpc(
     let payload = read_frame(&mut stream).map_err(|e| RpcError::Io(e.to_string()))?;
     let resp: Response = serde_json::from_slice(&payload)?;
     Ok(resp)
+}
+
+/// [`rpc`] with a wall-clock budget for the whole exchange, connect included.
+///
+/// The exchange runs on a helper thread and the caller waits at most `budget`;
+/// a daemon that is wedged, absent, or slow costs the caller `budget` and no
+/// more. Use it where the caller must never hang on `quotad` (a statusline).
+pub fn rpc_within(
+    socket: &Path,
+    id: u64,
+    method: &str,
+    params: impl serde::Serialize,
+    budget: Duration,
+) -> Result<Response, RpcError> {
+    let bytes = serde_json::to_vec(&Request::with_params(id, method, params))?;
+    let socket = socket.to_path_buf();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(exchange(&socket, &bytes, budget));
+    });
+    receive
+        .recv_timeout(budget)
+        .map_err(|_| RpcError::Io(format!("no reply within {}ms", budget.as_millis())))?
+}
+
+fn exchange(socket: &Path, request: &[u8], budget: Duration) -> Result<Response, RpcError> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| RpcError::Connect(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(budget))
+        .and_then(|()| stream.set_write_timeout(Some(budget)))
+        .map_err(|e| RpcError::Io(e.to_string()))?;
+    write_frame(&mut stream, request).map_err(|e| RpcError::Io(e.to_string()))?;
+    let payload = read_frame(&mut stream).map_err(|e| RpcError::Io(e.to_string()))?;
+    Ok(serde_json::from_slice(&payload)?)
 }
 
 pub fn rpc_watch(

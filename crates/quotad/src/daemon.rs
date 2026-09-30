@@ -14,21 +14,23 @@ use quota_adapters::http::TlsTransport;
 use quota_adapters::provider::{ProbeCtx, Provider};
 use quota_adapters::{ClaudeAdapter, CodexAdapter};
 use quota_core::framing::{decode_len, encode_frame, FrameError};
-use quota_core::math::{can_start, pace_for};
+use quota_core::math::{can_start, can_start_percent, pace_for, DEFAULT_RESERVE_PERCENT};
 use quota_core::protocol::{
     AccountMutationResult, AccountsAddParams, AccountsRemoveParams, AccountsSelectParams,
-    CanStartParams, CanStartResult, ErrorBody, PaceParams, PaceResult, ProviderFilter,
-    RefreshParams, Request, Response, StatusParams, StatusResult, VersionInfo, WatchParams,
-    METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE, METHOD_ACCOUNTS_SELECT,
-    METHOD_CAN_START, METHOD_PACE, METHOD_PING, METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION,
-    METHOD_WATCH,
+    CanStartParams, CanStartResult, ErrorBody, ObserveParams, ObserveResult, PaceParams,
+    PaceResult, ProviderFilter, RefreshParams, Request, Response, StatusParams, StatusResult,
+    VersionInfo, WatchParams, METHOD_ACCOUNTS_ADD, METHOD_ACCOUNTS_LIST, METHOD_ACCOUNTS_REMOVE,
+    METHOD_ACCOUNTS_SELECT, METHOD_CAN_START, METHOD_OBSERVE, METHOD_PACE, METHOD_PING,
+    METHOD_REFRESH, METHOD_STATUS, METHOD_VERSION, METHOD_WATCH,
 };
 use quota_core::timeutil::now_unix;
 use quota_core::types::{
-    reading_answers_for_active_account, AdapterError, Availability, ProviderId, ProviderSnapshot,
-    Snapshot, MAX_RETRY_AFTER_SECS,
+    freshness_for, reading_answers_for_active_account, ActiveIdentity, AdapterError, Availability,
+    Freshness, ProviderId, ProviderSnapshot, Snapshot, DEFAULT_READING_MAX_AGE_SECS,
+    MAX_RETRY_AFTER_SECS,
 };
 use quota_core::Config;
+use quota_source_cursor::CursorAdapter;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -47,6 +49,7 @@ const WATCH_IDLE_FLOOR_SECS: u64 = 600;
 const WATCH_IDLE_SLACK_SECS: u64 = 30;
 
 use crate::accounts::AccountStore;
+use crate::observe::{snapshot_from_push, PUSH_RING_MIN_GAP_SECS};
 use crate::store::Store;
 
 pub fn run(cfg: Config) -> Result<(), DaemonError> {
@@ -144,6 +147,13 @@ struct App {
     /// Each provider has its own single-flight gate and generation.
     refresh_gates: HashMap<ProviderId, Arc<RefreshGate>>,
     watch_tx: broadcast::Sender<Snapshot>,
+    /// Receipt time of the newest push per provider. A current push outranks
+    /// polling that provider.
+    pushed_at: HashMap<ProviderId, i64>,
+    /// When the ring last took a pushed snapshot, per provider.
+    last_ring_push: HashMap<ProviderId, i64>,
+    /// When a rate-limited-by-us provider (Cursor) was last probed.
+    last_polled: HashMap<ProviderId, tokio::time::Instant>,
     /// Codex home when the active quota account names none. `None` resolves
     /// `$CODEX_HOME` or `~/.codex` at each read.
     codex_home: Option<PathBuf>,
@@ -212,7 +222,7 @@ fn account_scope(g: &App, provider: ProviderId) -> AccountScope {
 }
 
 fn account_scopes(g: &App) -> HashMap<ProviderId, AccountScope> {
-    [ProviderId::Codex, ProviderId::Claude]
+    [ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor]
         .into_iter()
         .map(|provider| (provider, account_scope(g, provider)))
         .collect()
@@ -260,6 +270,7 @@ impl RefreshGate {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
+    #[cfg(test)]
     async fn mark_complete(&self, scope: AccountScope) {
         let mut completed = self.completed.lock().await;
         self.complete(&mut completed, scope);
@@ -300,65 +311,90 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
         accounts,
         cfg,
         watch_tx,
+        pushed_at: HashMap::new(),
+        last_ring_push: HashMap::new(),
+        last_polled: HashMap::new(),
         codex_home: None,
         claude_home: None,
     }));
 
-    // Register both signals before starting the initial provider
-    // probes. A startup SIGTERM then follows the same socket cleanup path as a
-    // signal received after the accept loop starts.
-    let plan = {
-        let g = app.read().await;
-        probe_plan(&g)
-    };
-    let startup_probe = probe_on_thread(move || collect_snapshot(plan));
-    let startup = tokio::select! {
-        _ = interrupt.recv() => {
-            eprintln!("quotad: received SIGINT during startup, shutting down");
-            None
-        }
-        _ = terminate.recv() => {
-            eprintln!("quotad: received SIGTERM during startup, shutting down");
-            None
-        }
-        result = startup_probe => Some(result),
-    };
-    let snapshot = match startup {
-        Some(Ok(snapshot)) => snapshot,
-        Some(Err(error)) => {
-            let _ = fs::remove_file(&socket);
-            return Err(DaemonError::Io(format!(
-                "initial provider probe task failed: {error}"
-            )));
-        }
-        None => {
-            let _ = fs::remove_file(&socket);
-            return Ok(());
-        }
-    };
-    apply_snapshot(&app, snapshot).await;
-    {
-        let g = app.read().await;
-        for (provider, gate) in &g.refresh_gates {
-            gate.mark_complete(account_scope(&g, *provider)).await;
-        }
+    // Do not await provider probes before entering the accept loop. Claude's
+    // Keychain can show an approval prompt, so each provider refresh runs in
+    // its own task and cannot hold the listener or another provider's cadence.
+    let mut scheduled_refreshes = HashMap::new();
+    for provider in [ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor] {
+        start_scheduled_refresh(&mut scheduled_refreshes, provider, || {
+            tokio::spawn(refresh_one_provider(app.clone(), provider))
+        })
+        .await;
     }
-
-    let mut scheduled_refresh: Option<tokio::task::JoinHandle<()>> = None;
-    loop {
-        let wait = {
-            let g = app.read().await;
-            Duration::from_secs(g.interval_secs)
-        };
+    let first_refresh = {
+        let g = app.read().await;
+        Duration::from_secs(g.interval_secs)
+    };
+    let shutdown = async {
         tokio::select! {
-            _ = interrupt.recv() => {
-                eprintln!("quotad: shutting down");
-                break;
+            _ = interrupt.recv() => eprintln!("quotad: shutting down"),
+            _ = terminate.recv() => eprintln!("quotad: received SIGTERM, shutting down"),
+        }
+    };
+    let refresh_app = app.clone();
+    let scheduled_refreshes = Arc::new(Mutex::new(scheduled_refreshes));
+    let refresh_slots = scheduled_refreshes.clone();
+    accept_loop(
+        listener,
+        app,
+        rpc_slots,
+        watch_slots,
+        first_refresh,
+        shutdown,
+        move || {
+            let refresh_app = refresh_app.clone();
+            let refresh_slots = refresh_slots.clone();
+            async move {
+                let mut scheduled_refreshes = refresh_slots.lock().await;
+                // Keep refresh cadence independent of socket traffic. Provider
+                // probes run in their own tasks, so a stalled Keychain prompt or
+                // network request cannot hold this accept loop.
+                for provider in [ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor] {
+                    start_scheduled_refresh(&mut scheduled_refreshes, provider, || {
+                        tokio::spawn(refresh_one_provider(refresh_app.clone(), provider))
+                    })
+                    .await;
+                }
             }
-            _ = terminate.recv() => {
-                eprintln!("quotad: received SIGTERM, shutting down");
-                break;
-            }
+        },
+    )
+    .await;
+    let mut scheduled_refreshes = scheduled_refreshes.lock().await;
+    for task in scheduled_refreshes.drain().map(|(_, task)| task) {
+        task.abort();
+    }
+    let _ = fs::remove_file(&socket);
+    Ok(())
+}
+
+/// Accept requests and run scheduled refreshes against one persistent timer.
+/// Re-creating a sleep after every accepted connection lets continuous traffic
+/// postpone the next refresh forever.
+async fn accept_loop<S, F, Fut>(
+    listener: UnixListener,
+    app: Arc<RwLock<App>>,
+    rpc_slots: Arc<Semaphore>,
+    watch_slots: Arc<Semaphore>,
+    first_refresh: Duration,
+    shutdown: S,
+    mut refresh: F,
+) where
+    S: std::future::Future<Output = ()>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+    let mut refresh_timer = Box::pin(tokio::time::sleep(first_refresh));
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
@@ -378,39 +414,39 @@ async fn run_async(cfg: Config) -> Result<(), DaemonError> {
                     Err(e) => eprintln!("quotad: accept: {e}"),
                 }
             }
-            _ = tokio::time::sleep(wait) => {
-                // Keep this event loop polling signals and accepting socket
-                // clients while providers refresh on independent threads.
-                start_scheduled_refresh(&mut scheduled_refresh, || {
-                    tokio::spawn(refresh(app.clone()))
-                })
-                .await;
+            _ = &mut refresh_timer => {
+                refresh().await;
+                let wait = {
+                    let g = app.read().await;
+                    Duration::from_secs(g.interval_secs)
+                };
+                refresh_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + wait);
             }
         }
     }
-    if let Some(task) = scheduled_refresh {
-        task.abort();
-    }
-    let _ = fs::remove_file(&socket);
-    Ok(())
 }
 
 /// Start a scheduled refresh unless the previous one is still running. A task
 /// that finished at any point since the last tick is reaped here, so it can
 /// never suppress the next probe.
-async fn start_scheduled_refresh<S>(slot: &mut Option<tokio::task::JoinHandle<()>>, start: S)
-where
+async fn start_scheduled_refresh<S>(
+    slots: &mut HashMap<ProviderId, tokio::task::JoinHandle<()>>,
+    provider: ProviderId,
+    start: S,
+) where
     S: FnOnce() -> tokio::task::JoinHandle<()>,
 {
-    if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+    if slots.get(&provider).is_some_and(|task| !task.is_finished()) {
         return;
     }
-    if let Some(task) = slot.take() {
+    if let Some(task) = slots.remove(&provider) {
         if let Err(error) = task.await {
             eprintln!("quotad: scheduled refresh task failed: {error}");
         }
     }
-    *slot = Some(start());
+    slots.insert(provider, start());
 }
 
 fn seed_codexbar_history(store: &mut Store, cfg: &Config) {
@@ -577,8 +613,7 @@ fn prepare_socket(path: &Path) -> Result<(), DaemonError> {
 #[derive(Clone)]
 struct ProbePlan {
     timeout: u64,
-    enable_codex: bool,
-    enable_claude: bool,
+    cursor_secret_path: String,
     codex_home: Option<PathBuf>,
     claude_home: Option<PathBuf>,
     codexbar_dir: PathBuf,
@@ -588,8 +623,7 @@ struct ProbePlan {
 fn probe_plan(g: &App) -> ProbePlan {
     ProbePlan {
         timeout: g.cfg.http_timeout_secs,
-        enable_codex: g.cfg.enable_codex,
-        enable_claude: g.cfg.enable_claude,
+        cursor_secret_path: g.cfg.cursor_secret_path.clone(),
         codex_home: account_scope(g, ProviderId::Codex)
             .home
             .or_else(|| g.codex_home.clone()),
@@ -602,7 +636,7 @@ fn probe_plan(g: &App) -> ProbePlan {
 }
 
 fn provider_refresh_gates() -> HashMap<ProviderId, Arc<RefreshGate>> {
-    [ProviderId::Codex, ProviderId::Claude]
+    [ProviderId::Codex, ProviderId::Claude, ProviderId::Cursor]
         .into_iter()
         .map(|provider| (provider, Arc::new(RefreshGate::default())))
         .collect()
@@ -626,10 +660,16 @@ fn collect_provider(plan: ProbePlan, provider: ProviderId) -> ProviderSnapshot {
     };
     match provider {
         ProviderId::Codex => codex_adapter(plan).probe(&ctx),
-        ProviderId::Claude => ClaudeAdapter {
-            config_dir: plan.claude_home,
+        ProviderId::Claude => ClaudeAdapter::for_account(plan.claude_home).probe(&ctx),
+        ProviderId::Cursor => {
+            match CursorAdapter::from_keychain_first_chain(plan.cursor_secret_path) {
+                Ok(adapter) => adapter.probe(&ctx),
+                Err(error) => ProviderSnapshot::unavailable(
+                    ProviderId::Cursor,
+                    AdapterError::new("secrets_config", error.to_string()),
+                ),
+            }
         }
-        .probe(&ctx),
     }
 }
 
@@ -683,17 +723,6 @@ fn collect_codex_in_backoff(
     BackoffProbe::Owner(file.map(Box::new))
 }
 
-fn collect_snapshot(plan: ProbePlan) -> Snapshot {
-    let mut providers = Vec::new();
-    if plan.enable_codex {
-        providers.push(collect_provider(plan.clone(), ProviderId::Codex));
-    }
-    if plan.enable_claude {
-        providers.push(collect_provider(plan, ProviderId::Claude));
-    }
-    Snapshot::new(now_unix(), providers)
-}
-
 fn apply_snapshot_locked(g: &mut App, snap: Snapshot) {
     let changed = match g.store.latest() {
         Some(prev) => !same_usage(prev, &snap),
@@ -711,21 +740,6 @@ fn apply_snapshot_locked(g: &mut App, snap: Snapshot) {
 fn publish_locked(g: &mut App, snap: Snapshot) {
     let _ = g.watch_tx.send(snap.clone());
     g.store.push(snap);
-}
-
-async fn apply_snapshot(app: &Arc<RwLock<App>>, snap: Snapshot) {
-    let mut snap = snap;
-    let mut g = app.write().await;
-    for provider in &mut snap.providers {
-        ensure_rate_limit_backoff(&g, provider);
-    }
-    let now = now_unix();
-    let snap = snap.refreshed_at(now);
-    for provider in &snap.providers {
-        let scope = account_scope(&g, provider.provider);
-        record_retry_after(&mut g, scope, provider, now);
-    }
-    apply_snapshot_locked(&mut g, snap);
 }
 
 /// A 429 that names no `Retry-After` still backs that provider off, for the
@@ -887,8 +901,6 @@ async fn publish(app: &Arc<RwLock<App>>, probed: Vec<Probed>) {
             );
             continue;
         }
-        // A file-only reading of the deadline's own account shows that
-        // deadline. Anything else is a full result and states its own.
         let held = g
             .retry_after_until
             .get(&provider)
@@ -903,6 +915,24 @@ async fn publish(app: &Arc<RwLock<App>>, probed: Vec<Probed>) {
                 ensure_rate_limit_backoff(&g, &mut snapshot);
                 record_retry_after(&mut g, scope.clone(), &snapshot, now);
             }
+        }
+        if provider == ProviderId::Cursor {
+            g.last_polled.insert(provider, tokio::time::Instant::now());
+        }
+        if provider == ProviderId::Claude && push_is_current(&g, provider, now) {
+            // Keep the pushed measurements, but retain compatible OAuth-only
+            // windows from this completed probe. Dropping the whole result
+            // here loses Opus/Sonnet limits when the push arrived mid-probe.
+            if let Some(pushed) = providers
+                .iter_mut()
+                .find(|existing| existing.provider == provider)
+            {
+                if merge_oauth_windows_during_push(pushed, &snapshot, now) {
+                    applied = true;
+                }
+            }
+            claim.gate.complete(&mut claim.guard, scope);
+            continue;
         }
         match providers
             .iter_mut()
@@ -942,6 +972,7 @@ where
         let enabled = match provider {
             ProviderId::Codex => g.cfg.enable_codex,
             ProviderId::Claude => g.cfg.enable_claude,
+            ProviderId::Cursor => g.cfg.enable_cursor,
         };
         if !enabled {
             return None;
@@ -981,9 +1012,8 @@ where
 const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 
 /// Probe every enabled provider concurrently and publish them together.
-/// Every gate is observed before any is waited on, so a cycle already in
-/// flight answers this request for all of its providers. Gates are claimed in
-/// a fixed order so concurrent cycles cannot deadlock.
+/// Each provider waits on its own gate in its own future, so one provider's
+/// in-flight probe cannot delay the others from starting.
 async fn refresh_providers<F, Fut>(app: Arc<RwLock<App>>, providers: &[ProviderId], probe: F)
 where
     F: Fn(Arc<RwLock<App>>, ProviderId, ProbeMode) -> Fut,
@@ -1010,20 +1040,18 @@ async fn refresh_providers_within<F, Fut>(
             .map(|provider| observe(&g, *provider))
             .collect()
     };
-    let mut claims = Vec::new();
-    for observed in observed {
-        if let Some(claim) = observed.claim().await {
-            claims.push(claim);
-        }
-    }
+    debug_assert!(observed.len() <= 3, "there are only three quota providers");
     let (finished, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let probing = async {
-        let probe_one = |claim: Option<Claim>| {
+        let probe_one = |observed: Option<Observed>| {
             let app = &app;
             let probe = &probe;
             let finished = &finished;
             async move {
-                let Some(claim) = claim else {
+                let Some(observed) = observed else {
+                    return;
+                };
+                let Some(claim) = observed.claim().await else {
                     return;
                 };
                 let provider = claim.provider;
@@ -1034,8 +1062,12 @@ async fn refresh_providers_within<F, Fut>(
                 }
             }
         };
-        let mut claims = claims.into_iter();
-        tokio::join!(probe_one(claims.next()), probe_one(claims.next()));
+        let mut observed = observed.into_iter();
+        tokio::join!(
+            probe_one(observed.next()),
+            probe_one(observed.next()),
+            probe_one(observed.next())
+        );
         drop(finished);
     };
     let publishing = async {
@@ -1051,18 +1083,50 @@ async fn refresh_providers_within<F, Fut>(
     tokio::join!(probing, publishing);
 }
 
+/// Providers that are disabled, in backoff, or already covered by fresher
+/// evidence return without probing.
 async fn refresh(app: Arc<RwLock<App>>) {
     let providers: Vec<ProviderId> = {
         let g = app.read().await;
         [
             (ProviderId::Codex, g.cfg.enable_codex),
             (ProviderId::Claude, g.cfg.enable_claude),
+            (ProviderId::Cursor, g.cfg.enable_cursor),
         ]
         .into_iter()
-        .filter_map(|(provider, enabled)| enabled.then_some(provider))
+        .filter_map(|(provider, enabled)| (enabled && poll_due(&g, provider)).then_some(provider))
         .collect()
     };
     refresh_providers(app, &providers, probe_provider).await;
+}
+
+/// The scheduler owns one task per provider. A stalled probe keeps only its
+/// own slot occupied; healthy providers continue on each scheduled cycle.
+async fn refresh_one_provider(app: Arc<RwLock<App>>, provider: ProviderId) {
+    let due = {
+        let g = app.read().await;
+        let enabled = match provider {
+            ProviderId::Codex => g.cfg.enable_codex,
+            ProviderId::Claude => g.cfg.enable_claude,
+            ProviderId::Cursor => g.cfg.enable_cursor,
+        };
+        enabled && poll_due(&g, provider)
+    };
+    if due {
+        refresh_providers(app, &[provider], probe_provider).await;
+    }
+}
+
+/// A current statusline push already answers for Claude. Cursor's dashboard
+/// route is polled no faster than its own floor.
+fn poll_due(g: &App, provider: ProviderId) -> bool {
+    match provider {
+        ProviderId::Claude => !push_is_current(g, provider, now_unix()),
+        ProviderId::Cursor => g.last_polled.get(&provider).is_none_or(|at| {
+            at.elapsed() >= Duration::from_secs(quota_source_cursor::MIN_POLL_SECS)
+        }),
+        ProviderId::Codex => true,
+    }
 }
 
 /// After an account mutation, drop every reading, pace sample and deadline
@@ -1083,6 +1147,9 @@ fn invalidate_switched_accounts(g: &mut App, before: &HashMap<ProviderId, Accoun
     for provider in &switched {
         g.retry_after_until.remove(provider);
         g.store.forget(*provider);
+        g.pushed_at.remove(provider);
+        g.last_ring_push.remove(provider);
+        g.last_polled.remove(provider);
     }
     let Some(mut snapshot) = latest else {
         return;
@@ -1105,22 +1172,201 @@ fn invalidate_switched_accounts(g: &mut App, before: &HashMap<ProviderId, Accoun
     }
 }
 
+fn push_is_current(g: &App, provider: ProviderId, now: i64) -> bool {
+    g.pushed_at.get(&provider).is_some_and(|at| {
+        freshness_for(Some(*at), DEFAULT_READING_MAX_AGE_SECS, now) == Freshness::Current
+    })
+}
+
 fn same_usage(a: &Snapshot, b: &Snapshot) -> bool {
     if a.providers.len() != b.providers.len() {
         return false;
     }
-    a.providers.iter().zip(b.providers.iter()).all(|(x, y)| {
-        x.provider == y.provider
-            && x.status == y.status
-            && x.permission == y.permission
-            && x.windows.len() == y.windows.len()
-            && x.windows.iter().zip(y.windows.iter()).all(|(a, b)| {
-                a.kind == b.kind
-                    && a.state == b.state
-                    && a.reading == b.reading
-                    && a.reset_at == b.reset_at
-            })
-    })
+    a.providers
+        .iter()
+        .zip(b.providers.iter())
+        .all(|(x, y)| same_provider_usage(x, y))
+}
+
+fn same_provider_usage(x: &ProviderSnapshot, y: &ProviderSnapshot) -> bool {
+    x.provider == y.provider
+        && x.status == y.status
+        && x.permission == y.permission
+        && x.source == y.source
+        && x.windows.len() == y.windows.len()
+        && x.windows.iter().zip(y.windows.iter()).all(|(a, b)| {
+            a.kind == b.kind
+                && a.state == b.state
+                && a.reading == b.reading
+                && a.reset_at == b.reset_at
+        })
+}
+
+/// A statusline payload has no account identifier. Accept it only for the
+/// default Claude scope, without an environment-selected isolated config dir.
+fn push_matches_active_account(
+    g: &App,
+    provider: ProviderId,
+    env_config_dir: Option<&str>,
+) -> bool {
+    provider == ProviderId::Claude
+        && account_scope(g, provider) == AccountScope::default()
+        && !ClaudeAdapter::has_isolated_config(None, env_config_dir)
+}
+
+/// Merge the completed OAuth probe's windows into a newer statusline reading.
+/// The push owns measurements observed at or after its provider timestamp;
+/// older OAuth-only measurements keep their own original timestamps and are
+/// replaced only by a newer OAuth measurement for the same window.
+fn merge_oauth_windows_during_push(
+    pushed: &mut ProviderSnapshot,
+    oauth: &ProviderSnapshot,
+    now: i64,
+) -> bool {
+    if pushed.provider != ProviderId::Claude
+        || oauth.provider != ProviderId::Claude
+        || pushed.source != Some(quota_core::types::Source::Statusline)
+        || oauth.source != Some(quota_core::types::Source::Oauth)
+        || pushed.account_digest != oauth.account_digest
+    {
+        return false;
+    }
+
+    let pushed_observed_at = pushed.observed_at;
+    let mut oauth = oauth.clone();
+    oauth.refresh_freshness(now);
+    let mut changed = false;
+    for incoming in oauth.windows {
+        match pushed
+            .windows
+            .iter_mut()
+            .find(|current| current.kind == incoming.kind && current.label == incoming.label)
+        {
+            Some(current) => {
+                let current_is_pushed = pushed_observed_at.is_some_and(|pushed_at| {
+                    current
+                        .observed_at
+                        .is_some_and(|observed_at| observed_at >= pushed_at)
+                });
+                let incoming_is_newer = incoming
+                    .observed_at
+                    .zip(current.observed_at)
+                    .is_some_and(|(incoming_at, current_at)| incoming_at > current_at);
+                if !current_is_pushed && incoming_is_newer {
+                    *current = incoming;
+                    changed = true;
+                }
+            }
+            None => {
+                pushed.windows.push(incoming);
+                changed = true;
+            }
+        }
+    }
+    if pushed.permission != oauth.permission
+        && oauth.permission != quota_core::types::ProviderPermission::Unknown
+    {
+        pushed.permission = oauth.permission;
+        changed = true;
+    }
+    if changed {
+        pushed.refresh_freshness(now);
+    }
+    changed
+}
+
+/// Preserve current OAuth windows omitted by a statusline payload. Claude's
+/// OAuth response can include distinct Opus and Sonnet weekly limits, while
+/// the statusline reports only aggregate windows.
+fn preserve_current_oauth_windows(g: &App, pushed: &mut ProviderSnapshot, now: i64) {
+    let Some(mut oauth) = g
+        .store
+        .latest()
+        .and_then(|snapshot| snapshot.by_id(ProviderId::Claude))
+        .filter(|reading| {
+            matches!(
+                reading.source,
+                Some(quota_core::types::Source::Oauth | quota_core::types::Source::Statusline)
+            )
+        })
+        .cloned()
+    else {
+        return;
+    };
+    oauth.refresh_freshness(now);
+    if oauth.freshness != Freshness::Current {
+        return;
+    }
+    if oauth.permission != quota_core::types::ProviderPermission::Unknown {
+        pushed.permission = oauth.permission;
+    }
+    for window in oauth.windows {
+        if !pushed
+            .windows
+            .iter()
+            .any(|current| current.kind == window.kind && current.label == window.label)
+        {
+            pushed.windows.push(window);
+        }
+    }
+    pushed.refresh_freshness(now);
+}
+
+/// Fold one pushed provider snapshot into the latest snapshot. Unlike a poll
+/// it leaves the adaptive refresh interval alone, and while the numbers repeat
+/// it refreshes the newest ring entry in place so a chatty statusline cannot
+/// push other providers' history out of the ring.
+async fn apply_pushed_snapshot(
+    app: &Arc<RwLock<App>>,
+    provider: ProviderSnapshot,
+    now: i64,
+) -> bool {
+    let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    apply_pushed_snapshot_for_config(app, provider, now, env_config_dir.as_deref()).await
+}
+
+async fn apply_pushed_snapshot_for_config(
+    app: &Arc<RwLock<App>>,
+    mut provider: ProviderSnapshot,
+    now: i64,
+    env_config_dir: Option<&str>,
+) -> bool {
+    let id = provider.provider;
+    let mut g = app.write().await;
+    if !push_matches_active_account(&g, id, env_config_dir) {
+        return false;
+    }
+    preserve_current_oauth_windows(&g, &mut provider, now);
+    g.pushed_at.insert(id, now);
+    let mut providers = g
+        .store
+        .latest()
+        .map(|snapshot| snapshot.refreshed_at(now).providers)
+        .unwrap_or_default();
+    let unchanged = providers
+        .iter()
+        .find(|existing| existing.provider == id)
+        .is_some_and(|existing| same_provider_usage(existing, &provider));
+    match providers
+        .iter_mut()
+        .find(|existing| existing.provider == id)
+    {
+        Some(existing) => *existing = provider,
+        None => providers.push(provider),
+    }
+    let snapshot = Snapshot::new(now, providers).refreshed_at(now);
+    let ring_due = g
+        .last_ring_push
+        .get(&id)
+        .is_none_or(|at| now.saturating_sub(*at) >= PUSH_RING_MIN_GAP_SECS);
+    let _ = g.watch_tx.send(snapshot.clone());
+    if unchanged && !ring_due {
+        g.store.replace_latest(snapshot);
+    } else {
+        g.store.push(snapshot);
+        g.last_ring_push.insert(id, now);
+    }
+    true
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1325,6 +1571,10 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                     return Response::err(req.id, "bad_params", format!("can_start: {e}"));
                 }
             };
+            let request = match admission_request(&params) {
+                Ok(request) => request,
+                Err(message) => return Response::err(req.id, "bad_params", message),
+            };
             let g = app.read().await;
             let latest = answering_now(&g, g.snapshot_or_empty());
             let now = now_unix();
@@ -1334,13 +1584,15 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                 .iter()
                 .filter(|p| params.provider.matches(p.provider))
             {
-                answers.push(can_start(
-                    p,
-                    g.store.history_ref(),
-                    params.tokens,
-                    params.deadline,
-                    now,
-                ));
+                let history = g.store.history_ref();
+                answers.push(match request {
+                    Admission::Tokens(tokens) => {
+                        can_start(p, history, tokens, params.deadline, now)
+                    }
+                    Admission::Percent { percent, reserve } => {
+                        can_start_percent(p, history, percent, reserve, params.deadline, now)
+                    }
+                });
             }
             let available: Vec<_> = answers
                 .iter()
@@ -1348,6 +1600,33 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
                 .collect();
             let ok = !available.is_empty() && available.iter().all(|a| a.ok);
             Response::result(req.id, CanStartResult { ok, answers })
+        }
+        METHOD_OBSERVE => {
+            let params: ObserveParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Response::err(req.id, "bad_params", format!("observe: {e}")),
+            };
+            let now = now_unix();
+            match snapshot_from_push(&params, now) {
+                Ok(snapshot) => {
+                    if apply_pushed_snapshot(app, snapshot, now).await {
+                        Response::result(
+                            req.id,
+                            ObserveResult {
+                                accepted: params.windows.len(),
+                                observed_at: now,
+                            },
+                        )
+                    } else {
+                        Response::err(
+                            req.id,
+                            "account_scope",
+                            "Claude statusline has no account identity; push refused while a quota account is selected",
+                        )
+                    }
+                }
+                Err(rejection) => Response::err(req.id, rejection.code, rejection.message),
+            }
         }
         METHOD_REFRESH => {
             let params: RefreshParams = serde_json::from_value(req.params).unwrap_or_default();
@@ -1425,6 +1704,33 @@ async fn dispatch(app: &Arc<RwLock<App>>, req: Request) -> Response {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Admission {
+    Tokens(u64),
+    Percent { percent: f64, reserve: f64 },
+}
+
+/// `tokens` and `percent` are separate questions; ask exactly one.
+fn admission_request(params: &CanStartParams) -> Result<Admission, String> {
+    let Some(percent) = params.percent else {
+        if params.reserve.is_some() {
+            return Err("can_start: reserve only applies to a percent request".into());
+        }
+        return Ok(Admission::Tokens(params.tokens));
+    };
+    if params.tokens > 0 {
+        return Err("can_start: give tokens or percent, not both".into());
+    }
+    let reserve = params.reserve.unwrap_or(DEFAULT_RESERVE_PERCENT);
+    if !(percent.is_finite() && percent > 0.0 && percent <= 100.0) {
+        return Err("can_start: percent must be in (0, 100]".into());
+    }
+    if !(reserve.is_finite() && (0.0..100.0).contains(&reserve)) {
+        return Err("can_start: reserve must be in [0, 100)".into());
+    }
+    Ok(Admission::Percent { percent, reserve })
+}
+
 /// When the newest reading stops being current; a year out when none will.
 fn next_expiry_deadline(latest: Option<&Snapshot>) -> tokio::time::Instant {
     const NEVER: Duration = Duration::from_secs(365 * 24 * 3600);
@@ -1482,11 +1788,23 @@ fn reading_answers_now(g: &App, reading: &ProviderSnapshot) -> bool {
     match reading.provider {
         ProviderId::Codex => codex_adapter(plan).answers_for_active_account(taken_for),
         ProviderId::Claude => {
-            let active = ClaudeAdapter {
-                config_dir: plan.claude_home,
+            if reading.source == Some(quota_core::types::Source::Statusline) {
+                // A statusline push has no provider identity. It is bound to
+                // the default Claude scope at acceptance; an explicit Claude
+                // account or an isolated CLAUDE_CONFIG_DIR rejects pushes.
+                let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+                return account_scope(g, ProviderId::Claude) == AccountScope::default()
+                    && !ClaudeAdapter::has_isolated_config(None, env_config_dir.as_deref());
             }
-            .active_identity();
+            let active = ClaudeAdapter::for_account(plan.claude_home)
+                .active_identity_for(reading.credential_path.as_deref());
             reading_answers_for_active_account(taken_for, &active, Vec::new)
+        }
+        // Cursor does not expose a stable account identity. A selected quota
+        // account is attached to its refresh scope and is invalidated on a
+        // switch; the current session therefore behaves as an unnamed source.
+        ProviderId::Cursor => {
+            reading_answers_for_active_account(taken_for, &ActiveIdentity::Unnamed, Vec::new)
         }
     }
 }
@@ -1547,6 +1865,9 @@ async fn write_frame_timed<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use quota_core::protocol::{METHOD_PING, METHOD_VERSION};
+
+    /// A push outranks polling while its reading is current: the core max age.
+    const PUSH_PRECEDENCE_SECS: i64 = DEFAULT_READING_MAX_AGE_SECS as i64;
     use quota_core::types::{AdapterError, ProviderId, ProviderObservation, ProviderSnapshot};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
@@ -1677,9 +1998,76 @@ mod tests {
             accounts: AccountStore::load(accounts_path),
             cfg,
             watch_tx,
+            pushed_at: HashMap::new(),
+            last_ring_push: HashMap::new(),
+            last_polled: HashMap::new(),
             codex_home: Some(dir.join("codex")),
             claude_home: Some(dir.join("claude")),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_refresh_timer_ticks_during_continuous_socket_traffic() {
+        let dir = unique_test_dir("quota-accept-loop");
+        let socket = dir.join("quotad.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let app = Arc::new(RwLock::new(test_app_in(&dir)));
+        app.write().await.interval_secs = 1;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let observed_ticks = ticks.clone();
+        let server = tokio::spawn(accept_loop(
+            listener,
+            app,
+            Arc::new(Semaphore::new(MAX_RPC_CLIENTS)),
+            Arc::new(Semaphore::new(MAX_WATCH_CLIENTS)),
+            Duration::from_millis(25),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move || {
+                observed_ticks.fetch_add(1, Ordering::Relaxed);
+                async {}
+            },
+        ));
+
+        let traffic_socket = socket.clone();
+        let traffic = tokio::spawn(async move {
+            let stop = std::time::Instant::now() + Duration::from_millis(1_150);
+            let mut requests = 0;
+            while std::time::Instant::now() < stop {
+                let mut stream = UnixStream::connect(&traffic_socket).await.unwrap();
+                let request = serde_json::to_vec(&Request::new(requests, METHOD_PING)).unwrap();
+                stream
+                    .write_all(&encode_frame(&request).unwrap())
+                    .await
+                    .unwrap();
+                let payload = read_frame_async(&mut stream).await.unwrap();
+                let response: Response = serde_json::from_slice(&payload).unwrap();
+                assert!(response.ok);
+                requests += 1;
+            }
+            requests
+        });
+        let requests = tokio::time::timeout(Duration::from_secs(3), traffic)
+            .await
+            .expect("socket traffic completed")
+            .expect("traffic task completed");
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("accept loop shut down")
+            .expect("accept loop task completed");
+
+        assert!(
+            requests >= 10,
+            "test must sustain socket traffic: {requests}"
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 2,
+            "scheduled refreshes were starved during traffic"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Claude credentials in `test_app_in(dir)`'s Claude dir. Like every
@@ -2212,6 +2600,8 @@ mod tests {
             METHOD_CAN_START,
             quota_core::CanStartParams {
                 tokens: 50_000,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::All,
             },
@@ -2256,6 +2646,716 @@ mod tests {
         assert!(!blob.contains("rt-secret"));
         assert!(!blob.contains("hunter2"));
         assert!(!blob.contains("access_token"));
+    }
+
+    fn observe_request(id: u64, used: f64) -> Request {
+        Request::with_params(
+            id,
+            METHOD_OBSERVE,
+            serde_json::json!({
+                "schema": 1,
+                "provider": "claude",
+                "source": "statusline",
+                "windows": [{
+                    "kind": "five_hour", "label": "5h", "used_percent": used,
+                    "reset_at": now_unix() + 7_200, "limit_window_seconds": 18_000
+                }]
+            }),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_becomes_current_claude_evidence_and_outranks_polling() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let before = app.read().await.interval_secs;
+        assert!(poll_due(&*app.read().await, ProviderId::Claude));
+
+        let resp = dispatch(&app, observe_request(1, 34.0)).await;
+        assert!(resp.ok, "{resp:?}");
+        let result: ObserveResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.accepted, 1);
+
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.status, Availability::Ok);
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+        assert!(
+            !poll_due(&g, ProviderId::Claude),
+            "fresh push must beat OAuth polling"
+        );
+        assert_eq!(
+            g.interval_secs, before,
+            "a push never retunes the poll cadence"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statusline_push_is_refused_for_an_explicit_claude_account() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let add = Request::with_params(
+            1,
+            METHOD_ACCOUNTS_ADD,
+            quota_core::AccountsAddParams {
+                id: Some("isolated-claude".into()),
+                provider: ProviderId::Claude,
+                email: None,
+                workspace_label: Some("isolated".into()),
+                login_method: None,
+                workspace_account_id: None,
+                secret_ref: None,
+                home_path: None,
+                select: true,
+            },
+        );
+        assert!(dispatch(&app, add).await.ok);
+
+        let response = dispatch(&app, observe_request(2, 34.0)).await;
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "account_scope");
+        let g = app.read().await;
+        assert!(g.snapshot_or_empty().by_id(ProviderId::Claude).is_none());
+        assert!(!g.pushed_at.contains_key(&ProviderId::Claude));
+        assert!(poll_due(&g, ProviderId::Claude));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statusline_push_is_refused_for_an_environment_isolated_claude_config() {
+        use quota_core::protocol::ObserveParams;
+
+        let app = Arc::new(RwLock::new(test_app()));
+        apply_provider_snapshot(&app, observed_reading(ProviderId::Claude, 12.0)).await;
+        let before = app.read().await.store.latest().cloned().unwrap();
+        let params: ObserveParams =
+            serde_json::from_value(observe_request(2, 34.0).params).unwrap();
+        let pushed = snapshot_from_push(&params, now_unix()).unwrap();
+
+        assert!(
+            !apply_pushed_snapshot_for_config(
+                &app,
+                pushed,
+                now_unix(),
+                Some("/tmp/claude-isolated-fixture"),
+            )
+            .await
+        );
+
+        let g = app.read().await;
+        assert_eq!(g.store.latest(), Some(&before));
+        assert!(!g.pushed_at.contains_key(&ProviderId::Claude));
+        assert!(poll_due(&g, ProviderId::Claude));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statusline_push_preserves_current_opus_and_sonnet_oauth_windows() {
+        use quota_core::types::{ProviderPermission, Source, UsageWindow, WindowKind};
+
+        let app = Arc::new(RwLock::new(test_app()));
+        let now = now_unix();
+        let oauth = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(Source::Oauth),
+            windows: vec![
+                UsageWindow::from_percent_at(
+                    WindowKind::Extra,
+                    "opus weekly",
+                    35.0,
+                    Some(now + 7 * 24 * 60 * 60),
+                    Some(7 * 24 * 60 * 60),
+                    Some(now),
+                    DEFAULT_READING_MAX_AGE_SECS,
+                ),
+                UsageWindow::from_percent_at(
+                    WindowKind::Extra,
+                    "sonnet weekly",
+                    100.0,
+                    Some(now + 7 * 24 * 60 * 60),
+                    Some(7 * 24 * 60 * 60),
+                    Some(now),
+                    DEFAULT_READING_MAX_AGE_SECS,
+                ),
+            ],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+            permission: ProviderPermission::Allowed,
+        });
+        apply_provider_snapshot(&app, oauth).await;
+
+        let response = dispatch(&app, observe_request(3, 34.0)).await;
+        assert!(response.ok, "{response:?}");
+        let original_observed_at: HashMap<_, _> = {
+            let g = app.read().await;
+            let snapshot = g.snapshot_or_empty();
+            let claude = snapshot.by_id(ProviderId::Claude).unwrap();
+            assert_eq!(claude.source, Some(Source::Statusline));
+            ["opus weekly", "sonnet weekly"]
+                .into_iter()
+                .map(|label| {
+                    let window = claude
+                        .windows
+                        .iter()
+                        .find(|window| window.label == label)
+                        .unwrap();
+                    (label, window.observed_at)
+                })
+                .collect()
+        };
+        assert_eq!(original_observed_at["opus weekly"], Some(now));
+        assert_eq!(original_observed_at["sonnet weekly"], Some(now));
+
+        let second = dispatch(&app, observe_request(4, 35.0)).await;
+        assert!(second.ok, "{second:?}");
+        {
+            let g = app.read().await;
+            let claude = g
+                .snapshot_or_empty()
+                .by_id(ProviderId::Claude)
+                .cloned()
+                .unwrap();
+            assert_eq!(claude.source, Some(Source::Statusline));
+            for label in ["opus weekly", "sonnet weekly"] {
+                let preserved = claude
+                    .windows
+                    .iter()
+                    .find(|window| window.label == label)
+                    .unwrap();
+                assert_eq!(preserved.observed_at, original_observed_at[label]);
+            }
+        }
+
+        let response = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(
+            !result.ok,
+            "the exhausted Sonnet window must veto admission"
+        );
+        assert_eq!(result.answers[0].window_kind, Some(WindowKind::Extra));
+        assert!(result.answers[0].explanation.contains("sonnet weekly"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_during_oauth_probe_keeps_new_push_and_merges_exhausted_sonnet_limit() {
+        use quota_core::types::{ProviderPermission, Source, UsageWindow, WindowKind};
+
+        let app = Arc::new(RwLock::new(test_app()));
+        let probe_observed_at = now_unix();
+        let oauth = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(Source::Oauth),
+            windows: vec![
+                UsageWindow::from_percent_at(
+                    WindowKind::FiveHour,
+                    "5h",
+                    15.0,
+                    None,
+                    Some(18_000),
+                    Some(probe_observed_at),
+                    DEFAULT_READING_MAX_AGE_SECS,
+                ),
+                UsageWindow::from_percent_at(
+                    WindowKind::Extra,
+                    "opus weekly",
+                    35.0,
+                    None,
+                    Some(604_800),
+                    Some(probe_observed_at),
+                    DEFAULT_READING_MAX_AGE_SECS,
+                ),
+                UsageWindow::from_percent_at(
+                    WindowKind::Extra,
+                    "sonnet weekly",
+                    100.0,
+                    None,
+                    Some(604_800),
+                    Some(probe_observed_at),
+                    DEFAULT_READING_MAX_AGE_SECS,
+                ),
+            ],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(probe_observed_at),
+            max_age_secs: DEFAULT_READING_MAX_AGE_SECS,
+            permission: ProviderPermission::Unknown,
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let probe_app = app.clone();
+        let poll = tokio::spawn(async move {
+            refresh_provider_with(probe_app, ProviderId::Claude, move |_, _mode| async move {
+                let _ = started_tx.send(());
+                complete_rx.await.ok()
+            })
+            .await;
+        });
+
+        started_rx.await.expect("OAuth probe started");
+        assert!(dispatch(&app, observe_request(5, 34.0)).await.ok);
+        let pushed_at = {
+            let g = app.read().await;
+            g.snapshot_or_empty()
+                .by_id(ProviderId::Claude)
+                .unwrap()
+                .windows[0]
+                .observed_at
+                .unwrap()
+        };
+        complete_tx.send(oauth).expect("complete OAuth probe");
+        poll.await.expect("poll task completed");
+
+        let shown = claude_status(&app).await;
+        assert_eq!(shown.source, Some(Source::Statusline));
+        let pushed_five_hour = shown
+            .windows
+            .iter()
+            .find(|window| window.label == "5h")
+            .unwrap();
+        assert_eq!(pushed_five_hour.used_percent, Some(34.0));
+        assert_eq!(pushed_five_hour.observed_at, Some(pushed_at));
+        for label in ["opus weekly", "sonnet weekly"] {
+            assert_eq!(
+                shown
+                    .windows
+                    .iter()
+                    .find(|window| window.label == label)
+                    .unwrap()
+                    .observed_at,
+                Some(probe_observed_at),
+                "OAuth timestamps must survive the merge"
+            );
+        }
+
+        let response = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(!result.ok, "exhausted Sonnet must veto admission");
+        assert_eq!(result.answers[0].window_kind, Some(WindowKind::Extra));
+        assert!(result.answers[0].explanation.contains("sonnet weekly"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_flight_poll_never_overwrites_a_push_that_landed_during_it() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(poll_due(&*app.read().await, ProviderId::Claude));
+        refresh_provider_with(app.clone(), ProviderId::Claude, |app, _mode| async move {
+            assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+            let mut polled = ProviderSnapshot::unavailable(
+                ProviderId::Claude,
+                AdapterError::new("http_401", "token expired"),
+            );
+            polled.source = Some(quota_core::types::Source::Oauth);
+            Some(polled)
+        })
+        .await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.status, Availability::Ok);
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_poll_snapshot_keeps_a_current_push() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+        let polled = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("http_401", "token expired"),
+        );
+        refresh_provider_with(
+            app.clone(),
+            ProviderId::Claude,
+            move |_, _mode| async move { Some(polled) },
+        )
+        .await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.source, Some(quota_core::types::Source::Statusline));
+        assert_eq!(claude.windows[0].used_percent, Some(34.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_poll_replaces_a_push_once_the_push_is_no_longer_current() {
+        let app = Arc::new(RwLock::new(test_app()));
+        assert!(dispatch(&app, observe_request(1, 34.0)).await.ok);
+        let stale = now_unix() - PUSH_PRECEDENCE_SECS - 1;
+        app.write()
+            .await
+            .pushed_at
+            .insert(ProviderId::Claude, stale);
+        let polled = ProviderSnapshot::unavailable(
+            ProviderId::Claude,
+            AdapterError::new("http_401", "token expired"),
+        );
+        apply_provider_snapshot(&app, polled).await;
+        let g = app.read().await;
+        let claude = g
+            .snapshot_or_empty()
+            .by_id(ProviderId::Claude)
+            .cloned()
+            .unwrap();
+        assert_eq!(claude.status, Availability::Unavailable);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn polling_resumes_once_the_push_is_no_longer_current() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let mut g = app.write().await;
+        let stale = now_unix() - PUSH_PRECEDENCE_SECS - 1;
+        g.pushed_at.insert(ProviderId::Claude, stale);
+        assert!(poll_due(&g, ProviderId::Claude));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_precedence_and_reading_freshness_agree_at_the_max_age_boundary() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let mut g = app.write().await;
+        let now = now_unix();
+        for (age, current) in [
+            (PUSH_PRECEDENCE_SECS - 1, true),
+            (PUSH_PRECEDENCE_SECS, true),
+            (PUSH_PRECEDENCE_SECS + 1, false),
+            (-1, false),
+        ] {
+            g.pushed_at.insert(ProviderId::Claude, now - age);
+            assert_eq!(
+                push_is_current(&g, ProviderId::Claude, now),
+                current,
+                "push at age {age}"
+            );
+            let reading = freshness_for(Some(now - age), DEFAULT_READING_MAX_AGE_SECS, now);
+            assert_eq!(
+                reading == Freshness::Current,
+                current,
+                "reading at age {age}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_identical_pushes_do_not_evict_ring_history() {
+        let app = Arc::new(RwLock::new(test_app()));
+        for id in 0..10 {
+            assert!(dispatch(&app, observe_request(id, 34.0)).await.ok);
+        }
+        let g = app.read().await;
+        assert_eq!(
+            g.store.history_ref().len(),
+            2,
+            "seed entry plus one pushed entry, not one per push"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_push_takes_a_new_ring_entry_for_pace_history() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        dispatch(&app, observe_request(2, 35.0)).await;
+        assert_eq!(app.read().await.store.history_ref().len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_pushes_are_refused_with_codes_and_store_nothing() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let mut req = observe_request(1, 34.0);
+        req.params["schema"] = serde_json::json!(9);
+        let resp = dispatch(&app, req).await;
+        assert_eq!(resp.error.unwrap().code, "unsupported_schema");
+        let resp = dispatch(
+            &app,
+            Request::with_params(2, METHOD_OBSERVE, serde_json::json!({"x": 1})),
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "bad_params");
+        let g = app.read().await;
+        assert!(g.snapshot_or_empty().by_id(ProviderId::Claude).is_none());
+    }
+
+    fn can_start_request(params: serde_json::Value) -> Request {
+        Request::with_params(9, METHOD_CAN_START, params)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statusline_push_with_a_malformed_weekly_bucket_refuses_percent_admission() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let parsed = quota_source_claude_statusline::parse(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":4102444800},"seven_day":"soon"}}"#,
+        )
+        .unwrap();
+        let push = Request::with_params(1, METHOD_OBSERVE, parsed.observe_params().unwrap());
+        assert!(dispatch(&app, push).await.ok);
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(
+            result.answers[0].window_kind,
+            Some(quota_core::types::WindowKind::Weekly)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pushed_spend_limit_reads_back_from_status_as_a_coherent_usd_window() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/claude-statusline/spend-2.1.284.json"),
+        )
+        .unwrap();
+        let parsed = quota_source_claude_statusline::parse(&fixture).unwrap();
+        let push = Request::with_params(1, METHOD_OBSERVE, parsed.observe_params().unwrap());
+        assert!(dispatch(&app, push).await.ok);
+        let resp = dispatch(
+            &app,
+            Request::with_params(
+                2,
+                METHOD_STATUS,
+                StatusParams {
+                    provider: ProviderFilter::Claude,
+                },
+            ),
+        )
+        .await;
+        let status = resp.result.unwrap();
+        let spend = status["snapshot"]["providers"][0]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["kind"] == "spend")
+            .unwrap()
+            .clone();
+        for money in [&spend, &spend["reading"]] {
+            assert_eq!(money["unit"], "usd", "{spend}");
+            assert_eq!(money["used_usd"], 271.4, "{spend}");
+            assert_eq!(money["limit_usd"], 500.0, "{spend}");
+            assert_eq!(money["limit"], 500.0, "{spend}");
+            assert_eq!(money["remaining"], 500.0 - 271.4, "{spend}");
+        }
+        assert_eq!(spend["used_percent"], 271.4 / 500.0 * 100.0, "{spend}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn percent_admission_runs_through_dispatch_on_pushed_evidence() {
+        let app = Arc::new(RwLock::new(test_app()));
+        dispatch(&app, observe_request(1, 34.0)).await;
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 10.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(result.ok, "{result:?}");
+        assert_eq!(
+            result.answers[0].basis,
+            quota_core::types::CanStartBasis::PercentBudget
+        );
+
+        let resp = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 65.0, "provider": "claude"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.ok);
+        let admission = result.answers[0].admission.clone().unwrap();
+        assert!(!admission.headroom_ok);
+        assert_eq!(admission.reserve_percent, 2.0);
+
+        let resp = dispatch(
+            &app,
+            can_start_request(
+                serde_json::json!({"percent": 65.0, "reserve": 0.5, "provider": "claude"}),
+            ),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(result.ok, "reserve is the caller's to lower: {result:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn percent_aggregate_keeps_an_all_unreadable_provider_veto() {
+        use quota_core::types::{
+            ProviderObservation, ProviderPermission, Source, UsageWindow, WindowKind,
+        };
+
+        let dir = unique_test_dir("quota-percent-unreadable-all");
+        write_claude_credentials(&dir);
+        let app = Arc::new(RwLock::new(test_app_in(&dir)));
+        let now = now_unix();
+        let claude = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(Source::Oauth),
+            windows: vec![UsageWindow::unreadable(
+                WindowKind::Weekly,
+                "sonnet weekly",
+                None,
+                Some(604_800),
+                Some(now),
+                300,
+            )],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 300,
+            permission: ProviderPermission::Unknown,
+        });
+        assert_eq!(claude.status, Availability::Unavailable);
+        apply_provider_snapshot(&app, claude).await;
+        apply_provider_snapshot(&app, observed_reading(ProviderId::Cursor, 10.0)).await;
+
+        let response = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "all"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(
+            !result.ok,
+            "the approving Cursor reading cannot mask Claude"
+        );
+        let claude = result
+            .answers
+            .iter()
+            .find(|answer| answer.provider == ProviderId::Claude)
+            .unwrap();
+        assert_eq!(
+            claude.basis,
+            quota_core::types::CanStartBasis::UnknownWindow
+        );
+        assert_eq!(claude.window_kind, Some(WindowKind::Weekly));
+        let cursor = result
+            .answers
+            .iter()
+            .find(|answer| answer.provider == ProviderId::Cursor)
+            .unwrap();
+        assert!(cursor.ok);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn percent_aggregate_keeps_a_mixed_readable_unreadable_provider_veto() {
+        use quota_core::types::{
+            ProviderObservation, ProviderPermission, Source, UsageWindow, WindowKind,
+        };
+
+        let dir = unique_test_dir("quota-percent-unreadable-mixed");
+        write_claude_credentials(&dir);
+        let app = Arc::new(RwLock::new(test_app_in(&dir)));
+        let now = now_unix();
+        let claude = ProviderSnapshot::observed(ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(Source::Oauth),
+            windows: vec![
+                UsageWindow::from_percent_at(
+                    WindowKind::FiveHour,
+                    "5h",
+                    10.0,
+                    Some(now + 18_000),
+                    Some(18_000),
+                    Some(now),
+                    300,
+                ),
+                UsageWindow::unreadable(
+                    WindowKind::Weekly,
+                    "sonnet weekly",
+                    None,
+                    Some(604_800),
+                    Some(now),
+                    300,
+                ),
+            ],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 300,
+            permission: ProviderPermission::Unknown,
+        });
+        assert_eq!(claude.status, Availability::Ok);
+        apply_provider_snapshot(&app, claude).await;
+        apply_provider_snapshot(&app, observed_reading(ProviderId::Cursor, 10.0)).await;
+
+        let response = dispatch(
+            &app,
+            can_start_request(serde_json::json!({"percent": 1.0, "provider": "all"})),
+        )
+        .await;
+        let result: CanStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(
+            !result.ok,
+            "a readable Claude window cannot vouch for the weekly limit"
+        );
+        let claude = result
+            .answers
+            .iter()
+            .find(|answer| answer.provider == ProviderId::Claude)
+            .unwrap();
+        assert_eq!(
+            claude.basis,
+            quota_core::types::CanStartBasis::UnknownWindow
+        );
+        assert_eq!(claude.window_kind, Some(WindowKind::Weekly));
+        let cursor = result
+            .answers
+            .iter()
+            .find(|answer| answer.provider == ProviderId::Cursor)
+            .unwrap();
+        assert!(cursor.ok);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn admission_request_rejects_mixed_and_out_of_range_questions() {
+        let ask = |v: serde_json::Value| admission_request(&serde_json::from_value(v).unwrap());
+        assert!(matches!(
+            ask(serde_json::json!({"tokens": 5})),
+            Ok(Admission::Tokens(5))
+        ));
+        assert!(ask(serde_json::json!({"tokens": 5, "percent": 1.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 0.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 100.5})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0, "reserve": 100.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0, "reserve": -1.0})).is_err());
+        assert!(ask(serde_json::json!({"reserve": 1.0})).is_err());
+        assert!(ask(serde_json::json!({"percent": 5.0})).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cursor_is_polled_no_faster_than_its_floor() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let mut g = app.write().await;
+        assert!(poll_due(&g, ProviderId::Cursor), "never polled yet");
+        g.last_polled
+            .insert(ProviderId::Cursor, tokio::time::Instant::now());
+        assert!(!poll_due(&g, ProviderId::Cursor));
     }
 
     fn observed_reading(provider: ProviderId, used: f64) -> ProviderSnapshot {
@@ -2378,31 +3478,146 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn greptile_4_provider_schedule_restarts_healthy_slots_while_another_stalls() {
+        let mut slots = HashMap::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        start_scheduled_refresh(&mut slots, ProviderId::Codex, || {
+            tokio::spawn(async move {
+                let _ = release_rx.await;
+            })
+        })
+        .await;
+        let mut healthy_starts = 0;
+        for _ in 0..2 {
+            let codex = slots.get(&ProviderId::Codex).unwrap();
+            assert!(!codex.is_finished());
+            start_scheduled_refresh(&mut slots, ProviderId::Claude, || {
+                healthy_starts += 1;
+                tokio::spawn(async {})
+            })
+            .await;
+            while !slots.get(&ProviderId::Claude).unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(healthy_starts, 2);
+        assert!(!slots.get(&ProviderId::Codex).unwrap().is_finished());
+        let _ = release_tx.send(());
+        for task in slots.into_values() {
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn greptile_4_refresh_claims_and_probes_are_independent_per_provider() {
+        let app = Arc::new(RwLock::new(test_app()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held = tokio::spawn(refresh_provider_with(
+            app.clone(),
+            ProviderId::Codex,
+            move |_, _| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Some(observed_reading(ProviderId::Codex, 25.0))
+            },
+        ));
+        started_rx.await.unwrap();
+
+        let healthy_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cycle_probes = healthy_probes.clone();
+        let mixed_cycle = tokio::spawn(refresh_providers_within(
+            app.clone(),
+            &[ProviderId::Codex, ProviderId::Claude],
+            Duration::ZERO,
+            move |_, provider, _| {
+                let cycle_probes = cycle_probes.clone();
+                async move {
+                    if provider == ProviderId::Claude {
+                        cycle_probes.fetch_add(1, Ordering::Relaxed);
+                        Some(observed_reading(ProviderId::Claude, 25.0))
+                    } else {
+                        None
+                    }
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while healthy_probes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Claude starts while the Codex claim is held");
+        assert!(!mixed_cycle.is_finished());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let g = app.read().await;
+                if g.refresh_gates[&ProviderId::Claude]
+                    .completed
+                    .try_lock()
+                    .is_ok()
+                {
+                    break;
+                }
+                drop(g);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the finished Claude probe releases its own gate");
+
+        for _ in 0..2 {
+            let healthy_probes = healthy_probes.clone();
+            refresh_providers_within(
+                app.clone(),
+                &[ProviderId::Claude],
+                Duration::ZERO,
+                move |_, _, _| {
+                    healthy_probes.fetch_add(1, Ordering::Relaxed);
+                    async { Some(observed_reading(ProviderId::Claude, 25.0)) }
+                },
+            )
+            .await;
+        }
+        assert_eq!(healthy_probes.load(Ordering::Relaxed), 3);
+        assert!(!held.is_finished());
+
+        let _ = release_tx.send(());
+        held.await.unwrap();
+        mixed_cycle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn greptile_4_finished_scheduled_refresh_does_not_block_the_next() {
-        let mut slot = Some(tokio::spawn(async {}));
-        while !slot.as_ref().unwrap().is_finished() {
+        let mut slots = HashMap::new();
+        start_scheduled_refresh(&mut slots, ProviderId::Claude, || tokio::spawn(async {})).await;
+        while !slots.get(&ProviderId::Claude).unwrap().is_finished() {
             tokio::task::yield_now().await;
         }
         let mut started = 0;
-        start_scheduled_refresh(&mut slot, || {
+        start_scheduled_refresh(&mut slots, ProviderId::Claude, || {
             started += 1;
             tokio::spawn(async {})
         })
         .await;
         assert_eq!(started, 1);
-        assert!(slot.is_some());
+        assert!(slots.contains_key(&ProviderId::Claude));
 
         let (_hold, wait) = tokio::sync::oneshot::channel::<()>();
-        slot = Some(tokio::spawn(async move {
-            let _ = wait.await;
-        }));
-        start_scheduled_refresh(&mut slot, || {
+        slots.insert(
+            ProviderId::Claude,
+            tokio::spawn(async move {
+                let _ = wait.await;
+            }),
+        );
+        start_scheduled_refresh(&mut slots, ProviderId::Claude, || {
             started += 1;
             tokio::spawn(async {})
         })
         .await;
         assert_eq!(started, 1, "a running refresh is not duplicated");
-        slot.take().unwrap().abort();
+        slots.remove(&ProviderId::Claude).unwrap().abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2491,8 +3706,7 @@ mod tests {
     fn file_only_plan(home: &Path) -> ProbePlan {
         ProbePlan {
             timeout: 1,
-            enable_codex: true,
-            enable_claude: false,
+            cursor_secret_path: "cursor/session".into(),
             codex_home: Some(home.to_path_buf()),
             claude_home: None,
             codexbar_dir: quota_adapters::codexbar::workspace_fixtures_dir(),
@@ -2627,6 +3841,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens: 0,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::All,
             },
@@ -3205,6 +4421,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens: 0,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::Claude,
             },
@@ -3262,6 +4480,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::Codex,
             },
@@ -3592,6 +4812,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens: 0,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::All,
             },
@@ -3816,6 +5038,8 @@ mod tests {
             METHOD_CAN_START,
             CanStartParams {
                 tokens: 0,
+                percent: None,
+                reserve: None,
                 deadline: None,
                 provider: ProviderFilter::Claude,
             },

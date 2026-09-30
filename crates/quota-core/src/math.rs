@@ -6,9 +6,12 @@
 use std::collections::HashSet;
 
 use crate::types::{
-    Availability, CanStartAnswer, CanStartBasis, Freshness, PaceReport, ProviderId,
-    ProviderSnapshot, Snapshot, UsageWindow, WindowKind, WindowState,
+    Availability, CanStartAnswer, CanStartBasis, Freshness, PaceReport, PercentAdmission,
+    ProviderId, ProviderSnapshot, Snapshot, UsageWindow, WindowKind, WindowState,
 };
+
+/// Percent that must stay untouched after an admitted job unless the caller says otherwise.
+pub const DEFAULT_RESERVE_PERCENT: f64 = 2.0;
 
 /// Drop samples that look like a window reset (used_percent fell by more than
 /// `RESET_DROP`) and keep the last contiguous run.
@@ -61,6 +64,7 @@ fn kind_rank(kind: &WindowKind) -> u8 {
         WindowKind::Weekly => 2,
         WindowKind::Monthly => 3,
         WindowKind::Extra => 4,
+        WindowKind::Spend => 5,
     }
 }
 
@@ -109,15 +113,90 @@ fn unavailable_answer(provider: ProviderId, explanation: String) -> CanStartAnsw
         reset_at: None,
         eta_empty_secs: None,
         burn_percent_per_hour: None,
+        admission: None,
     }
 }
 
-/// Samples of `kind` from readings of the same provider account as `latest`.
+/// Shared refusal precedence for token and percent admission. In particular,
+/// a reported unreadable window stays a veto even when the provider marks the
+/// whole response unavailable because every measurement was unreadable.
+fn eligibility_refusal(latest: &ProviderSnapshot) -> Option<CanStartAnswer> {
+    if latest.is_for_another_account() {
+        return Some(CanStartAnswer {
+            provider: latest.provider,
+            ok: false,
+            basis: CanStartBasis::AccountChanged,
+            explanation: format!(
+                "{} account changed since reading; its quota is unknown until a refresh",
+                latest.provider
+            ),
+            window_kind: None,
+            remaining_percent: None,
+            remaining_tokens: None,
+            reset_at: None,
+            eta_empty_secs: None,
+            burn_percent_per_hour: None,
+            admission: None,
+        });
+    }
+    if latest.status == Availability::Stale || latest.freshness == Freshness::Stale {
+        return Some(unavailable_answer(
+            latest.provider,
+            availability_message(latest),
+        ));
+    }
+    if latest.permission == crate::types::ProviderPermission::LimitReached {
+        return Some(unavailable_answer(
+            latest.provider,
+            "provider permission is limit_reached".to_string(),
+        ));
+    }
+    let unknown: Vec<&UsageWindow> = latest
+        .windows
+        .iter()
+        .filter(|window| window.state == WindowState::Unknown)
+        .collect();
+    if let Some(first) = unknown.first() {
+        let labels: Vec<&str> = unknown.iter().map(|window| window.label.as_str()).collect();
+        return Some(CanStartAnswer {
+            provider: latest.provider,
+            ok: false,
+            basis: CanStartBasis::UnknownWindow,
+            explanation: format!(
+                "{} {} has no readable measurement and may be exhausted",
+                latest.provider,
+                labels.join(", ")
+            ),
+            window_kind: Some(first.kind.clone()),
+            remaining_percent: None,
+            remaining_tokens: None,
+            reset_at: first.reset_at,
+            eta_empty_secs: None,
+            burn_percent_per_hour: None,
+            admission: None,
+        });
+    }
+    if latest.status != Availability::Ok {
+        return Some(unavailable_answer(
+            latest.provider,
+            availability_message(latest),
+        ));
+    }
+    None
+}
+
+/// Samples of one window from readings of the same provider account as `latest`.
 /// Another account's readings never feed this account's pace; a reading whose
 /// account is unknown matches only a latest reading whose account is unknown.
 /// `history` must hold only readings of the active quota account: an unknown
 /// provider account cannot tell two quota accounts apart.
-fn samples_for<'a, I>(history: I, latest: &ProviderSnapshot, kind: &WindowKind) -> Vec<(i64, f64)>
+/// A window is identified by kind *and* label so Cursor included/on-demand
+/// and Claude Opus/Sonnet weekly limits cannot borrow each other's burn.
+fn samples_for<'a, I>(
+    history: I,
+    latest: &ProviderSnapshot,
+    window: &UsageWindow,
+) -> Vec<(i64, f64)>
 where
     I: IntoIterator<Item = &'a Snapshot>,
 {
@@ -133,7 +212,11 @@ where
             .by_id(latest.provider)
             .filter(|p| p.account_digest == latest.account_digest)
         {
-            if let Some(w) = p.window(kind) {
+            if let Some(w) = p
+                .windows
+                .iter()
+                .find(|w| w.kind == window.kind && w.label == window.label)
+            {
                 if let (Some(observed_at), Some(used)) =
                     (w.observed_at.or(p.observed_at), w.used_percent)
                 {
@@ -179,7 +262,7 @@ where
             explanation: "no readable usage windows in last snapshot".to_string(),
         };
     };
-    let samples = samples_for(history, latest, &window.kind);
+    let samples = samples_for(history, latest, window);
     let burn = burn_percent_per_sec(&samples);
     let burn_hour = burn.map(|b| b * 3600.0);
     let rem = window.remaining_percent.unwrap_or(0.0);
@@ -235,58 +318,8 @@ pub fn can_start<'a, I>(
 where
     I: IntoIterator<Item = &'a Snapshot>,
 {
-    if latest.is_for_another_account() {
-        return CanStartAnswer {
-            provider: latest.provider,
-            ok: false,
-            basis: CanStartBasis::AccountChanged,
-            explanation: format!(
-                "{} account changed since reading; its quota is unknown until a refresh",
-                latest.provider
-            ),
-            window_kind: None,
-            remaining_percent: None,
-            remaining_tokens: None,
-            reset_at: None,
-            eta_empty_secs: None,
-            burn_percent_per_hour: None,
-        };
-    }
-    if latest.status == Availability::Stale || latest.freshness == Freshness::Stale {
-        return unavailable_answer(latest.provider, availability_message(latest));
-    }
-    if latest.permission == crate::types::ProviderPermission::LimitReached {
-        return unavailable_answer(
-            latest.provider,
-            "provider permission is limit_reached".to_string(),
-        );
-    }
-    let unknown: Vec<&UsageWindow> = latest
-        .windows
-        .iter()
-        .filter(|w| w.state == WindowState::Unknown)
-        .collect();
-    if let Some(first) = unknown.first() {
-        let labels: Vec<&str> = unknown.iter().map(|w| w.label.as_str()).collect();
-        return CanStartAnswer {
-            provider: latest.provider,
-            ok: false,
-            basis: CanStartBasis::UnknownWindow,
-            explanation: format!(
-                "{} {} has no readable measurement and may be exhausted",
-                latest.provider,
-                labels.join(", ")
-            ),
-            window_kind: Some(first.kind.clone()),
-            remaining_percent: None,
-            remaining_tokens: None,
-            reset_at: first.reset_at,
-            eta_empty_secs: None,
-            burn_percent_per_hour: None,
-        };
-    }
-    if latest.status != Availability::Ok {
-        return unavailable_answer(latest.provider, availability_message(latest));
+    if let Some(refusal) = eligibility_refusal(latest) {
+        return refusal;
     }
     let Some(window) = binding_window(latest) else {
         return CanStartAnswer {
@@ -300,10 +333,11 @@ where
             reset_at: None,
             eta_empty_secs: None,
             burn_percent_per_hour: None,
+            admission: None,
         };
     };
 
-    let samples = samples_for(history, latest, &window.kind);
+    let samples = samples_for(history, latest, window);
     let burn = burn_percent_per_sec(&samples);
     let burn_hour = burn.map(|b| b * 3600.0);
     let rem_pct = window.remaining_percent;
@@ -370,6 +404,7 @@ where
             reset_at: window.reset_at,
             eta_empty_secs: eta,
             burn_percent_per_hour: burn_hour,
+            admission: None,
         };
     }
 
@@ -395,6 +430,7 @@ where
             reset_at: window.reset_at,
             eta_empty_secs: eta,
             burn_percent_per_hour: burn_hour,
+            admission: None,
         };
     }
 
@@ -413,6 +449,7 @@ where
             reset_at: window.reset_at,
             eta_empty_secs: eta,
             burn_percent_per_hour: burn_hour,
+            admission: None,
         };
     }
 
@@ -440,6 +477,143 @@ where
         reset_at: window.reset_at,
         eta_empty_secs: eta,
         burn_percent_per_hour: burn_hour,
+        admission: None,
+    }
+}
+
+/// One window's verdict for a percent request; `slack` orders windows by how
+/// close they are to refusing.
+struct PercentVerdict<'a> {
+    window: &'a UsageWindow,
+    admission: PercentAdmission,
+    burn_hour: Option<f64>,
+    eta: Option<f64>,
+    slack: f64,
+}
+
+fn judge_window<'w, 'h, I>(
+    window: &'w UsageWindow,
+    latest: &ProviderSnapshot,
+    history: I,
+    percent: f64,
+    reserve: f64,
+    deadline: Option<i64>,
+    now: i64,
+) -> Option<PercentVerdict<'w>>
+where
+    I: IntoIterator<Item = &'h Snapshot>,
+{
+    let remaining = window.remaining_percent?;
+    let remaining_after = remaining - percent;
+    let headroom_ok = remaining_after >= reserve;
+    let burn = burn_percent_per_sec(&samples_for(history, latest, window));
+    let eta = burn.and_then(|b| eta_empty_secs(remaining_after, b));
+    let burning = burn.is_some_and(|b| b > 0.0);
+    let survives = |until: i64| eta.is_none_or(|eta| eta >= (until - now) as f64);
+    let (pace_checked, pace_ok) = match window.reset_at.filter(|reset| *reset > now) {
+        Some(reset) if burning => (true, survives(reset)),
+        _ => (false, true),
+    };
+    let deadline_ok = deadline.is_none_or(|d| d > now && (!burning || survives(d)));
+    Some(PercentVerdict {
+        window,
+        admission: PercentAdmission {
+            requested_percent: percent,
+            reserve_percent: reserve,
+            remaining_after_percent: remaining_after,
+            headroom_ok,
+            pace_ok,
+            pace_checked,
+            deadline_ok,
+        },
+        burn_hour: burn.map(|b| b * 3600.0),
+        eta,
+        slack: remaining_after - reserve,
+    })
+}
+
+/// Percent admission: may a job that spends about `percent` of a window start?
+///
+/// Every readable window that publishes a remaining percent must pass, so a
+/// 5-hour window at 90% refuses a 15% job even when the weekly window is
+/// empty-handed. The tightest window is the one reported. A window passes when
+/// all three hold: `remaining - percent >= reserve`; at the current burn the
+/// remainder after the job outlasts the window's reset (the pace veto); and, if
+/// a `deadline` was given, it is still ahead and the remainder outlasts it. A
+/// deadline only ever adds a refusal; it never waives the pace veto.
+pub fn can_start_percent<'h, I>(
+    latest: &ProviderSnapshot,
+    history: I,
+    percent: f64,
+    reserve: f64,
+    deadline: Option<i64>,
+    now: i64,
+) -> CanStartAnswer
+where
+    I: IntoIterator<Item = &'h Snapshot> + Clone,
+{
+    if let Some(refusal) = eligibility_refusal(latest) {
+        return refusal;
+    }
+    let mut verdicts: Vec<PercentVerdict<'_>> = latest
+        .windows
+        .iter()
+        .filter_map(|w| judge_window(w, latest, history.clone(), percent, reserve, deadline, now))
+        .collect();
+    if verdicts.is_empty() {
+        return unavailable_answer(
+            latest.provider,
+            "no readable window publishes a remaining percent".to_string(),
+        );
+    }
+    verdicts.sort_by(|a, b| a.slack.total_cmp(&b.slack));
+    let failing = verdicts
+        .iter()
+        .position(|v| !(v.admission.headroom_ok && v.admission.pace_ok && v.admission.deadline_ok));
+    let chosen = &verdicts[failing.unwrap_or(0)];
+    let ok = failing.is_none();
+    let window = chosen.window;
+    let admission = chosen.admission.clone();
+    let reset = window
+        .reset_at
+        .map(crate::timeutil::format_rfc3339)
+        .unwrap_or_else(|| "unpublished".to_string());
+    let pace_note = match (admission.pace_checked, chosen.eta) {
+        (true, Some(eta)) => format!("pace: empties in {eta:.0}s after the job"),
+        (true, None) => "pace: not exhausting at the current burn".to_string(),
+        (false, _) => "pace: no burn rate or no future reset yet, not a veto".to_string(),
+    };
+    let verdict = match (
+        admission.headroom_ok,
+        admission.pace_ok,
+        admission.deadline_ok,
+    ) {
+        (true, true, true) => "admitted",
+        (false, _, _) => "refused: not enough headroom above the reserve",
+        (true, false, _) => "refused: the pace projection empties the window before it resets",
+        (true, true, false) => "refused: the job does not fit before the deadline",
+    };
+    let explanation = format!(
+        "{} {} {verdict}. {:.1}% remaining - {:.1}% requested = {:.1}% left, reserve {:.1}%; {pace_note}; reset {reset}",
+        latest.provider,
+        window.label,
+        window.remaining_percent.unwrap_or(0.0),
+        admission.requested_percent,
+        admission.remaining_after_percent,
+        admission.reserve_percent,
+    );
+    CanStartAnswer {
+        provider: latest.provider,
+        ok,
+        basis: CanStartBasis::PercentBudget,
+        explanation,
+        window_kind: Some(window.kind.clone()),
+        remaining_percent: window.remaining_percent,
+        remaining_tokens: None,
+        reset_at: window.reset_at,
+        eta_empty_secs: chosen.eta,
+        burn_percent_per_hour: chosen.burn_hour,
+        admission: Some(admission),
     }
 }
 
@@ -799,6 +973,299 @@ mod tests {
         assert!(!b.ok);
     }
 
+    fn history_burning(used_then: f64, used_now: f64, now: i64) -> Vec<Snapshot> {
+        vec![
+            Snapshot::new(
+                now - 3_600,
+                vec![provider_at(ProviderId::Codex, used_then, now - 3_600)],
+            ),
+            Snapshot::new(now, vec![provider_at(ProviderId::Codex, used_now, now)]),
+        ]
+    }
+
+    #[test]
+    fn percent_admission_admits_with_headroom_and_names_its_tests() {
+        let now = crate::timeutil::now_unix();
+        let p = provider_at(ProviderId::Codex, 50.0, now);
+        let a = can_start_percent(&p, &[], 10.0, DEFAULT_RESERVE_PERCENT, None, now);
+        assert!(a.ok, "{}", a.explanation);
+        assert_eq!(a.basis, CanStartBasis::PercentBudget);
+        let admission = a.admission.unwrap();
+        assert_eq!(admission.remaining_after_percent, 40.0);
+        assert!(admission.headroom_ok && admission.pace_ok);
+        assert!(!admission.pace_checked, "one sample cannot veto");
+    }
+
+    #[test]
+    fn percent_admission_reserve_boundary_is_inclusive() {
+        let now = crate::timeutil::now_unix();
+        let p = provider_at(ProviderId::Codex, 90.0, now);
+        assert!(can_start_percent(&p, &[], 8.0, 2.0, None, now).ok);
+        let refused = can_start_percent(&p, &[], 8.1, 2.0, None, now);
+        assert!(!refused.ok);
+        assert!(!refused.admission.unwrap().headroom_ok);
+    }
+
+    #[test]
+    fn percent_admission_refuses_the_live_codex_case() {
+        let now = crate::timeutil::now_unix();
+        let p = provider_at(ProviderId::Codex, 99.0, now);
+        let a = can_start_percent(&p, &[], 1.0, DEFAULT_RESERVE_PERCENT, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::PercentBudget);
+        assert!(a.explanation.contains("not enough headroom"));
+    }
+
+    #[test]
+    fn percent_admission_pace_can_veto_when_headroom_passes() {
+        let now = crate::timeutil::now_unix();
+        let history = history_burning(40.0, 50.0, now);
+        let p = provider_at(ProviderId::Codex, 50.0, now);
+        let a = can_start_percent(&p, &history, 10.0, 2.0, None, now);
+        assert!(!a.ok, "{}", a.explanation);
+        let admission = a.admission.unwrap();
+        assert!(admission.headroom_ok);
+        assert!(admission.pace_checked && !admission.pace_ok);
+        assert_eq!(a.eta_empty_secs.map(|eta| eta.round()), Some(14_400.0));
+        assert!(a.explanation.contains("pace projection"));
+    }
+
+    #[test]
+    fn percent_admission_an_earlier_deadline_does_not_waive_the_pace_veto() {
+        let now = crate::timeutil::now_unix();
+        let history = history_burning(40.0, 50.0, now);
+        let p = provider_at(ProviderId::Codex, 50.0, now);
+        let without = can_start_percent(&p, &history, 10.0, 2.0, None, now);
+        let with = can_start_percent(&p, &history, 10.0, 2.0, Some(now + 600), now);
+        assert!(!without.ok && !with.ok, "{}", with.explanation);
+        let admission = with.admission.unwrap();
+        assert!(admission.headroom_ok && admission.deadline_ok);
+        assert!(admission.pace_checked && !admission.pace_ok);
+        assert!(with.explanation.contains("pace projection"));
+    }
+
+    #[test]
+    fn percent_admission_a_deadline_only_adds_a_refusal() {
+        let now = crate::timeutil::now_unix();
+        let history = history_burning(40.0, 50.0, now);
+        let mut p = provider_at(ProviderId::Codex, 50.0, now);
+        p.windows[0].reset_at = Some(now + 10_000);
+        let a = can_start_percent(&p, &history, 1.0, 2.0, None, now);
+        assert!(a.ok, "{}", a.explanation);
+        let past = can_start_percent(&p, &history, 1.0, 2.0, Some(now - 1), now);
+        assert!(!past.ok);
+        assert!(!past.admission.unwrap().deadline_ok);
+        assert!(past.explanation.contains("before the deadline"));
+    }
+
+    #[test]
+    fn percent_admission_a_deadline_the_burn_cannot_reach_refuses_without_a_reset() {
+        let now = crate::timeutil::now_unix();
+        let history = history_burning(40.0, 50.0, now);
+        let mut p = provider_at(ProviderId::Codex, 50.0, now);
+        p.windows[0].reset_at = None;
+        let open = can_start_percent(&p, &history, 10.0, 2.0, None, now);
+        assert!(open.ok && !open.admission.unwrap().pace_checked);
+        let late = can_start_percent(&p, &history, 10.0, 2.0, Some(now + 20_000), now);
+        assert!(!late.ok, "{}", late.explanation);
+        assert!(!late.admission.unwrap().deadline_ok);
+    }
+
+    #[test]
+    fn percent_admission_reports_the_tightest_window() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Codex, 90.0, now);
+        p.windows.push(UsageWindow::from_percent_at(
+            WindowKind::Weekly,
+            "weekly",
+            10.0,
+            None,
+            None,
+            Some(now),
+            300,
+        ));
+        let a = can_start_percent(&p, &[], 15.0, 2.0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.window_kind, Some(WindowKind::Session));
+        let b = can_start_percent(&p, &[], 5.0, 2.0, None, now);
+        assert!(b.ok);
+        assert_eq!(b.window_kind, Some(WindowKind::Session));
+    }
+
+    #[test]
+    fn percent_admission_never_treats_an_uncapped_spend_counter_as_headroom() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Cursor, 0.0, now);
+        p.windows = vec![UsageWindow::from_spend_at(
+            WindowKind::Spend,
+            "on-demand",
+            12.5,
+            None,
+            None,
+            None,
+            Some(now),
+            300,
+        )];
+        let a = can_start_percent(&p, &[], 1.0, 2.0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+    }
+
+    #[test]
+    fn percent_admission_uses_dollar_windows_through_their_percent() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Cursor, 0.0, now);
+        p.windows = vec![UsageWindow::from_spend_at(
+            WindowKind::Spend,
+            "on-demand",
+            12.0,
+            Some(60.0),
+            None,
+            None,
+            Some(now),
+            300,
+        )];
+        assert_eq!(p.windows[0].used_percent, Some(20.0));
+        assert_eq!(p.windows[0].remaining, Some(48.0));
+        assert!(can_start_percent(&p, &[], 70.0, 2.0, None, now).ok);
+        assert!(!can_start_percent(&p, &[], 79.0, 2.0, None, now).ok);
+    }
+
+    fn cursor_at(included_usd: f64, on_demand_usd: f64, reset: i64, at: i64) -> ProviderSnapshot {
+        let mut p = provider_at(ProviderId::Cursor, 0.0, at);
+        p.windows = [("included", included_usd), ("on-demand", on_demand_usd)]
+            .into_iter()
+            .map(|(label, used)| {
+                UsageWindow::from_spend_at(
+                    WindowKind::Spend,
+                    label,
+                    used,
+                    Some(100.0),
+                    Some(reset),
+                    None,
+                    Some(at),
+                    300,
+                )
+            })
+            .collect();
+        p
+    }
+
+    #[test]
+    fn pace_history_is_keyed_by_window_identity_not_kind() {
+        let now = crate::timeutil::now_unix();
+        let reset = now + 36_000;
+        let then = cursor_at(50.0, 10.0, reset, now - 3_600);
+        let latest = cursor_at(50.0, 50.0, reset, now);
+        let history = vec![
+            Snapshot::new(now - 3_600, vec![then]),
+            Snapshot::new(now, vec![latest.clone()]),
+        ];
+        let on_demand = &latest.windows[1];
+        let samples = samples_for(&history, &latest, on_demand);
+        assert_eq!(
+            samples.iter().map(|s| s.1).collect::<Vec<_>>(),
+            [10.0, 50.0]
+        );
+
+        let a = can_start_percent(&latest, &history, 5.0, 2.0, None, now);
+        assert!(!a.ok, "{}", a.explanation);
+        assert!(a.explanation.contains("on-demand"), "{}", a.explanation);
+        assert!(!a.admission.unwrap().pace_ok);
+    }
+
+    #[test]
+    fn percent_admission_refuses_when_a_reported_window_is_unreadable() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Claude, 10.0, now);
+        p.windows.push(UsageWindow::unreadable(
+            WindowKind::Weekly,
+            "weekly",
+            None,
+            Some(604_800),
+            Some(now),
+            300,
+        ));
+        let a = can_start_percent(&p, &[], 1.0, 2.0, None, now);
+        assert!(!a.ok, "{}", a.explanation);
+        assert_eq!(a.basis, CanStartBasis::UnknownWindow);
+        assert_eq!(a.window_kind, Some(WindowKind::Weekly));
+        assert!(a.explanation.contains("weekly has no readable measurement"));
+    }
+
+    #[test]
+    fn percent_admission_inspects_windows_before_all_unreadable_status() {
+        let now = crate::timeutil::now_unix();
+        let p = ProviderSnapshot::observed(crate::types::ProviderObservation {
+            provider: ProviderId::Claude,
+            source: Some(crate::types::Source::Oauth),
+            windows: vec![UsageWindow::unreadable(
+                WindowKind::Weekly,
+                "sonnet weekly",
+                None,
+                Some(604_800),
+                Some(now),
+                300,
+            )],
+            credits: None,
+            plan: None,
+            credential_path: None,
+            observed_at: Some(now),
+            max_age_secs: 300,
+            permission: crate::types::ProviderPermission::Unknown,
+        });
+        assert_eq!(p.status, Availability::Unavailable);
+
+        let answer = can_start_percent(&p, &[], 1.0, 2.0, None, now);
+        assert!(!answer.ok, "{}", answer.explanation);
+        assert_eq!(answer.basis, CanStartBasis::UnknownWindow);
+        assert_eq!(answer.window_kind, Some(WindowKind::Weekly));
+        assert!(answer.explanation.contains("sonnet weekly"));
+    }
+
+    #[test]
+    fn percent_admission_refuses_stale_and_unavailable_evidence() {
+        let now = crate::timeutil::now_unix();
+        let mut p = provider_at(ProviderId::Codex, 10.0, now - 10_000);
+        p.refresh_freshness(now);
+        assert_eq!(p.status, Availability::Stale);
+        let a = can_start_percent(&p, &[], 1.0, 2.0, None, now);
+        assert!(!a.ok);
+        assert_eq!(a.basis, CanStartBasis::Unavailable);
+    }
+
+    mod deadline_property {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// A deadline is only ever an extra refusal: whenever the same
+            /// question without one is refused, adding any deadline (past,
+            /// near, beyond the reset) stays refused.
+            #[test]
+            fn adding_a_deadline_never_turns_a_refusal_into_an_admit(
+                used_then in 0.0f64..100.0,
+                used_now in 0.0f64..100.0,
+                percent in 0.1f64..100.0,
+                reserve in 0.0f64..50.0,
+                reset_in in proptest::option::of(1i64..200_000),
+                deadline_in in -10_000i64..400_000,
+            ) {
+                let now = crate::timeutil::now_unix();
+                let history = history_burning(used_then, used_now, now);
+                let mut p = provider_at(ProviderId::Codex, used_now, now);
+                p.windows[0].reset_at = reset_in.map(|r| now + r);
+                let without = can_start_percent(&p, &history, percent, reserve, None, now);
+                let with = can_start_percent(&p, &history, percent, reserve, Some(now + deadline_in), now);
+                if !without.ok {
+                    prop_assert!(!with.ok, "{} / {}", without.explanation, with.explanation);
+                }
+                if let (Some(a), Some(b)) = (without.admission, with.admission) {
+                    prop_assert_eq!((a.headroom_ok, a.pace_ok), (b.headroom_ok, b.pace_ok));
+                }
+            }
+        }
+    }
     #[test]
     fn review_r2_pace_history_spanning_two_account_digests_uses_only_the_active_account() {
         let now = crate::timeutil::now_unix();
@@ -852,6 +1319,9 @@ mod tests {
         assert_eq!(pace.samples, 0);
         assert_eq!(pace.used_percent, None);
         assert!(pace.explanation.contains("account changed since reading"));
+        let percent = can_start_percent(&elsewhere, &history, 1.0, 2.0, None, now);
+        assert!(!percent.ok);
+        assert_eq!(percent.basis, CanStartBasis::AccountChanged);
     }
 
     #[test]

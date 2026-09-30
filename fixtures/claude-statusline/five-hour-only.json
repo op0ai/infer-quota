@@ -1,0 +1,13 @@
+{
+  "_pinned_from": [
+    "https://code.claude.com/docs/en/statusline (read 2026-09-29, sha256 6ddde6b55a53ae3a10c1c105729cb2c112ed19b30ff343c37f4a5241bce20080): line 339 (each window five_hour, seven_day, spend_limit may be independently absent; a window is dropped once its resets_at passes)"
+  ],
+  "session_id": "00000000-0000-4000-8000-000000000003",
+  "version": "2.1.80",
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 100,
+      "resets_at": 1746543900
+    }
+  }
+}

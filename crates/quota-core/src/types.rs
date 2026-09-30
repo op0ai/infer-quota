@@ -77,6 +77,7 @@ where
 pub enum ProviderId {
     Codex,
     Claude,
+    Cursor,
 }
 
 impl ProviderId {
@@ -84,6 +85,7 @@ impl ProviderId {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -91,6 +93,7 @@ impl ProviderId {
         match raw {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -110,6 +113,8 @@ pub enum Source {
     Cli,
     Cookie,
     File,
+    /// Pushed by Claude Code's statusline hook through `quota statusline`.
+    Statusline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +161,8 @@ pub enum WindowKind {
     Weekly,
     Monthly,
     Extra,
+    /// Money against a cap (`used_usd` / `limit_usd`), e.g. Cursor on-demand.
+    Spend,
 }
 
 impl WindowKind {
@@ -166,6 +173,7 @@ impl WindowKind {
             Self::Weekly => "weekly",
             Self::Monthly => "monthly",
             Self::Extra => "extra",
+            Self::Spend => "spend",
         }
     }
 }
@@ -204,9 +212,15 @@ pub struct UsageWindow {
     /// Absolute limit when the source publishes a real unit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<f64>,
-    /// `"percent"`, `"tokens"`, or `"credits"` — only set when a number exists.
+    /// `"percent"`, `"tokens"`, `"credits"`, or `"usd"` — only set when a number exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// Dollars already spent, for `spend` windows and money-denominated plans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_usd: Option<f64>,
+    /// Dollar cap for the window, when the source publishes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_usd: Option<f64>,
     /// UTC unix seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<i64>,
@@ -235,6 +249,10 @@ pub struct WindowReading {
     pub limit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_usd: Option<f64>,
 }
 
 impl UsageWindow {
@@ -277,6 +295,8 @@ impl UsageWindow {
             remaining: None,
             limit: None,
             unit: Some("percent".to_string()),
+            used_usd: None,
+            limit_usd: None,
         };
         let freshness = freshness_for(observed_at, max_age_secs, crate::timeutil::now_unix());
         Self {
@@ -292,10 +312,74 @@ impl UsageWindow {
             remaining: None,
             limit: None,
             unit: Some("percent".to_string()),
+            used_usd: None,
+            limit_usd: None,
             reset_at,
             reset_at_rfc3339: reset_at.map(crate::timeutil::format_rfc3339),
             limit_window_seconds,
         }
+    }
+
+    /// A money window. With a positive cap the percent fields are derived from
+    /// dollars; without one the window records spend but publishes no percent,
+    /// so admission never treats an uncapped counter as headroom.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_spend_at(
+        kind: WindowKind,
+        label: impl Into<String>,
+        used_usd: f64,
+        limit_usd: Option<f64>,
+        reset_at: Option<i64>,
+        limit_window_seconds: Option<i64>,
+        observed_at: Option<i64>,
+        max_age_secs: u64,
+    ) -> Self {
+        let cap = limit_usd.filter(|limit| limit.is_finite() && *limit > 0.0);
+        let mut window = match cap {
+            Some(limit) => Self::from_percent_at(
+                kind,
+                label,
+                used_usd / limit * 100.0,
+                reset_at,
+                limit_window_seconds,
+                observed_at,
+                max_age_secs,
+            ),
+            None => {
+                let mut window = Self::unreadable(
+                    kind,
+                    label,
+                    reset_at,
+                    limit_window_seconds,
+                    observed_at,
+                    max_age_secs,
+                );
+                window.state = WindowState::Ok;
+                window.reading = Some(WindowReading {
+                    used_percent: None,
+                    remaining_percent: None,
+                    remaining: None,
+                    limit: None,
+                    unit: Some("usd".to_string()),
+                    used_usd: None,
+                    limit_usd: None,
+                });
+                window
+            }
+        };
+        window.unit = Some("usd".to_string());
+        window.used_usd = Some(used_usd);
+        window.limit_usd = cap;
+        window.remaining = cap.map(|limit| (limit - used_usd).max(0.0));
+        window.limit = cap;
+        if let Some(reading) = window.reading.as_mut() {
+            reading.unit = Some("usd".to_string());
+            reading.used_usd = Some(used_usd);
+            reading.limit_usd = cap;
+            reading.remaining = window.remaining;
+            reading.limit = cap;
+        }
+        window
     }
 
     pub fn unreadable(
@@ -320,6 +404,8 @@ impl UsageWindow {
             remaining: None,
             limit: None,
             unit: None,
+            used_usd: None,
+            limit_usd: None,
             reset_at,
             reset_at_rfc3339: reset_at.map(crate::timeutil::format_rfc3339),
             limit_window_seconds,
@@ -331,7 +417,8 @@ impl UsageWindow {
     }
 }
 
-fn freshness_for(observed_at: Option<i64>, max_age_secs: u64, now: i64) -> Freshness {
+/// The one freshness rule: a reading is current while its age is at most `max_age_secs`; a future timestamp is stale.
+pub fn freshness_for(observed_at: Option<i64>, max_age_secs: u64, now: i64) -> Freshness {
     match observed_at {
         None => Freshness::Unknown,
         Some(at) if at > now || now.saturating_sub(at) as u64 > max_age_secs => Freshness::Stale,
@@ -646,6 +733,8 @@ impl Snapshot {
 #[serde(rename_all = "snake_case")]
 pub enum CanStartBasis {
     TokenBudget,
+    /// `--percent` admission: headroom above a reserve plus a pace projection.
+    PercentBudget,
     PercentOnly,
     Unavailable,
     /// The provider reported a window whose measurement could not be read, so
@@ -674,6 +763,31 @@ pub struct CanStartAnswer {
     pub eta_empty_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub burn_percent_per_hour: Option<f64>,
+    /// Present only for `--percent` admission; names each test that was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<PercentAdmission>,
+}
+
+/// The tests behind a percent admission: `remaining - requested >= reserve`,
+/// the pace projection not emptying the window before it resets, and (when one
+/// was asked for) the job fitting before the deadline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PercentAdmission {
+    pub requested_percent: f64,
+    pub reserve_percent: f64,
+    pub remaining_after_percent: f64,
+    pub headroom_ok: bool,
+    pub pace_ok: bool,
+    /// False when no burn rate or no published reset existed, so pace could not veto.
+    pub pace_checked: bool,
+    /// True when no deadline was requested or the job fits before it. Absent in
+    /// answers from older daemons, which read as true.
+    #[serde(default = "default_true")]
+    pub deadline_ok: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

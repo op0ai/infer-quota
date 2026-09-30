@@ -1,0 +1,27 @@
+{
+  "_pinned_from": [
+    "https://github.com/anthropics/claude-code/blob/8364969e9f5234ef3d9743cf7c790e9aab0ac3b1/CHANGELOG.md#L1686-L1690 (2.1.251 adds rate_limits.spend_limit)",
+    "https://github.com/anthropics/claude-code/blob/8364969e9f5234ef3d9743cf7c790e9aab0ac3b1/CHANGELOG.md#L3-L7 (2.1.284: \"the status line's `rate_limits.spend_limit` also gains `used_usd`, `limit_usd` and `period`\")",
+    "https://code.claude.com/docs/en/statusline (read 2026-09-29, sha256 6ddde6b55a53ae3a10c1c105729cb2c112ed19b30ff343c37f4a5241bce20080): line 195 (spend_limit used_percentage/resets_at; percent can exceed 100), example lines 302-305"
+  ],
+  "session_id": "00000000-0000-4000-8000-000000000002",
+  "cwd": "/work/example",
+  "version": "2.1.284",
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 8.5,
+      "resets_at": 1746540000
+    },
+    "seven_day": {
+      "used_percentage": 40,
+      "resets_at": 1746799200
+    },
+    "spend_limit": {
+      "used_percentage": 54.28,
+      "resets_at": 1748736000,
+      "used_usd": 271.4,
+      "limit_usd": 500,
+      "period": "month"
+    }
+  }
+}

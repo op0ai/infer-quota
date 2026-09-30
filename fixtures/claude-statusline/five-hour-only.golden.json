@@ -1,0 +1,20 @@
+{
+  "observe": {
+    "plan": null,
+    "provider": "claude",
+    "schema": 1,
+    "source": "statusline",
+    "windows": [
+      {
+        "kind": "five_hour",
+        "label": "5h",
+        "limit_usd": null,
+        "limit_window_seconds": 18000,
+        "reset_at": 1746543900,
+        "used_percent": 100.0,
+        "used_usd": null
+      }
+    ]
+  },
+  "segment": "5h 100% ↺2h05m"
+}

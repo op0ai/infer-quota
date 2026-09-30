@@ -3,17 +3,22 @@ resolver = "2"
 members = [
     "crates/quota-core",
     "crates/quota-adapters",
+    "crates/quota-source-claude-statusline",
+    "crates/quota-source-cursor",
     "crates/quota-secrets",
     "crates/quotad",
     "crates/quota",
     "crates/quota-ctl",
     "crates/quota-bench",
 ]
-# Targeted (lean) builds — no extra feature flags. quotad/quota never link
-# quota-secrets or quota-ctl. Drop the control plane when unwanted:
+# Targeted (lean) builds. Source crates sit behind the `Provider` trait:
+#   quota-source-claude-statusline  parser for Claude Code's statusline JSON (used by `quota`)
+#   quota-source-cursor             Cursor usage-summary collector (used by `quotad`)
+# quotad links quota-secrets read-only (Claude Code's Keychain item, the Cursor
+# cookie); it never links quota-ctl. Drop the control plane when unwanted:
 #   cargo build --release -p quotad -p quota
-# quota-ctl pulls quota-secrets (OpenBao via feature `openbao`, OS keychain). quota-bench
-# is a local harness, not installed. See install.sh --minimal.
+# quota-ctl enables the OpenBao feature; quotad has its own opt-in `openbao` feature.
+# quota-bench is a local harness, not installed. See install.sh --minimal.
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +32,8 @@ repository = "https://github.com/op0ai/infer-quota"
 quota-core = { path = "crates/quota-core", version = "0.1.0" }
 quota-adapters = { path = "crates/quota-adapters", version = "0.1.0" }
 quota-secrets = { path = "crates/quota-secrets", version = "0.1.0" }
+quota-source-claude-statusline = { path = "crates/quota-source-claude-statusline", version = "0.1.0" }
+quota-source-cursor = { path = "crates/quota-source-cursor", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

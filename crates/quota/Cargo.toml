@@ -10,8 +10,11 @@ readme = false
 [dependencies]
 clap.workspace = true
 quota-core.workspace = true
+quota-source-claude-statusline.workspace = true
+# Already in Cargo.lock at this pin (quotad); safe `killpg` for a timed-out `--chain`.
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "process"] }
 serde_json.workspace = true
 
 [dev-dependencies]
-# Already present in Cargo.lock; a unique directory per run cleans itself up.
+# Already in Cargo.lock; unique temporary directories isolate fake-daemon sockets and clean up.
 tempfile = "3.27.0"
